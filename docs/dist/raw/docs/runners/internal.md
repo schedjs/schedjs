@@ -1,0 +1,104 @@
+# Internal runner (embedded)
+
+> Run in-process functions — no HTTP, no Docker, no daemon
+
+The **internal runner** executes handlers **in the same process** as the engine —
+a plain TypeScript/JavaScript function per task. No HTTP server, no Docker, no
+separate daemon process. This is the **embedded mode** ("Shape 1"): `@schedjs/core`
+becomes a library inside your app, and the scheduler is just a few lines of setup.
+
+The platform guarantees stay intact — retries, run history, alerts, zombie-lock
+reaping all work exactly as with the HTTP runner. Embedded mode is *not* a
+regression to fire-and-forget job queues: every run is recorded, every failure is
+surfaced.
+
+## When to use it
+
+- You want scheduled jobs inside your existing app process (a server, a CLI, a service).
+- Your jobs are functions, not external workers — no need for HTTP/Docker plumbing.
+- You want the "install in 60 seconds" story: `npm i @schedjs/core`, a SQLite file, done.
+
+When **not**: long-running jobs that must survive process restarts, or jobs that need
+to run outside your process — use the [daemon](../cli) with the [HTTP](http) /
+[Docker](docker) runners instead.
+
+## Handlers
+
+A handler is a function `(data, ctx) => result`:
+
+```ts
+import { createInternalRunner } from '@schedjs/core';
+
+const runner = createInternalRunner({
+  handlers: {
+    generateThumbnail: async (data, ctx) => {
+      ctx.log('thumbnail: started');
+      ctx.setProgress(50);
+      const out = await renderThumbnail((data as { videoId: string }).videoId);
+      ctx.setProgress(100);
+      return { output: out }; // → run.result
+    },
+    transcode: async (data) => {
+      throw new Error('ffmpeg not found'); // → run failed, error recorded
+    },
+  },
+});
+```
+
+- **data** — `task.config.data`, the run parameters snapshot (JSON-serializable).
+- **ctx** — `{ runId, taskName, startedAt, log(line), setProgress(percent) }`.
+`log` lines are joined into the run's `log`; `setProgress` lands in `progress`.
+- **Return value** → `run.result` (`undefined`/`null` → `null`).
+- **A thrown error** → `failed` with the error message (plus any log lines
+collected so far). A throwing handler is a failed run, never a crashed process.
+
+Handlers are resolved by `task.config.handler` — fail-fast with a clear message if
+the name is missing or not registered.
+
+## Embedded setup — the whole thing
+
+```ts
+import { DatabaseSync } from 'node:sqlite';
+import { createEngine, createInternalRunner, createSqliteStorage, syncTasks } from '@schedjs/core';
+
+const storage = createSqliteStorage(new DatabaseSync('sched.db'));
+
+const engine = createEngine({
+  storage,
+  runner: createInternalRunner({
+    handlers: {
+      generateThumbnail: async (data) => { /* ... */ },
+    },
+  }),
+  maxConcurrent: 4,          // parallel in-process handlers (default: 1 = sequential)
+});
+
+// desired-state: same tasks.json contract, but registered from code (or from a file)
+await syncTasks(storage, [
+  {
+    name: 'generate-thumbnail',
+    runner: 'internal',
+    schedules: [{ cron: '0 9 * * *' }],
+    config: { handler: 'generateThumbnail', data: { videoId: 'v-42' } },
+    retry: { maxAttempts: 3, backoffMs: 60_000 },
+  },
+], new Date());
+
+engine.start(); // tick + watchdog + poll loops
+```
+
+The same `tasks.json` file format works embedded: `loadTasksJson('tasks.json')` +
+`syncTasks(storage, defs, now)` — no daemon involved.
+
+## Concurrency, priority, retry
+
+Embedded mode gets the engine features out of the box — see
+[Tasks](../tasks#priority-and-retry):
+
+- **maxConcurrent** (engine option, default `1`) — how many due tasks run in
+parallel. Raise it for in-process handlers that are mostly I/O-bound. Per-task
+overlap is still impossible: the storage claim is atomic, so one task never runs
+twice at once.
+- **priority** (task field) — higher runs first among due tasks.
+- **retry** (task field) — a failed run is retried with backoff up to
+`maxAttempts`; alerts/`onRunFinal` fire only on the **final, exhausted** failure.

@@ -1,0 +1,51 @@
+# sched local dev stack — standalone web shell (nginx) + sched daemon (api).
+#   docker compose -f docker-compose.dev.yml up --build
+#   → shell:  http://127.0.0.1:8095   (token: dev-key, in the header field)
+services:
+  daemon:
+    build:
+      context: .
+      dockerfile: apps/daemon/Dockerfile
+      args:
+        # npm-based image: pulls @schedjs/daemon from the public npm registry
+        # (override NPM_REGISTRY to install from a private mirror).
+        DAEMON_VERSION: ${SCHED_DAEMON_VERSION:-0.10.2}
+    environment:
+      SCHED_ADMIN_KEY: dev-key
+    volumes:
+      - ./deploy/tasks.json:/app/tasks.json:ro
+      - sched-data:/data
+    command:
+      - --tasks
+      - /app/tasks.json
+      - --db
+      - /data/sched.db
+      - --admin-port
+      - "8080"
+      - --admin-host
+      - 0.0.0.0
+      - --tick-interval
+      - "1000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health',{headers:{authorization:'Bearer '+process.env.SCHED_ADMIN_KEY}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [sched]
+
+  shell:
+    build:
+      context: .
+      dockerfile: packages/ui/Dockerfile.serve
+    ports:
+      - "8095:8081"
+    depends_on:
+      daemon:
+        condition: service_healthy
+    networks: [sched]
+
+volumes:
+  sched-data:
+
+networks:
+  sched:

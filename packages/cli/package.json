@@ -1,0 +1,57 @@
+{
+  "name": "@schedjs/cli",
+  "version": "0.1.2",
+  "description": "Cron scheduler CLI for Node.js — status, runs, tasks, schedules, trigger/pause/resume via the admin API + worker conformance checker",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "sched": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/clean.mjs && tsc -p tsconfig.build.json"
+  },
+  "keywords": [
+    "cron",
+    "scheduler",
+    "job-scheduler",
+    "job-queue",
+    "task-scheduler",
+    "background-jobs",
+    "self-hosted",
+    "queue",
+    "nodejs",
+    "typescript",
+    "cli",
+    "command-line",
+    "operator"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schedjs/schedjs.git"
+  },
+  "homepage": "https://schedjs.github.io/schedjs",
+  "bugs": {
+    "url": "https://github.com/schedjs/schedjs/issues"
+  },
+  "author": {
+    "name": "schedjs",
+    "url": "https://github.com/schedjs"
+  }
+}

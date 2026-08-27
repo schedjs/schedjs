@@ -1,0 +1,26 @@
+{
+  "tasks": [
+    {
+      "name": "demo-http",
+      "runner": "http",
+      "label": "HTTP demo task",
+      "description": "Hits a local echo endpoint (will fail — nothing listens there)",
+      "schedules": [{ "interval": "every 1 minute" }],
+      "config": {
+        "url": "http://127.0.0.1:9999/echo",
+        "method": "GET"
+      }
+    },
+    {
+      "name": "demo-cron",
+      "runner": "http",
+      "label": "Cron demo task",
+      "description": "Fires daily at 09:00 UTC",
+      "schedules": [{ "cron": "0 9 * * *" }],
+      "config": {
+        "url": "http://127.0.0.1:9999/cron",
+        "method": "POST"
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "tasks": [
+    { "name": "accept-task", "runner": "accept", "schedules": [{ "cron": "0 9 * * *" }], "config": {} }
+  ]
+}

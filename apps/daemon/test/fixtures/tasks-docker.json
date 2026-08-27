@@ -1,0 +1,5 @@
+{
+  "tasks": [
+    { "name": "docker-task", "runner": "docker", "schedules": [{ "cron": "0 9 * * *" }], "config": { "image": "busybox" } }
+  ]
+}

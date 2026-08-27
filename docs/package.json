@@ -1,0 +1,15 @@
+{
+  "name": "docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node sync-openapi.mjs && nuxi dev",
+    "generate": "node sync-openapi.mjs && nuxi generate && node ../scripts/docs-dist.mjs",
+    "build": "node sync-openapi.mjs && nuxi generate && node ../scripts/docs-dist.mjs",
+    "preview": "nuxi preview"
+  },
+  "dependencies": {
+    "docus": "^5.12.3",
+    "nuxt": "^4.5.2"
+  }
+}

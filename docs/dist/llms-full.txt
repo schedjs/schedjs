@@ -1,0 +1,4014 @@
+# Introduction
+
+**sched** is a cron scheduler done right: **reliable delivery**, **run history**, and a
+**web UI** — self-hosted, queue-based, polyglot-ready.
+
+## Why sched
+
+"Fire and forget" is not enough for a scheduler. sched's promise — **the scheduler knows
+everything about every run**:
+
+- **Input** — with what parameters the task was invoked (`data`)
+- **Progress** — 0–100 progress and captured stdout/stderr log
+- **Outcome** — JSON result, error, artifacts (S3 keys, email receipts, URLs)
+- **Lifecycle** — `queued → running → succeeded | failed | cancelled`, timestamps, duration
+
+Runs survive restarts, locks are reaped, and every run is recorded in the storage — SQLite
+by default, or MySQL/MariaDB, Postgres or Mongo when history must live in an existing
+database (each is a separate package, see [Storage](https://schedjs.github.io/schedjs/storage)).
+
+## Key features
+
+- **Cron scheduling** with timezone support (`tz`) and DST-safe next-run calculation
+- **Run history** (`RunRecord`): `data`, `result`, `error`, `progress`, `log`, `artifacts`
+- **Pluggable storage** — SQLite first (in `@schedjs/core`), MySQL/MariaDB, Postgres and
+  Mongo as separate adapter packages, all with a contract test-suite
+- **Polyglot runners** — HTTP, Docker, and any custom runner you write against the `Runner` contract
+- **Embedded mode** — schedule in-process functions with the internal runner; no daemon, no Docker (see [quick start](https://schedjs.github.io/schedjs/quick-start#1-embedded-schedule-functions-in-process))
+- **Retries with backoff** — `retry: { maxAttempts, backoffMs, multiplier }` per task; a *persistent* failure is one where retries ran out
+- **Idempotent dispatch** — `x-sched-run-id` on the wire; workers dedupe by run id
+- **Async runs** — `202 accepted` + polling for long-running jobs
+- **Admin API** + **web UI** (web components) — see runs, tasks, status
+
+## Three ways to run
+
+Pick by scale — the engine underneath is the same, so run history, retries and alerts
+work on every path:
+
+1. **Embedded** — schedule functions in-process, zero infra (SQLite file + handlers).
+2. **Standalone daemon** — own process with HTTP/Docker workers, admin UI, alerts.
+3. **Docker** — the daemon in a container, compose-friendly, self-hosting.
+
+See [Quick start](https://schedjs.github.io/schedjs/quick-start) to run your first task on any of them.
+
+## Architecture
+
+```text
+            tasks.json (desired state)
+                    │ sync
+                    ▼
+   ┌────────────┐   tick/watchdog/poll    ┌───────────────────────────────┐
+   │   Engine   │ ──────────────────────▶ │      Runners (execution)      │
+   │ (scheduler)│   claim → run → record  │ http · docker · process · ssh │
+   │            │                         │ mcp · internal · custom       │
+   └─────┬──────┘                         └───────────────────────────────┘
+         │ storage seam
+         ▼
+   ┌───────────────────────┐    ┌──────────────────────────────────────┐
+   │        Storage        │    │  Daemon (CLI + Admin API + UI)       │
+   │ sqlite/mysql/pg/mongo │    │ --admin-port · SCHED_ADMIN_KEY       │
+   └───────────────────────┘    └──────────────────────────────────────┘
+```
+
+- **Engine** — deterministic tick loop + zombie watchdog over the storage seam. Claims due
+  tasks, dispatches to the runner, records outcomes, reaps stale locks.
+- **Runners** — own *how* a task runs. HTTP (request/response, sync or `accepted` + poll),
+  Docker (container spawn), or your own in-process function.
+- **Storage** — the `Storage` contract: tasks, runs, locking. SQLite, MySQL/MariaDB,
+  Postgres and Mongo implement it.
+- **Daemon** — loads `tasks.json` (desired state), syncs it, runs the engine, serves the
+  admin API and the web UI.
+
+## Where to go next
+
+- [Quick start](https://schedjs.github.io/schedjs/quick-start) — run your first scheduled task in 3 minutes
+- [Tasks](https://schedjs.github.io/schedjs/tasks) — the `tasks.json` format and scheduling
+- [Runs](https://schedjs.github.io/schedjs/runs) — the run lifecycle and `RunRecord`
+- [Runners](https://schedjs.github.io/schedjs/runners/http) — HTTP / Docker / custom runners
+- [Protocol](https://schedjs.github.io/schedjs/protocol) — the wire contract between sched and workers
+
+
+# Quick start
+
+Get a scheduled task firing in a few minutes. There are **three ways to run sched** —
+pick by how much setup you want:
+
+| Path                                                                                                 | What you get                                                  | Setup                            |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | -------------------------------- |
+| [1. Embedded](https://schedjs.github.io/schedjs/#1-embedded-schedule-functions-in-process)           | Schedule **functions** inside your app — no daemon, no Docker | SQLite file + a handler map      |
+| [2. Standalone daemon](https://schedjs.github.io/schedjs/#2-standalone-daemon-http-worker--admin-ui) | Own process, HTTP/Docker workers, **admin UI + alerts**       | A worker endpoint + `tasks.json` |
+| [3. Docker](https://schedjs.github.io/schedjs/#3-docker-everything-in-a-container)                   | The daemon in a container, compose-friendly                   | `docker compose up`              |
+
+Same engine underneath — run history, retries, priority, `onRunFinal` alerts work on
+every path.
+
+> **Note:** `@schedjs/*` packages are distributed via a package registry — install
+> through any package manager in step [0](https://schedjs.github.io/schedjs/#0-installation); building from source is
+> covered there too. Every path in this guide works the same way for both.
+
+## 0. Installation
+
+Packages are published to a package registry (private by default; the public npmjs
+after the public release). Access is granted with registry credentials. Install
+through any package manager:
+
+### Library — `@schedjs/core`
+
+Install `@schedjs/core` — pick your package manager:
+
+```bash
+npm install @schedjs/core
+yarn add @schedjs/core
+pnpm add @schedjs/core
+bun add @schedjs/core
+```
+
+### Daemon — `@schedjs/daemon` (global, binary `schedd`)
+
+Install `@schedjs/daemon` — pick your package manager:
+
+```bash
+npm install -g @schedjs/daemon
+yarn global add @schedjs/daemon
+pnpm add -g @schedjs/daemon
+bun add -g @schedjs/daemon
+```
+
+### Operator CLI — `@schedjs/cli` (global, binary `sched`)
+
+```bash
+npm install -g @schedjs/cli
+sched status --admin-url http://127.0.0.1:8080/api
+```
+
+### Or build from source (monorepo: all packages + docs + tests)
+
+```bash
+git clone https://github.com/schedjs/schedjs
+cd schedjs
+```
+
+```bash
+yarn install
+yarn build
+```
+
+## 1. Embedded — schedule functions in-process
+
+Smallest scale: your jobs are **functions, not workers**. `@schedjs/core` embeds in your
+app — a SQLite file, a handler map, and the engine. No daemon process, no HTTP, no
+Docker. Save this as `embed.mjs` (`.mjs`, not `.js` — the package is ESM-only) and
+run it:
+
+```js
+// embed.mjs — sched as a library (ESM: the package has no CJS build)
+import { DatabaseSync } from 'node:sqlite'
+import { createEngine, createInternalRunner, createSqliteStorage, syncTasks } from '@schedjs/core'
+
+const storage = createSqliteStorage(new DatabaseSync('sched.db'))
+
+const engine = createEngine({
+  storage,
+  runner: createInternalRunner({
+    handlers: {
+      generateThumbnail: async (data, ctx) => {
+        ctx.log('rendering thumbnail')
+        return { video: data.videoId, thumb: 'thumb.png' }   // → run.result
+      },
+    },
+  }),
+  maxConcurrent: 4, // parallel in-process handlers (default: 1)
+})
+
+async function main() {
+  await syncTasks(storage, [
+    {
+      name: 'generate-thumbnail',
+      runner: 'internal',
+      schedules: [{ cron: '0 9 * * *' }],
+      config: { handler: 'generateThumbnail', data: { videoId: 'v-42' } },
+    },
+  ], new Date())
+
+  engine.start() // renders a thumbnail at 09:00 daily
+}
+
+main()
+```
+
+```bash
+node embed.mjs
+```
+
+What you get out of the box: run history in SQLite (`storage.listRuns()`),
+[retries with backoff](https://schedjs.github.io/schedjs/tasks#retry), priority, and `onRunFinal` alerts.
+
+- Handler contract: `(data, ctx) => result` — a throw is a failed run; `ctx.log` /
+  `ctx.setProgress` feed the run record. See [Internal runner](https://schedjs.github.io/schedjs/runners/internal).
+- Run logging & observability: see [Logging](https://schedjs.github.io/schedjs/logging).
+
+**Want the admin UI, HTTP workers, or status alerts?** The engine is the same — move
+to the standalone daemon ([Path 2](https://schedjs.github.io/schedjs/#2-standalone-daemon-http-worker--admin-ui)) and
+reuse your `tasks.json`.
+
+## 2. Standalone daemon — HTTP worker + admin UI
+
+The picture to keep in mind: **sched is the scheduler, a worker is anything that answers
+HTTP**. sched fires a request at your worker's URL every time the schedule says so; the
+worker replies; sched records the run. In this guide the worker is a 15-line Node server
+you run locally — swap it for your real service later.
+
+### 2.1 Write a worker
+
+A worker is just an HTTP endpoint. Save this as `worker.js` and run it:
+
+```js
+// worker.js — answers /greet and /fail, everything else — 404
+const http = require('node:http')
+
+http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json')
+
+  if (req.url === '/greet') {
+    // 2xx = succeeded. The body is what sched stores in run.result
+    res.end(JSON.stringify({ greeting: 'hello from worker' }))
+    return
+  }
+  if (req.url === '/fail') {
+    res.statusCode = 500
+    res.end(JSON.stringify({ error: 'boom' }))
+    return
+  }
+  res.statusCode = 404
+  res.end(JSON.stringify({ error: 'not found' }))
+}).listen(9999, () => console.log('worker on http://127.0.0.1:9999'))
+```
+
+```bash
+node worker.js
+```
+
+Now something really lives at `http://127.0.0.1:9999` — try it:
+`curl http://127.0.0.1:9999/greet`.
+
+### 2.2 Write `tasks.json`
+
+```json
+{
+  "tasks": [
+    {
+      "name": "greet",
+      "label": "Hello world",
+      "schedules": [{ "interval": "every 1 minute" }],
+      "config": { "url": "http://127.0.0.1:9999/greet", "method": "GET" }
+    },
+    {
+      "name": "failing-task",
+      "label": "Shows a failed run",
+      "schedules": [{ "interval": "every 2 minutes" }],
+      "config": { "url": "http://127.0.0.1:9999/fail", "method": "GET" }
+    }
+  ]
+}
+```
+
+Schedule kinds: `{ "cron": "0 9 * * *" }`, `{ "interval": "every 5 minutes" }`,
+`{ "once": "tomorrow at noon" }` — see [Tasks](https://schedjs.github.io/schedjs/tasks).
+
+### 2.3 Run the daemon
+
+```bash
+SCHED_ADMIN_KEY=dev-key schedd \
+  --tasks tasks.json \
+  --db sched.db \
+  --admin-port 8080
+```
+
+(from the monorepo, the same command is `node apps/daemon/dist/entry.js` instead of `schedd`)
+
+- The daemon syncs `tasks.json` as desired state, then starts ticking (1s cadence).
+- `--admin-port 8080` serves the admin API (`/api/*`) on `127.0.0.1:8080`. Set
+  `SCHED_ADMIN_KEY` to require a Bearer token.
+- The web UI ships separately: `npx @schedjs/ui` → `sched-ui serve --proxy http://127.0.0.1:8080`
+  (four ways to consume it — see [Admin UI](https://schedjs.github.io/schedjs/ui)).
+
+### 2.4 Watch it run
+
+Run the UI and open it:
+
+```bash
+npx @schedjs/ui serve --proxy http://127.0.0.1:8080   # → http://127.0.0.1:8081
+```
+
+You'll see both tasks and their runs:
+
+- `greet` → runs turn **succeeded**, with `result: { greeting: "hello from worker" }`
+- `failing-task` → runs turn **failed**, with the captured error
+
+Every run is recorded with status, timestamps, and result — that's the run history.
+
+**Scale up from here:** add [status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts) (webhook),
+the [MCP server](https://schedjs.github.io/schedjs/mcp) for agent tooling, or deploy the same daemon as a
+[service](https://schedjs.github.io/schedjs/self-hosting).
+
+## 3. Docker — everything in a container
+
+No local Node needed — run the daemon in a container. Get the repo first
+(you only need a clone — the Dockerfile builds from it):
+
+```bash
+git clone https://github.com/schedjs/schedjs
+cd schedjs
+```
+
+Then put `worker.js` and `tasks.json` next to this `docker-compose.yml`:
+
+```yaml
+# docker-compose.yml
+services:
+  sched:
+    # image: ghcr.io/schedjs/sched   ← once published, drop the build block
+    build:
+      context: .
+      dockerfile: apps/daemon/Dockerfile
+    environment:
+      SCHED_ADMIN_KEY: dev-key
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./tasks.json:/app/tasks.json:ro
+      - sched-data:/data
+    command:
+      - --tasks
+      - /app/tasks.json
+      - --db
+      - /data/sched.db
+      - --admin-port
+      - "8080"
+      - --admin-host
+      - 0.0.0.0
+
+volumes:
+  sched-data:
+```
+
+```bash
+docker compose up
+# API: http://127.0.0.1:8080/api/health  (token: dev-key)
+# UI:  npx @schedjs/ui → sched-ui serve --proxy http://127.0.0.1:8080
+```
+
+Your worker stays on the host (`node worker.js`) and sched reaches it at
+`http://host.docker.internal:9999/...` — update the task URLs accordingly, or put the
+worker in the same compose file as a second service.
+
+For the full stack with the web UI in a separate container (`sched-ui serve` on
+`:8095`, proxying `/api` to the daemon), use the repo's `docker-compose.dev.yml`:
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+See [Self-hosting](https://schedjs.github.io/schedjs/self-hosting) for the layout and security notes.
+
+## Next steps
+
+- [Tasks](https://schedjs.github.io/schedjs/tasks) — the full `tasks.json` format (schedules, priority, retry)
+- [Runs](https://schedjs.github.io/schedjs/runs) — the run lifecycle and `RunRecord`
+- [Runners](https://schedjs.github.io/schedjs/runners/http) — HTTP, Docker, internal, custom
+- [Logging](https://schedjs.github.io/schedjs/logging) — run logs, `onRunFinal`, engine events
+- [CLI & daemon](https://schedjs.github.io/schedjs/cli) — flags, env vars, admin UI
+
+
+# Tasks
+
+Tasks are defined in a `tasks.json` file — the **desired-state contract**. The daemon
+syncs it into storage on start: tasks that exist in the file are created/updated, removed
+tasks are disabled.
+
+## Structure
+
+```json
+{
+  "tasks": [
+    {
+      "name": "publish-video",
+      "runner": "http",
+      "label": "Publish video",
+      "description": "Publishes the rendered video to the platform",
+      "schedules": [{ "cron": "0 9 * * *", "timezone": "Europe/Berlin" }],
+      "config": {
+        "url": "https://studio.example.com/api/publish",
+        "method": "POST",
+        "auth": { "apiKey": "secret" }
+      }
+    }
+  ],
+  "alerts": {
+    "on": ["failed"],
+    "onMissed": true,
+    "webhook": {
+      "url": "https://hooks.example.com/ops",
+      "secret": "whsec_…"
+    }
+  }
+}
+```
+
+The file has three top-level blocks: `tasks` (the definitions), optional `runners`
+(sandbox ceilings, see [Runner config](https://schedjs.github.io/schedjs/#runner-config)) and optional `alerts`
+(platform-level status webhooks — see [Self-hosting → Status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts)).
+A programmatic `createDaemon({ alerts })` option overrides the file's `alerts` block.
+
+### Per-task alert routing
+
+The root `alerts` block is the **channel + defaults** for the whole daemon. A task can
+**override its routing** with its own `alerts` block — field-wise merge over the root,
+**the task wins, arrays replace** (they are never concatenated):
+
+```json
+{
+  "tasks": [
+    {
+      "name": "publish-video",
+      "runner": "http",
+      "alerts": { "on": ["failed"] }
+    },
+    {
+      "name": "generate-thumbnail",
+      "runner": "internal",
+      "alerts": { "on": [] },
+      "schedules": [{ "cron": "0 2 * * *" }]
+    }
+  ],
+  "alerts": {
+    "on": ["failed"],
+    "onMissed": true,
+    "webhook": { "url": "https://hooks.example.com/ops", "secret": "whsec_…" }
+  }
+}
+```
+
+- `generate-thumbnail` has `alerts.on: []` — a failing cosmetic run stays silent,
+  while `publish-video` (no override) keeps the root default `on: ["failed"]`.
+- `alerts.onMissed: false` opts a task out of [missed-slot](https://schedjs.github.io/schedjs/self-hosting#status-alerts)
+  alerts; `alerts.webhook` routes that task to a **different channel** (e.g. a critical
+  task pages PagerDuty while the rest go to Slack).
+- A task without an `alerts` block uses the root defaults — no behavior change.
+- Malformed task `alerts` (bad status, non-boolean `onMissed`, webhook without a
+  string `url`) fails at load, not on runs.
+
+## Priority, retry and the run deadline
+
+Three engine-level fields control *how* a task runs — they work with every runner.
+
+### Run deadline (`timeoutMs`)
+
+Force-termination contract: after how long may sched give up on a run that isn't
+finishing on its own.
+
+\| Value | Meaning |
+\|---|---|---|
+\| `-1` (default when omitted) | &#x2A;*Never auto-terminate.** The run lives until it finishes or is manually cancelled (`POST /runs/:id/cancel`). For long pipelines that may go silent for hours |
+\| `> 0` | Force-fail the run this many **milliseconds** after it starts (sync: abort via the runner's signal; async: the poll ceiling) |
+
+```json
+{ "name": "ozon-seller-pipeline", "timeoutMs": -1, "config": { "url": "http://worker/run" } }
+```
+
+`timeoutMs` **defaults to `-1` when omitted** — a task that may run for hours
+without reporting progress is never killed automatically; only the operator
+can, via cancel. Write an explicit positive `timeoutMs` only when you *want* a
+force-fail deadline (e.g. a stuck worker must fail loudly after N minutes).
+
+### Trigger-only tasks (no schedule)
+
+`schedules` is **optional**. A task without it is a **trigger-only** task: it never
+fires on a tick (`nextRunAt` stays `null`), stays visible in task lists, and runs
+only when triggered manually — `POST /tasks/:name/run` (admin api) or
+`triggerTask` (embedded). Use it for on-demand operations that have no cron
+(e.g. re-encoding a video when the source changed):
+
+```json
+{ "name": "re-encode-video", "config": { "url": "http://worker/tasks/re-encode" } }
+```
+
+### Multiple schedules per task (schedule-as-entity)
+
+A task declares **one or more** schedules via `schedules: [...]` — each element is one
+firing rule with its own `data`, `externalId`/`dedupKey`, and policy overrides. One
+task + one schedule **per channel**, each carrying its own `{ "channelId": "UC-…" }`
+run parameters:
+
+```json
+{
+  "name": "sync-channel-stats",
+  "config": { "url": "http://worker/tasks/sync-stats" },
+  "schedules": [
+    {
+      "cron": "0 9 * * *",
+      "data": { "channelId": "UC-ada" },
+      "externalId": "ada",
+      "dedupKey": "channel-ada"
+    },
+    {
+      "cron": "0 9 * * *",
+      "data": { "channelId": "UC-sam" },
+      "externalId": "sam",
+      "dedupKey": "channel-sam"
+    }
+  ]
+}
+```
+
+- A schedule-fired run dispatches with the &#x2A;*schedule's `data`** (manual `POST /tasks/:name/run` keeps the task's defaults).
+- `externalId` is the tenant key (userId/orgId) — multi-tenancy from the first line.
+- `dedupKey` is the **idempotent upsert key**: creating a schedule with a key that
+  already exists updates that schedule instead of duplicating it. Must be unique across
+  the file (duplicates fail at load).
+- `retry`/`priority` at the schedule level override the task's (`schedule ?? task`
+  resolution — never a partial merge). Effective policy is materialized onto the
+  schedule row at sync (entry ?? task default) and at API create (`POST /schedules`), so a single-schedule task carries its task-level policy onto its
+  row. An entry that doesn't set `priority`/`retry` inherits the task default;
+  an explicit `0` priority is honored as-is (not treated as «unset»).
+- **Runtime state lives on the schedule row**: `nextRunAt`/`lastRunAt`/
+  `failCount`/`retryCount`/lock advance there — a schedule-fired run takes its
+  `data` from the schedule (falling back to the task's defaults when unset), and
+  its `RunRecord.scheduleId` names the schedule that fired it.
+- **Per-task ceiling 1**: a task's schedules are serialized — while one schedule
+  of a task is locked (in flight), its siblings are neither due nor claimable.
+  The contract «a task never runs twice» is preserved.
+
+### `priority`
+
+Non-negative integer (default `0`). Among due tasks, higher priority runs first
+(ties break by due time). With `maxConcurrent > 1`, priority determines claim order.
+A scheduled publish must beat a background transcode batch in the queue:
+
+```json
+{
+  "name": "publish-video",
+  "priority": 10,
+  "schedules": [{ "cron": "0 9 * * *" }],
+  "config": { "url": "..." }
+}
+```
+
+A schedule that doesn't set `priority` inherits the task's — the effective value
+is materialized onto the schedule row at sync and at `POST /schedules`. An
+explicit `priority: 0` on the entry wins over a task-level default.
+
+### `retry`
+
+Pulling analytics from an API that rate-limits: retry with backoff instead of
+failing the run.
+
+```json
+{
+  "name": "sync-channel-stats",
+  "schedules": [{ "cron": "*/15 * * * *" }],
+  "config": { "url": "..." },
+  "retry": { "maxAttempts": 3, "backoffMs": 60_000, "multiplier": 2 }
+}
+```
+
+- `maxAttempts` — **total** attempts budget (1 = no retries, the failure is final).
+- `backoffMs` — delay before the first retry; each consumed retry multiplies it by
+  `multiplier` (default `1` = fixed backoff). **Required** in the `retry` object
+  (write `0` when you don't retry, e.g. `{ "maxAttempts": 1, "backoffMs": 0 }`).
+- On a failed run with retries left, the engine schedules another attempt at
+  `now + backoff` instead of advancing the schedule. The failed run is still
+  recorded (with its `attempt` number); `failCount` is **not** bumped yet.
+- A **persistent failure** is one where retries ran out — only then is the run
+  counted (`failCount++`) and only then do alerts / `onRunFinal` fire. This is the
+  contract the AI-operator trigger builds on: N persistent fails in a window, not
+  N failed attempts.
+- A manual `triggerTask` never auto-retries — an explicit human trigger is a
+  one-shot, its result alerts immediately.
+
+## Fields
+
+| Field         | Type   | Default  | Description                                                                                                                                                                                      |
+| ------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`        | string | —        | Unique task name. Runs are recorded against it                                                                                                                                                   |
+| `runner`      | string | `"http"` | Which runner executes the task (http / docker / internal / custom)                                                                                                                               |
+| `schedules`   | array  | —        | Optional. One or more firing rules, each with its own `data`/policy. Omit → **trigger-only** task (never due, launched manually / from the API)                                                  |
+| `tz`          | string | `"UTC"`  | IANA timezone for cron wall-clock semantics (applies to schedules that don't set their own)                                                                                                      |
+| `config`      | object | —        | Runner-specific config, validated per runner at load (fail-fast)                                                                                                                                 |
+| `priority`    | number | `0`      | Task-level scheduling priority — the default for schedules that don't override it (engine feature)                                                                                               |
+| `retry`       | object | —        | Task-level retry policy: `{ maxAttempts, backoffMs, multiplier? }` — the default for schedules that don't override it (engine feature)                                                           |
+| `timeoutMs`   | number | `-1`     | Run-deadline contract: `-1` (default) = never auto-terminate (manual cancel only), `> 0` = force-fail after N ms (see [Run deadline](https://schedjs.github.io/schedjs/#run-deadline-timeoutms)) |
+| `label`       | string | —        | Human-readable label (admin UI); the engine ignores it                                                                                                                                           |
+| `description` | string | —        | Longer description (admin UI); the engine ignores it                                                                                                                                             |
+
+## Schedule kinds
+
+Exactly one schedule key per `schedules` element — anything else fails at load:
+
+```json
+{ "cron": "0 9 * * *" }          // cron expression, wall-clock in the schedule's tz
+{ "interval": "every 5 minutes" } // human interval (also: "every 1 hour", "every day at 09:00")
+{ "once": "tomorrow at noon" }    // one-shot: fires once, then unschedules
+```
+
+- `timezone` may sit inside the cron element (`{ "cron": "...", "timezone": "..." }`); it is
+  hoisted to that schedule's `tz`.
+- One-shot (`once`) schedules fire once; `nextRunAt` becomes `null` after firing.
+- Every element may also carry `data`, `externalId`, `dedupKey`, `retry`, `priority`
+  (see [Multiple schedules per task](https://schedjs.github.io/schedjs/#multiple-schedules-per-task-schedule-as-entity)).
+
+## Runner config
+
+Config is opaque to the engine and validated per runner at load time — a bad config
+aborts the daemon with a clear error instead of failing at runtime. Runners opt in via
+the optional `validateConfig` hook (see [Custom runners](https://schedjs.github.io/schedjs/runners/custom)): the docker
+runner, for example, aborts startup when a task's image is outside the runner's allowlist.
+
+- **http** — `url`, `method`, `headers`, `body`, `envelope`, `data`, `auth` — see
+  [HTTP runner](https://schedjs.github.io/schedjs/runners/http)
+- **docker** — `image`, `tag`, `command`, `args`, `env`, `data`, `timeoutMs`, `maxLogKb` —
+  see [Docker runner](https://schedjs.github.io/schedjs/runners/docker). Note the runner-level `config.timeoutMs`
+  also accepts `-1` = no container timeout (since daemon 0.11.0), mirroring the
+  task-level run-deadline `-1`
+- **custom** — whatever your runner's config shape is — see [Custom runners](https://schedjs.github.io/schedjs/runners/custom)
+
+## Pause — two levels (AND semantics)
+
+Pause exists on **both** the task and the schedule. A schedule-fired run fires iff
+`!task.paused && !schedule.paused`:
+
+- `task.paused` — the **family stop** (repair window): stops every schedule of
+  the task at once. `resumeTask` clears only this level.
+- `schedule.paused` — **one instance** (pause a single channel): stops just that
+  schedule. `resumeSchedule` clears only its level.
+
+`resume(task)` does not unpause schedules and vice versa — the UI shows the
+**effective** status (🔴 task-paused / 🟡 schedule-paused) so «снял паузу, а оно
+молчит» never happens. A pending retry is a due run of the schedule — pausing
+gates it too; unpausing re-arms it.
+
+## Sync semantics
+
+`tasks.json` is the source of truth on start:
+
+- new task → created (scheduled from its first `nextRunAt`)
+- changed task → updated in place
+- removed task → **disabled** (kept in history, never ticks again; re-adding it
+  to the file keeps it disabled — enable via `taskOps` in embedded code)
+
+The daemon **re-syncs on a live interval** (default 60 s, `syncIntervalMs`): an
+edit to `tasks.json` is picked up without a restart — same create / update /
+disable-on-remove semantics, runtime state preserved unless the schedule changed.
+A **broken file at runtime is ignored with a log** (last good state stays, the
+daemon keeps running); fail-fast applies only to the startup load. Force a
+re-sync on demand with `daemon.runSyncOnce()`.
+
+The engine does **not** back-fill missed slots: a task whose `nextRunAt` is in the past
+fires once on the next tick, then reschedules from *completion time*.
+
+**Long tasks and the lock TTL.** A sync run longer than `lockTtlMs` (default 30 min)
+keeps its lock via the engine's heartbeat (`lockHeartbeatMs`, default `lockTtlMs / 3` =
+10 min) — it is never reaped mid-flight by the zombie watchdog. The watchdog only
+reaps locks whose heartbeat died (daemon down). The hung-run ceiling is the runner's
+own `timeoutMs` (process / docker / http / ssh), not the lock TTL. See
+[Runs → Long runs and the lock heartbeat](https://schedjs.github.io/schedjs/runs#long-runs-and-the-lock-heartbeat).
+
+**Runtime registration.** Tasks can also be created / updated / rescheduled at runtime
+via the admin API — `POST /tasks` (full definition, `schedules: [...]` supported) and
+`POST /schedules` (one firing rule at a time, same validation as `tasks.json`, no
+restart). Runtime-registered tasks are **not** file-managed: sync never disables them
+(they survive live re-syncs and restarts) — remove one with `DELETE /tasks/:name`. See
+[Admin API → Runtime registration](https://schedjs.github.io/schedjs/admin-api#runtime-registration-post-tasks).
+
+
+# Runs
+
+Every execution of a task is a **run** — recorded in storage, visible in the admin UI
+and the API. This is sched's promise: the scheduler knows everything about every run.
+
+## RunRecord
+
+```ts
+interface RunRecord {
+  id: string;                 // UUID — idempotency on the wire
+  taskName: string;
+  runner: string;             // 'http' | 'docker' | custom
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  data: unknown | null;       // run parameters snapshot at start
+  result: unknown | null;     // final result reported by the worker
+  error: string | null;
+  progress: number | null;    // 0–100, written mid-flight
+  log: string | null;         // captured stdout/stderr, soft-capped
+  artifacts: ArtifactRef[] | null;  // { kind: 's3'|'email'|'url'|'file', ref, label }
+  workerRef: string | null;   // statusUrl (http) / container_id (docker)
+  attempt: number;            // 1-based attempt within the retry cycle (1 = first try)
+  trigger: 'schedule' | 'manual'; // how the run was launched — the tick, or an explicit trigger/retry
+  triggeredBy: string | null; // who launched a manual run (email/identity); null for schedule runs
+  scheduleId: string | null;  // the schedule that fired this run; null = manual/trigger
+  temporary: boolean;         // retention class: true = short TTL (24h), false = long (30d)
+  retryOf: string | null;     // predecessor run id (manual retry / engine auto-retry); null = fresh
+  startedAt: Date;
+  finishedAt: Date | null;
+}
+```
+
+`data` is a snapshot of the run parameters taken at dispatch: from the **schedule's**`data` for a schedule-fired run (falling back to the task's `config.data` /
+`config.body` when the schedule carries none), or from the task's defaults for a
+manual trigger — merged with the caller's `{ data }` override
+(`triggerTask(name, { data })` → `{ ...config.data, ...data }`, books one-off
+parity). The worker receives the same snapshot the run record carries: at dispatch
+the runner's payload (`config.data`/`config.body`) is overridden with the run data
+when the run carries explicit data, so a manual trigger's override and a retry's
+snapshot reach the worker — not just the audit trail. `scheduleId` answers "which
+schedule shot" — per-tenant usage counting falls out of it for free.
+
+## Run metadata
+
+Four first-class fields:
+
+- **`trigger`** — `'schedule'` (fired by the tick) or `'manual'` (`triggerTask` / manual retry).
+- **`triggeredBy`** — caller identity of a manual run. sched is identity-agnostic:
+  the caller supplies it (`triggerTask(name, { triggeredBy })`); the admin api
+  forwards `{ triggeredBy }` from the run/retry bodies (null when omitted).
+- **`temporary`** — retention class, per-invocation. A temporary run is pruned after
+  24h, a regular one after 30d. Manual retries inherit the original's class.
+- **`retryOf`** — the predecessor run: the retried run (manual retry) or the failed
+  attempt (engine auto-retry, linked through `task.lastRunId`). Together with
+  `attempt` this forms a connected chain: attempt = position, retryOf = predecessor.
+
+## Retention
+
+The engine sweeps terminal runs (`succeeded | failed | cancelled`) on its own
+cadence — no daemon-only cron needed, embedded engines stay clean too:
+
+- `temporary: true` runs older than **24h** (`temporaryRetentionMs`) are deleted.
+- regular runs older than **30d** (`retentionMs`) are deleted.
+
+`runRetentionOnce()` runs the sweep on demand; the daemon's retention loop calls
+it hourly (configurable via `retentionIntervalMs`). Non-terminal runs are never
+pruned by the sweeper — the watchdog handles zombie locks instead.
+
+## Manual retry
+
+`POST /runs/:id/retry` (admin api) re-executes a run: the new run gets
+`data = run.data` (the original snapshot, not task defaults), `retryOf = run.id`,
+`trigger = 'manual'`, `temporary` inherited from the original, and a fresh
+`triggeredBy` — and the worker is dispatched with the original snapshot, not the
+task defaults. The original run is never modified — the audit trail stays intact.
+
+## Lifecycle
+
+```text
+        claimed          dispatched              worker reports
+  ───────────▶ ───────────▶ ────────────────────▶ ──────────────────▶
+  (created)     queued        running               succeeded | failed | cancelled
+                (async:       (worker started)     (terminal)
+                 accepted
+                 + poll)
+```
+
+- **Sync runs** — the worker answers within the request: outcome is terminal immediately.
+- **Async runs** — the worker answers `202 accepted` with a `statusUrl`; the run goes
+  `queued`, then `running`, and the engine polls until a terminal response (or
+  `pollTimeoutMs`, default 25 min, is exceeded → `failed`).
+- **Cancelled** — timeout escalation in the docker runner (SIGTERM → SIGKILL), an
+  explicit cancel, or startup recovery (see below). User cancel (`POST /runs/:id/cancel`) aborts the runner via `hooks.signal` — the worker is really
+  stopped (process/docker/ssh kill, http abort), not just re-labelled. A `queued`
+  async run is cancelled by **signalling the worker first**: when the accepted
+  envelope advertised a `cancelUrl`, sched POSTs `{ runId }` there and the worker
+  stops at the next stage boundary (see [Runner protocol → Cancel](https://schedjs.github.io/schedjs/protocol#cancel));
+  without one, cancel = drop from the poll queue (the worker may finish on its own
+  — the run record says so honestly), schedule advanced, lock released.
+- **Timeout** — the same worker signal is sent on auto-termination. When an async
+  run hits its `pollTimeoutMs` or per-task `timeoutMs` ceiling, sched POSTs
+  `{ runId }` to the advertised `cancelUrl` **before** failing the run, so the
+  worker stops at the next stage boundary instead of finishing destructive work
+  after the `failed` verdict was already recorded. A worker without a `cancelUrl`
+  is left to finish on its own (legacy stop-polling); a failed cancel signal is
+  appended to the run error.
+
+## Restart recovery
+
+A restart in the middle of a long run used to leave a **ghost** `running`/`queued`
+run forever: the poll queue is in-memory (lost), `pruneRuns` only touches terminal
+runs, and the zombie watchdog only reaps *task locks* — the run record stayed
+`running` with `finishedAt = null`. The daemon now recovers on start
+(`engine.recoverOrphanRuns()`):
+
+- every `running`/`queued&#x60; run left by the previous process → &#x2A;*`cancelled`** with
+  `error: "daemon restarted — orphaned run recovered"` (visible in the UI/API
+  history, not a silent hole);
+- every task lock → **released immediately** (no waiting for `lockTtl`);
+- `failCount` is **not** bumped — an interrupted run is an infrastructure event,
+  not a task failure;
+- the affected tasks re-dispatch on the next tick (catch-up) — at-least-once
+  intact.
+
+The recovery fires the `recovered-orphans` engine event (see
+[Logging → Engine events](https://schedjs.github.io/schedjs/logging#_3-engine-events-claim-dispatch-retry-zombie-reap))
+and is safe with the lock heartbeat: a heartbeat only lives in a live process, so
+at startup every lock is by definition orphaned.
+
+## Long runs and the lock heartbeat
+
+A &#x2A;*sync run longer than `lockTtlMs`** (default 30 min) would otherwise be reaped by
+the zombie watchdog mid-flight — the lock ages past the TTL while the worker is still
+alive, the next tick re-dispatches the task, and two parallel runs happen. The engine
+prevents that by refreshing the task's lock
+&#x2A;*every `lockHeartbeatMs`** (default `lockTtlMs / 3` = 10 min at the default)
+while the run is in flight, so the watchdog only ever reaps genuinely dead locks:
+
+- **Daemon alive, run alive** → heartbeat keeps `lockedAt` fresh → no reap, no
+  duplicate dispatch.
+- **Daemon down** → heartbeat stops → the lock ages past `lockTtlMs` → the
+  watchdog reaps it on restart → the run re-dispatches. At-least-once intact.
+
+Trade-off: a *hung* sync run whose heartbeat still fires keeps its lock fresh — the
+heartbeat is liveness, not a timeout. The ceiling for a hung run stays at the
+**runner level** (process / docker / http / ssh `timeoutMs`); there is no engine-level
+sync timeout. If your sync workers have no runner timeout, a truly wedged worker
+blocks the task until the daemon restarts — set the runner timeouts.
+
+Async (`accepted`) runs are covered by a different invariant: `pollTimeoutMs`
+(default 25 min) is documented &#x2A;*must be < `lockTtlMs`**, so the poll fails a hung
+run before the watchdog could reap its lock. The heartbeat targets the sync path,
+which has no ceiling of its own.
+
+Configure via `--lock-heartbeat SECONDS` (daemon) or `lockHeartbeatMs`
+(embedded `createEngine` / `createDaemon`).
+
+## Failures are recorded, not silent
+
+- Worker error → `failed` with `error` and whatever `log` was captured.
+- Missing runner → fail-fast: `runner "X": not implemented in this build`.
+- Poll errors (non-2xx, malformed envelope) → throw → run `failed`.
+- Task `failCount` increments; the schedule stays on schedule (its next run still fires).
+
+A terminal run can also push a **status alert** (webhook) — see
+[Self-hosting → Status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts); the alert fires on the
+final, exhausted failure, not on retries ([Tasks → retry](https://schedjs.github.io/schedjs/tasks#retry)).
+
+## What's in the log
+
+`log` is the captured stdout/stderr of the worker, soft-capped (docker: ring-buffer,
+default 10 KB; http: whatever the envelope reports).
+
+## Artifacts — who generates what
+
+sched does **not** generate artifacts. Reports, uploads, emails — that's the runner's
+job: it has the data and the credentials. sched only **stores what the runner reports**
+and shows it in the UI.
+
+```ts
+// ArtifactRef — returned by the runner in the envelope
+{ kind: 's3' | 'email' | 'url' | 'file', ref: 's3://bucket/key', label: 'Report' }
+```
+
+| kind    | ref example                               | meaning                                         |
+| ------- | ----------------------------------------- | ----------------------------------------------- |
+| `s3`    | `s3://my-bucket/task-reports/a/run123.md` | object key in object storage (Minio/S3)         |
+| `email` | message id / mailto:                      | email sent by the worker (receipt, not content) |
+| `url`   | `https://...`                             | external link                                   |
+| `file`  | local path                                | local artifact (docker runner output)           |
+
+The runner uploads the artifact to wherever it wants (S3, email, webhook) and hands
+sched the reference. sched persists `artifacts` on the RunRecord and the admin UI links
+to them.
+
+**Reading artifacts** — two modes:
+
+- **Direct URL** (default): the UI links straight to `ref` (`s3://`, `https://`).
+  Works when the artifact is public or the client has access.
+- **Proxy** (optional): if the daemon has object-storage credentials, an
+  authorized route `GET /api/runs/:id/artifacts/:idx` streams the object so the bucket
+  can stay private.
+
+**Failure is soft**: a worker that can't upload (S3 down) should still finish the run
+and report the problem in `error`/`result` — a missing artifact must not fail the run
+by itself.
+
+**Idempotency**: on a retry, re-use the existing artifact (`ref` already set) instead
+of re-generating.
+
+
+# Runner protocol
+
+The wire contract between sched and workers. Workers stay dumb: **receive → execute →
+report back**. sched owns the history (Model A).
+
+## Request envelope (daemon → worker)
+
+```text
+POST {config.url}
+headers:
+  x-sched-run-id: <runId>          # idempotency: worker dedupes by run id
+  x-sched-api-key: <apiKey>        # outbound auth (when config.auth is set)
+  content-type: application/json
+body: {
+  "task": { "name": "...", "config": { ... } },
+  "data": { ... }                  # run parameters
+}
+```
+
+Sending `x-sched-run-id` always is the sched side of idempotency: a worker that stores
+results by `runId` answers a redelivery with the saved outcome instead of re-executing.
+
+## Response envelope (worker → daemon)
+
+**Sync outcome** (short jobs, within the request timeout):
+
+```text
+200 {
+  "status":   "succeeded" | "failed",
+  "result":   { ... } | null,
+  "error":    "..." | null,          # required when failed
+  "progress": 100 | null,
+  "log":      "..." | null,          # captured stdout/stderr, soft-capped
+  "artifacts": [ { "kind": "s3"|"email"|"url"|"file", "ref": "...", "label": "..." } ] | null
+}
+```
+
+**Artifacts are generated by the worker, never by sched.** The worker uploads the
+artifact (S3 object, email, file) and hands sched a reference; sched persists it on the
+run and the UI links to it. A failed upload is reported in `error`/`result`, not by
+failing the run. See [Artifacts](https://schedjs.github.io/schedjs/runs#artifacts-who-generates-what).
+
+**Async lifecycle** (long jobs):
+
+```text
+202 { "status": "accepted", "statusUrl": "http://worker/status/<runId>", "cancelUrl": "http://worker/cancel/<runId>", "pollIntervalMs": 1000 }
+```
+
+`statusUrl` may be **relative** — it is resolved against the task's `config.url`
+(standard URL resolution: `/status/<id>` = origin-relative, `status/<id>` =
+path-relative). A worker must not need to know its externally reachable address;
+absolute URLs pass through unchanged.
+
+The run is marked `queued`; the engine then **polls** `statusUrl` (same outbound auth)
+until a terminal envelope arrives. Intermediate responses update progress/log/result
+without completing the run:
+
+```text
+200 { "status": "queued" | "running", "progress": 50, "log": "..." }
+```
+
+**Cancel.** `cancelUrl` is optional — a worker that advertises it gets a real
+cancel channel: `POST /runs/:id/cancel` makes sched POST `{ "runId": "<id>" }`
+to `cancelUrl` (same outbound auth + `x-sched-run-id` header) *before* finishing
+the run `cancelled`. The worker must stop the pipeline at the next stage boundary
+— no new external mutations (npm publish, git push, …) after acknowledging the
+cancel — and may keep serving `statusUrl` until it actually stops. A worker
+*without* `cancelUrl` keeps the legacy semantics: cancel = stop polling, the
+worker may finish on its own (documented — never rely on it for destructive
+stages). If the cancel signal itself fails (worker unreachable), the run is
+still `cancelled` but its error reads `cancelled by user (cancel signal failed: <reason>)` — the operator knows the worker may still be running.
+
+## Stdio transport
+
+The envelope is transport-agnostic. Over HTTP it travels as request/response bodies;
+over stdio (the process and docker runners' `envelope: true`) it travels on the child's
+pipes:
+
+```text
+stdin:   { "task": { "name": "...", "config": { ... } }, "data": { ... } }   (then EOF)
+stdout:  NDJSON envelopes — intermediate { "status": "running", "progress": 42 },
+         then one terminal { "status": "succeeded"|"failed"|"cancelled", ... }
+stderr:  worker logs (never stdout — stdout is the protocol channel)
+```
+
+Intermediate `running` progress is **persisted live** by the engine (`onProgress` →
+storage.updateRun) as it arrives, so the UI shows the counter growing before the run
+finishes — not just the final value written at completion.
+
+The worker still gets the run metadata as env (`SCHED_RUN_ID`, `SCHED_TASK_NAME`)
+plus the data-derived vars. Reference worker: `examples/stdio-worker.mjs`.
+
+## Why polling, not callbacks
+
+- The daemon opens no inbound surface → auth stays outbound-only, simpler.
+- Repeats the worker pattern of *getting* status rather than receiving pushes.
+- For docker, the daemon owns the container lifecycle anyway.
+
+Callbacks (worker → daemon push) are a future option — they'd need an inbound surface + auth.
+
+## Fail-fast rules
+
+- **Envelope mode + non-envelope 2xx = broken worker.** A task with
+  `config.envelope: true` whose dispatch response is a 2xx without a valid
+  envelope (`status` string) fails the run with `envelope mode but non-envelope 2xx body — broken worker` — it never silently falls back to simple-mode
+  success (same doctrine as the stdio runners).
+- `accepted` without a `poll()` implementation → run fails immediately.
+- `accepted` without a `statusUrl`, or with an unresolvable one → run fails.
+- **Run deadline (task `timeoutMs`):** `> 0` force-fails the run after N ms
+  from start (async: the per-task poll ceiling, overriding the global
+  `pollTimeoutMs`; sync: abort via the runner's signal). Before failing, sched
+  **signals the worker to stop** when the accepted envelope advertised a
+  `cancelUrl` — same `POST { runId }` as user cancel, so the worker halts at
+  the next stage boundary *before* any further external mutations (a timed-out
+  run must not keep publishing while the verdict says `failed`). A signal
+  failure is appended to the run error (`cancel signal failed: <reason>`) so
+  the operator knows the worker may still be running. `-1` (the default
+  when omitted) = never auto-terminate — only manual cancel stops the run.
+- **Transient poll errors are retried** (network errors, 5xx, 408/429 — 2
+  retries by default, 500 ms apart) before the run is given up; permanent poll
+  errors (4xx, non-envelope, unexpected status) fail immediately.
+- **Poll failures are labelled:** every poll-originated failure is recorded as
+  `http runner: poll failed: <reason>` (e.g. `poll failed: fetch failed`), so
+  the operator can tell a lost poll connection apart from a worker-reported
+  terminal failure.
+- Poll errors (non-2xx after retries, malformed envelope, unexpected status) → run `failed`.
+- `pollTimeoutMs` (default 25 min, must be < `lockTtlMs` — 5 min margin under the 30 min default so the poll fails a hung async run before the zombie watchdog can re-dispatch it) caps a hung async run. On firing, sched **signals the worker to stop** via the accepted envelope's `cancelUrl` (same `POST { runId }` as user cancel) before failing the run — the worker halts at the next stage boundary, so a `failed` verdict is not contradicted by a worker that keeps mutating. A worker without a `cancelUrl` keeps the legacy stop-polling semantics (it may finish on its own). Configure it via `createEngine({ pollTimeoutMs })` in embedded mode, or `--poll-timeout SECONDS` / `DaemonOptions.pollTimeoutMs` in the daemon.
+
+## Worker examples by language
+
+The envelope contract is deliberately SDK-free: any language with HTTP + JSON
+implements a worker with nothing but its standard library. Reference workers
+(`examples/workers/`), one file each:
+
+| Language | Worker                               | Run                                                            | Default port |
+| -------- | ------------------------------------ | -------------------------------------------------------------- | ------------ |
+| Go       | `examples/workers/go/worker.go`      | `cd examples/workers/go && go run .`                           | 8080         |
+| Python   | `examples/workers/python/worker.py`  | `cd examples/workers/python && python3 worker.py`              | 8081         |
+| C#       | `examples/workers/csharp/Program.cs` | `cd examples/workers/csharp && dotnet run`                     | 8082         |
+| Java     | `examples/workers/java/Worker.java`  | `cd examples/workers/java && javac Worker.java && java Worker` | 8083         |
+
+Each worker implements two example tasks — `ping` (sync) and `long` (async
+with `statusUrl` polling) — plus optional auth (`SCHED_API_KEY` →
+`x-sched-api-key` on dispatch and poll) and run-id idempotency (results stored
+by `x-sched-run-id`, redelivery answers with the saved outcome).
+
+See `examples/workers/README.md` for the full task contract, per-language setup
+and curl validation scenarios.
+
+
+# HTTP runner
+
+The HTTP runner fires a request per the task's config. Two modes:
+
+- **Simple (default)** — raw `config.body`, any 2xx = `succeeded`, run id sent in the
+  `x-sched-run-id` header.
+- **Envelope mode** (`config.envelope: true`) — the request body becomes
+  `{ task: { name, config }, data }` and the response is parsed per the
+  [runner protocol](https://schedjs.github.io/schedjs/../protocol) (sync or `202 accepted` + poll).
+
+## Config
+
+| Field       | Type                  | Description                                                                                                                                                                                   |
+| ----------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`       | string                | **Required.** Request URL                                                                                                                                                                     |
+| `method`    | string                | HTTP method (default `GET`)                                                                                                                                                                   |
+| `headers`   | object                | Extra request headers                                                                                                                                                                         |
+| `body`      | unknown               | Request body (simple mode; also the `data` fallback in envelope mode)                                                                                                                         |
+| `envelope`  | boolean               | Protocol mode (v2): `{ task, data }` body + envelope response parsing                                                                                                                         |
+| `data`      | unknown               | Run parameters for the envelope's `data` field. Takes priority over `body`                                                                                                                    |
+| `timeoutMs` | number                | **Transport** timeout for one request (dispatch and poll), default 30s. The **run** deadline is the task-level `timeoutMs` (see below) — an explicit `config.timeoutMs` override wins over it |
+| `auth`      | `{ apiKey, header? }` | Outbound auth — sent on dispatch **and** poll                                                                                                                                                 |
+
+## Outbound auth
+
+```json
+{
+  "url": "https://worker.example.com/run",
+  "method": "POST",
+  "envelope": true,
+  "auth": { "apiKey": "secret-key" }
+}
+```
+
+The key is sent as `x-sched-api-key` by default (override the header name with
+`auth.header`). It is attached to **both** the dispatch request and every poll request.
+Validation happens at config load (fail-fast): `apiKey` must be non-empty.
+
+## Envelope mode example
+
+Task hitting a worker that implements the protocol:
+
+```json
+{
+  "name": "publish-video",
+  "schedules": [{ "cron": "* * * * *" }],
+  "config": {
+    "url": "https://worker.example.com/publish",
+    "method": "POST",
+    "envelope": true,
+    "data": { "videoId": "v-42" },
+    "auth": { "apiKey": "secret" }
+  }
+}
+```
+
+The worker receives:
+
+```json
+{
+  "task": { "name": "publish-video", "config": { "url": "...", "envelope": true, "data": { "videoId": "v-42" } } },
+  "data": { "videoId": "v-42" }
+}
+```
+
+and answers with a sync envelope or `202 accepted` + `statusUrl` — see the
+[runner protocol](https://schedjs.github.io/schedjs/../protocol) for the response shapes.
+
+## Envelope-mode guardrails (battle-stand hardening)
+
+- **Broken worker, never silent success.** `envelope: true` + a 2xx response
+  without a valid envelope (no `status` field) fails the run with
+  `envelope mode but non-envelope 2xx body — broken worker` — the simple-mode
+  fallback only applies when envelope mode is off.
+- **Relative `statusUrl` is resolved** against `config.url` (`/status/<id>` →
+  origin-relative, `status/<id>&#x60; → path-relative). A worker must not know its
+  external address; absolute URLs pass through unchanged. The optional
+  &#x2A;*`cancelUrl`** in the accepted envelope is resolved the same way — see the
+  [cancel channel](https://schedjs.github.io/schedjs/../protocol#cancel) in the runner protocol.
+- **Transient poll failures are retried** (network errors, 5xx, 408/429 — 2
+  retries by default, 500 ms apart; tune via `createHttpRunner({ pollRetries, pollRetryDelayMs })`). Every poll-originated failure is recorded as
+  `http runner: poll failed: <reason>` so the operator can tell a lost poll
+  from a worker-reported failure.
+- **Async cancel.** On `POST /runs/:id/cancel` of a `queued`/async run, the
+  runner POSTs `{ runId }` to the worker's advertised `cancelUrl` (same auth +
+  `x-sched-run-id`) before the engine finishes the run `cancelled`. The same
+  signal fires on **auto-termination** — when an async run hits its
+  `pollTimeoutMs` or per-task `timeoutMs` ceiling, the runner POSTs `{ runId }`
+  to `cancelUrl` before the engine fails the run, so a timed-out worker stops at
+  the next stage boundary instead of mutating after the `failed` verdict. A worker
+  without a `cancelUrl` is left to finish on its own (legacy stop-polling).
+- **Run deadline.** The dispatch request is capped by the task-level `timeoutMs`
+  when it governs: `timeoutMs: -1` (the default when omitted) removes the
+  transport timeout entirely (only the engine/manual abort stops the run — for
+  hour-scale sync tasks), a positive `timeoutMs` caps the dispatch at the
+  deadline. Poll requests keep their own short transport guard (the run duration
+  is bounded by the task deadline / engine `pollTimeoutMs`, not by poll latency).
+
+
+# Docker runner
+
+The Docker runner spawns a container per run via the `docker` CLI (`docker run --rm`),
+captures output, and maps the exit code to the run status.
+
+## Config
+
+| Field          | Type      | Default        | Description                                                                                                                                                                                      |
+| -------------- | --------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `image`        | string    | —              | **Required.** Image name (may include a tag: `alpine:3.20`)                                                                                                                                      |
+| `tag`          | string    | image tag      | Explicit tag (`alpine` + `tag: "3.20"` → `alpine:3.20`)                                                                                                                                          |
+| `command`      | string [] | —              | Override the container command: `command[0]` → `--entrypoint`, `command[1..]` → argv after the image                                                                                             |
+| `args`         | string [] | —              | Extra arguments                                                                                                                                                                                  |
+| `env`          | object    | —              | Static env vars (win over `data`-derived vars)                                                                                                                                                   |
+| `data`         | unknown   | —              | Run parameters → `SCREAMING_SNAKE` env vars + `SCHED_DATA` (JSON)                                                                                                                                |
+| `timeoutMs`    | number    | 300000 (5 min) | Timeout: SIGTERM → 10s grace → SIGKILL → `cancelled`. `-1` = **no timeout** — the container runs until it exits or is cancelled by the operator (matching the task-level run-deadline semantics) |
+| `maxLogKb`     | number    | 10             | Ring-buffer log cap                                                                                                                                                                              |
+| `allowedTools` | string [] | —              | Sandbox: images/commands this task may run (`image@command` specs) — see [Security](https://schedjs.github.io/schedjs/../security)                                                               |
+| `envelope`     | boolean   | false          | **Experimental.** Stdio contract — see below                                                                                                                                                     |
+
+## Environment
+
+Every container gets:
+
+- `SCHED_RUN_ID` — the run id
+- `SCHED_TASK_NAME` — the task name
+- `data` → each top-level key as `SCREAMING_SNAKE` env var (`{ "userId": 42 }` →
+  `USER_ID=42`) plus `SCHED_DATA` with the full JSON. Static `env` wins over data-derived vars.
+  Two data keys that map to the same env var (`fooBar` and `foo_bar` → `FOO_BAR`) are an error:
+  config validation fails fast at load time, and a run that slips through fails instead of
+  silently last-write-wins.
+
+## Exit codes
+
+| Exit     | Result                                   |
+| -------- | ---------------------------------------- |
+| `0`      | `succeeded`                              |
+| non-zero | `failed` with `exit N` + tail of the log |
+| timeout  | SIGTERM → SIGKILL → `cancelled`          |
+
+`config.timeoutMs: -1` disables the container timeout entirely — the process
+runs until it exits on its own or is cancelled manually. (Before daemon 0.11.0 a
+`-1` was passed straight into `setTimeout` and killed the container instantly
+with `timeout after -1ms`.)
+
+## Stdio contract (`envelope: true`) — experimental
+
+> **Experimental.** The [process runner](https://schedjs.github.io/schedjs/process) ships a reference worker for the
+> stdio contract; a container image that speaks it is not published yet. Enable it
+> when your own image implements the contract (see below) — exit-code mode remains
+> the default and is unchanged.
+
+Opt-in protocol mode for containers that want to report progress and results
+structurally. The container speaks the [stdio transport](https://schedjs.github.io/schedjs/../protocol#stdio-transport):
+
+- **request** — one JSON envelope `{ "task": { "name", "config" }, "data" }` on
+  **stdin** (`docker run -i`, attached automatically), then EOF
+- **progress** — NDJSON lines on **stdout**: intermediate
+  `{ "status": "running", "progress": 42 }`
+- **result** — one terminal line on **stdout** (same envelope shape as the process
+  runner / HTTP runner)
+- **logs** — anything else on **stderr** (never stdout — stdout is the protocol)
+
+```json
+{ "runner": "docker", "config": { "image": "registry/my-worker", "envelope": true, "data": { "videoId": "v-42" } } }
+```
+
+A container that opted in but exits without a terminal envelope is a broken worker: the
+run fails with a clear protocol error. A container without `envelope` keeps the plain
+exit-code mapping — the two modes never mix.
+
+## Private registries (auth)
+
+The runner spawns the **docker CLI** (`docker run --rm`), not the docker HTTP API — so
+CLI credential resolution applies. `docker run` pulls an image that is not present
+locally, and that implicit pull authenticates exactly like `docker pull`:
+
+- **The CLI must exist in the daemon's image.** The official `sched-daemon` image
+  ships `docker-cli` (added 2026-08-22 after books' T2 finding); a custom/composed
+  image that drops it needs `apk add docker-cli` (alpine) — otherwise every
+  docker task fails with `ENOENT` at spawn.
+- `$DOCKER_CONFIG/config.json` (default `~/.docker/config.json`) — mount it into the
+  daemon's container (`/root/.docker/config.json`) or point `DOCKER_CONFIG` at a volume.
+- The same file that `docker login` writes — no sched-side config, no env creds.
+- Works unchanged behind a read-only docker-socket proxy (`DOCKER_HOST`): credentials
+  are a CLI-side concern, the proxy passes the pull through.
+
+The image allowlist is matched **by name/command string only** (`image[@command]`);
+registry auth never affects allowlist matching or tag resolution (default `:latest`,
+explicit `tag` wins — pure string logic). The actual tag dereference happens at pull
+time inside the docker daemon, which is exactly where the credentials apply. A pull
+that fails auth surfaces as a run failure (`docker run` exits non-zero with the
+registry's 401 in the log).
+
+## Security: sandbox (`allowedTools`)
+
+The runner is constrained by the sandbox ceiling — pass `allowedTools` when
+creating the runner (or set it in the daemon build / tasks.json `runners` block,
+see [Security](https://schedjs.github.io/schedjs/../security)). Exact names and trailing wildcards are supported:
+`allowedTools: ['alpine:*', 'ghcr.io/my-org/*']`. A task whose image/command is
+not allowed fails fast **before** any container is spawned.
+
+A ceiling spec with a command dimension (`alpine@echo`) also blocks tasks that
+omit an explicit command (the image's default entrypoint) — to allow the image
+default, use `alpine` (no `@`).
+
+```ts
+import { createDaemon } from '@schedjs/daemon';
+import { createDockerRunner } from '@schedjs/core';
+
+const daemon = createDaemon({
+  dbPath: 'sched.db',
+  tasksPath: 'tasks.json',
+  runners: {
+    docker: createDockerRunner({ allowedTools: ['alpine:*', 'busybox:*'] }),
+  },
+});
+```
+
+## Production note
+
+Never expose a raw docker socket to the network. On a host, route the daemon through a
+read-only docker-socket proxy (e.g. tecnativa with `POST=0`) and keep the allowlist on —
+see [Self-hosting](https://schedjs.github.io/schedjs/../self-hosting).
+
+
+# Process runner
+
+The process runner executes a local command per run — no Docker, no HTTP. It is the
+lightweight sibling of the [Docker runner](https://schedjs.github.io/schedjs/docker): same exit-code mapping, same
+environment contract, but the command runs directly on the daemon host.
+
+## Config
+
+| Field          | Type      | Default        | Description                                                                                             |
+| -------------- | --------- | -------------- | ------------------------------------------------------------------------------------------------------- |
+| `command`      | string [] | —              | **Required.** The full argv, no shell: `command[0]` is the executable (`node`, `python3`, `powershell`) |
+| `args`         | string [] | —              | Extra argv appended after `command`                                                                     |
+| `env`          | object    | —              | Static env vars (win over `data`-derived vars)                                                          |
+| `data`         | unknown   | —              | Run parameters → `SCREAMING_SNAKE` env vars + `SCHED_DATA` (JSON)                                       |
+| `envelope`     | boolean   | false          | Stdio contract — see below                                                                              |
+| `cwd`          | string    | daemon cwd     | Working directory for the command                                                                       |
+| `timeoutMs`    | number    | 300000 (5 min) | Timeout: SIGTERM → 10s grace → SIGKILL → `cancelled`                                                    |
+| `maxLogKb`     | number    | 10             | Ring-buffer log cap                                                                                     |
+| `allowedTools` | string [] | —              | Sandbox: executables this task may run — see [Security](https://schedjs.github.io/schedjs/../security)  |
+
+## No shell, by design
+
+`command` is an explicit argv, never a shell string. Shell features (globs, pipes,
+redirects) are not available — the interpreter is explicit:
+
+```json
+{ "runner": "process", "config": { "command": ["node", "/opt/scripts/report.mjs"] } }
+{ "runner": "process", "config": { "command": ["powershell", "-File", "C:\\ops\\check.ps1"] } }
+```
+
+There is no injection surface beyond what the operator writes in `tasks.json`.
+
+## Environment
+
+Identical to the Docker runner — **the child's environment is replaced, not
+inherited**: the daemon's ambient `process.env` (PATH, HOME, …) is NOT passed
+down. The child sees only the items below. Isolated on purpose (docker-parity: the
+worker never sees the daemon's secrets).
+
+- `SCHED_RUN_ID` — the run id
+- `SCHED_TASK_NAME` — the task name
+- `data` → each top-level key as `SCREAMING_SNAKE` env var (`{ "userId": 42 }` →
+  `USER_ID=42`) plus `SCHED_DATA` with the full JSON. Static `env` wins over data-derived vars.
+  Two data keys that map to the same env var (`fooBar` and `foo_bar` → `FOO_BAR`) are an
+  error: the run fails fast instead of silently overwriting.
+
+## Exit-code mapping (default)
+
+- `0` → `succeeded` (log attached)
+- `!=0` → `failed` `exit N: <tail>`
+- timeout → killed (SIGTERM, SIGKILL after grace) → `cancelled`
+- spawn error (executable missing) → `failed`
+
+## Stdio contract (`envelope: true`)
+
+Opt-in protocol mode for workers that want to report progress and results
+structurally. The worker speaks the [stdio transport](https://schedjs.github.io/schedjs/../protocol#stdio-transport):
+
+- **request** — one JSON envelope `{ "task": { "name", "config" }, "data" }` on **stdin**
+  (then EOF)
+- **progress** — NDJSON lines on **stdout**: intermediate
+  `{ "status": "running", "progress": 42 }`
+- **result** — one terminal line on **stdout**:
+  `{ "status": "succeeded"|"failed"|"cancelled", "result", "error", "progress", "log", "artifacts" }`
+- **logs** — anything else on **stderr** (never stdout — stdout is the protocol channel)
+
+A worker that opted in but exits without a terminal envelope is a broken worker: the run
+fails with a clear protocol error, never silently passes.
+
+Reference implementation: `examples/stdio-worker.mjs` (in the repo's `examples/workers/`).
+
+```json
+{
+  "tasks": [
+    {
+      "name": "export-captions",
+      "schedules": [{ "cron": "0 9 * * *" }],
+      "runner": "process",
+      "config": {
+        "command": ["node", "/opt/workers/captions.mjs"],
+        "envelope": true,
+        "data": { "videoId": "v-42", "language": "en" }
+      }
+    }
+  ]
+}
+```
+
+## Security: sandbox (`allowedTools`)
+
+Like the Docker runner's `allowedTools`, the process runner gates commands —
+see [Security](https://schedjs.github.io/schedjs/../security) for the full model (per-task + ceiling):
+
+```ts
+createProcessRunner({
+  allowedTools: ['node', 'python3', 'powershell*'], // exact or trailing-*
+});
+```
+
+A task whose `command[0]` is outside the allowlist fails at load time
+(`validateConfig`) — before any run — and never spawns at dispatch.
+
+
+# SSH runner
+
+The SSH runner executes a remote command per run over an SSH connection (`ssh2`),
+captures stdout+stderr, and maps the exit code to the run status — the same sync
+mapping as the [Docker](https://schedjs.github.io/schedjs/docker) and [Process](https://schedjs.github.io/schedjs/process) runners, but on a remote host.
+
+## Config
+
+| Field          | Type      | Default        | Description                                                                                                                                       |
+| -------------- | --------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host`         | string    | —              | **Required.** Remote host                                                                                                                         |
+| `port`         | number    | 22             | SSH port                                                                                                                                          |
+| `username`     | string    | —              | **Required.** Remote user                                                                                                                         |
+| `command`      | string    | —              | **Required.** The remote shell command (POSIX sh on the far side)                                                                                 |
+| `auth`         | object    | —              | **Required.** Exactly one of `keyFromEnv` / `passwordFromEnv` — see below                                                                         |
+| `fingerprints` | string [] | —              | Host-key pins — see below                                                                                                                         |
+| `timeoutMs`    | number    | 300000 (5 min) | **Command** (exec) timeout → `cancelled`. Connect is bounded separately by the ssh2 handshake (15 s) → `failed`                                   |
+| `maxLogKb`     | number    | 10             | Ring-buffer log cap                                                                                                                               |
+| `allowedTools` | string [] | —              | Sandbox: commands this task may run on the remote host (first token of `command`) — see [Security](https://schedjs.github.io/schedjs/../security) |
+
+## Secrets never live in tasks.json
+
+`tasks.json` is the desired state in git — private keys and passwords do not belong
+there. `auth` references **env vars** of the daemon process:
+
+```json
+{
+  "tasks": [
+    {
+      "name": "restart-nginx",
+      "schedules": [{ "cron": "0 4 * * *" }],
+      "runner": "ssh",
+      "config": {
+        "host": "vds.example",
+        "username": "root",
+        "command": "systemctl restart nginx && systemctl is-active nginx",
+        "auth": { "keyFromEnv": "SCHED_SSH_KEY_PRD" },
+        "fingerprints": ["SHA256:qIMWQ8C7H7yPK2dXk2HFGZ9nXq0cQv3VKoHzJ2pKx8M="]
+      }
+    }
+  ]
+}
+```
+
+- `keyFromEnv: "SCHED_SSH_KEY_PRD"` — the env var holds the PEM private key
+  (`-----BEGIN OPENSSH PRIVATE KEY-----…`)
+- `passwordFromEnv` — the env var holds the password
+
+A missing env var is a fail-fast: rejected at load time (`validateConfig`), never
+reached at dispatch. Both sources set at once is a config error.
+
+## Host-key pins
+
+`fingerprints` is an array of the remote host's public-key fingerprints —
+`SHA256:<base64>` (what `ssh-keyscan -t ed25519 <host>` prints), bare base64, or hex.
+A host whose key is not pinned **fails the run** — this deliberately overrides the
+ssh2 default of accepting any host key.
+
+Omitted/empty = accept any host key. That is a convenience for trusted networks,
+not a production posture.
+
+On mismatch the run fails with an error that names the pins and the received
+fingerprint — e.g. `Host key verification failed: received <fp>, expected one of [<pin1>, …]` — so you can tell which pin is stale when several are configured.
+
+## Exit-code mapping
+
+- `0` → `succeeded` (stdout+stderr captured into the run log)
+- `!=0` → `failed` `exit N: <tail>`
+- command timeout (`timeoutMs`) → `cancelled`
+- connect timeout (ssh2 handshake, fixed 15 s) → `failed` — two different
+  timeouts: `timeoutMs` bounds the exec phase only, reachability is the handshake's
+- connect/exec error (unreachable, bad auth, fingerprint mismatch) → `failed`
+
+## Security notes
+
+- The daemon's ssh private keys are read from env — protect them like any other
+  secret (service account, file perms, secret manager feeding env).
+- The remote command runs through the remote shell — the operator writes it, the
+  same trust boundary as a cron line on that host.
+- One connection per run; the connection is closed after every run regardless of
+  outcome.
+- Sandbox ceiling is enforced at load too: a task whose command's first token is
+  outside the runner `allowedTools` fails in `validateConfig` (fail-fast before
+  any run), matching process/docker/mcp — not only at run time.
+
+
+# MCP runner
+
+The MCP runner calls a tool on a [Model Context Protocol](https://modelcontextprotocol.org){rel="&#x22;nofollow&#x22;"}
+server per run — sync-only: the run resolves when the tool call resolves. This is the
+inverse of the [product MCP server](https://schedjs.github.io/schedjs/../mcp): there sched *exposes* its control plane to
+agents; here a task *consumes* any MCP server (an agent, a web service, a local tool
+server) as its worker.
+
+## When to use it
+
+Prefer the [HTTP runner](https://schedjs.github.io/schedjs/http) whenever the tool is reachable over plain HTTP — a
+cron calling a REST endpoint needs no MCP ceremony at all. The MCP runner earns
+its place only when:
+
+- the tool exists **only** as an MCP tool (no REST wrapper), **and**
+- you need a deterministic schedule→tool call **without an agent/LLM in the loop**
+  (the runner does the JSON-RPC ceremony: initialize/session/tools/call, maps
+  `isError` → `failed`, text blocks → `succeeded`).
+
+`stdio` transport spawns the server cold per run (`npx …`) with no persistent
+connection — prefer `http` (Streamable HTTP) for anything you call on a schedule.
+If a scheduled MCP tool hasn't been needed in months, that's a sign it belongs on
+the http runner instead.
+
+## Config
+
+| Field          | Type      | Default        | Description                                                                                                             |
+| -------------- | --------- | -------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `server`       | object    | —              | **Required.** The MCP server to connect to — see below                                                                  |
+| `tool`         | string    | —              | **Required.** The tool to call                                                                                          |
+| `args`         | object    | —              | Static arguments forwarded to the tool call                                                                             |
+| `timeoutMs`    | number    | 300000 (5 min) | Call timeout → `cancelled` (sync-only: a hung tool never passes)                                                        |
+| `allowedTools` | string [] | —              | Sandbox: tools this task may call (`server:tool` specs) — see [Security](https://schedjs.github.io/schedjs/../security) |
+
+### `server`
+
+| Field       | Type               | Description                                                                               |
+| ----------- | ------------------ | ----------------------------------------------------------------------------------------- |
+| `transport` | `'stdio' | 'http'` | **Required.** How to reach the server                                                     |
+| `command`   | string []          | stdio only. Full argv, no shell (process-runner contract): `command[0]` is the executable |
+| `url`       | string             | http only. Streamable HTTP endpoint                                                       |
+| `headers`   | object             | http only. Extra headers — values may embed env refs, see below                           |
+
+## Example: stdio server (local tool)
+
+```json
+{
+  "tasks": [
+    {
+      "name": "ping-agent",
+      "schedules": [{ "cron": "*/10 * * * *" }],
+      "runner": "mcp",
+      "config": {
+        "server": { "transport": "stdio", "command": ["npx", "my-mcp-tool"] },
+        "tool": "ping",
+        "args": { "target": "prod" }
+      }
+    }
+  ]
+}
+```
+
+## Example: Streamable HTTP server (remote)
+
+```json
+{
+  "tasks": [
+    {
+      "name": "sync-captions",
+      "schedules": [{ "cron": "0 3 * * *" }],
+      "runner": "mcp",
+      "config": {
+        "server": {
+          "transport": "http",
+          "url": "https://mcp.internal.example/mcp",
+          "headers": { "Authorization": "Bearer ${SCHED_MCP_TOKEN}" }
+        },
+        "tool": "captions.sync",
+        "args": { "full": true }
+      }
+    }
+  ]
+}
+```
+
+## Secrets never live in tasks.json
+
+`tasks.json` is the desired state in git — header tokens do not belong there. Header
+values embed **env refs** resolved from the daemon process at load (fail-fast if the
+var is missing — the daemon refuses to start, same rule as the ssh runner's `auth`):
+
+```json
+"headers": { "Authorization": "Bearer ${SCHED_MCP_TOKEN}" }
+```
+
+`SCHED_MCP_TOKEN` is read from the daemon's environment; the tasks.json file stays
+secret-free.
+
+## Result mapping
+
+| Server result                      | Run outcome                                              |
+| ---------------------------------- | -------------------------------------------------------- |
+| text content blocks                | `succeeded` with the blocks joined by newlines           |
+| non-text blocks (`image`, …)       | `succeeded`, block rendered as `[type: mimeType]` marker |
+| `structuredContent` only (no text) | `succeeded`, serialized as JSON                          |
+| `isError: true`                    | `failed` with the tool's text as the error               |
+| connect / call failure             | `failed` with the transport error                        |
+| timeout (`timeoutMs`)              | `cancelled`                                              |
+
+## Security: sandbox (`allowedTools`)
+
+The runner accepts an optional `server:tool` allowlist — see [Security](https://schedjs.github.io/schedjs/../security)
+for the full model. A task whose server **or tool** is not allowlisted fails fast
+at load **and** at run, before any connection opens:
+
+```ts
+createMcpRunner({ allowedTools: ['https://mcp.internal.example:*', 'npx*:read_*'] })
+```
+
+**stdio identity = `command[0]`** (the raw executable string, e.g. `npx`) — not the
+full argv and not the resolved binary path. So a pattern like `npx-mytool*` from an
+earlier revision could never match a server launched as `["npx", "my-mcp-tool"]`;
+use `npx*`, or disambiguate with an absolute executable path (`/usr/local/bin/mytool`)
+and pin that. An exact `command[0]` cannot discriminate between two servers launched
+you the same executable — thin per-server sandboxing must live server-side.
+
+The allowlist lives at the daemon/embedding boundary — the operator decides which MCP
+servers the scheduler may call, not the tasks.json author.
+
+An http server-only spec must carry a tool dimension (`url:*` or `url:tool`); a
+bare `https://host` fails at load — it would parse as server `https` and silently
+match nothing (a footgun on a security allowlist).
+
+
+# Internal runner (embedded)
+
+The **internal runner** executes handlers **in the same process** as the engine —
+a plain TypeScript/JavaScript function per task. No HTTP server, no Docker, no
+separate daemon process. This is the **embedded mode** ("Shape 1"): `@schedjs/core`
+becomes a library inside your app, and the scheduler is just a few lines of setup.
+
+The platform guarantees stay intact — retries, run history, alerts, zombie-lock
+reaping all work exactly as with the HTTP runner. Embedded mode is *not* a
+regression to fire-and-forget job queues: every run is recorded, every failure is
+surfaced.
+
+## When to use it
+
+- You want scheduled jobs inside your existing app process (a server, a CLI, a service).
+- Your jobs are functions, not external workers — no need for HTTP/Docker plumbing.
+- You want the "install in 60 seconds" story: `npm i @schedjs/core`, a SQLite file, done.
+
+When **not**: long-running jobs that must survive process restarts, or jobs that need
+to run outside your process — use the [daemon](https://schedjs.github.io/schedjs/../cli) with the [HTTP](https://schedjs.github.io/schedjs/http) /
+[Docker](https://schedjs.github.io/schedjs/docker) runners instead.
+
+## Handlers
+
+A handler is a function `(data, ctx) => result`:
+
+```ts
+import { createInternalRunner } from '@schedjs/core';
+
+const runner = createInternalRunner({
+  handlers: {
+    generateThumbnail: async (data, ctx) => {
+      ctx.log('thumbnail: started');
+      ctx.setProgress(50);
+      const out = await renderThumbnail((data as { videoId: string }).videoId);
+      ctx.setProgress(100);
+      return { output: out }; // → run.result
+    },
+    transcode: async (data) => {
+      throw new Error('ffmpeg not found'); // → run failed, error recorded
+    },
+  },
+});
+```
+
+- **`data`** — `task.config.data`, the run parameters snapshot (JSON-serializable).
+- **`ctx`** — `{ runId, taskName, startedAt, log(line), setProgress(percent) }`.
+  `log` lines are joined into the run's `log`; `setProgress` lands in `progress`.
+- **Return value** → `run.result` (`undefined`/`null` → `null`).
+- **A thrown error** → `failed` with the error message (plus any log lines
+  collected so far). A throwing handler is a failed run, never a crashed process.
+
+Handlers are resolved by `task.config.handler` — fail-fast with a clear message if
+the name is missing or not registered.
+
+## Embedded setup — the whole thing
+
+```ts
+import { DatabaseSync } from 'node:sqlite';
+import { createEngine, createInternalRunner, createSqliteStorage, syncTasks } from '@schedjs/core';
+
+const storage = createSqliteStorage(new DatabaseSync('sched.db'));
+
+const engine = createEngine({
+  storage,
+  runner: createInternalRunner({
+    handlers: {
+      generateThumbnail: async (data) => { /* ... */ },
+    },
+  }),
+  maxConcurrent: 4,          // parallel in-process handlers (default: 1 = sequential)
+});
+
+// desired-state: same tasks.json contract, but registered from code (or from a file)
+await syncTasks(storage, [
+  {
+    name: 'generate-thumbnail',
+    runner: 'internal',
+    schedules: [{ cron: '0 9 * * *' }],
+    config: { handler: 'generateThumbnail', data: { videoId: 'v-42' } },
+    retry: { maxAttempts: 3, backoffMs: 60_000 },
+  },
+], new Date());
+
+engine.start(); // tick + watchdog + poll loops
+```
+
+The same `tasks.json` file format works embedded: `loadTasksJson('tasks.json')` +
+`syncTasks(storage, defs, now)` — no daemon involved.
+
+## Concurrency, priority, retry
+
+Embedded mode gets the engine features out of the box — see
+[Tasks](https://schedjs.github.io/schedjs/../tasks#priority-and-retry):
+
+- **`maxConcurrent`** (engine option, default `1`) — how many due tasks run in
+  parallel. Raise it for in-process handlers that are mostly I/O-bound. Per-task
+  overlap is still impossible: the storage claim is atomic, so one task never runs
+  twice at once.
+- **`priority`** (task field) — higher runs first among due tasks.
+- **`retry`** (task field) — a failed run is retried with backoff up to
+  `maxAttempts`; alerts/`onRunFinal` fire only on the **final, exhausted** failure.
+
+
+# Custom runners
+
+A **runner** owns *how* a task runs. The engine owns scheduling and state; the runner owns
+execution — an HTTP call, a Docker container, an in-process function, anything. Built-in
+runners are HTTP and Docker; this page shows how to write your own.
+
+## The contract
+
+A runner implements the `Runner` interface (exported from `@schedjs/core`):
+
+```ts
+interface Runner {
+  run(task: TaskRecord, runId: string, startedAt: Date, hooks?: RunnerRunHooks): Promise<RunOutcome>;
+  poll?(runId: string, statusUrl: string, task?: TaskRecord): Promise<PollResult>;
+  validateConfig?(task: { name: string; config?: unknown }): void;
+}
+```
+
+`hooks.onProgress` (the 4th argument) is how a **sync** runner reports live
+progress — the engine persists it to storage before the run finishes, so a long
+running task shows progress in the UI even before its final outcome.
+
+`Runner`, `RunOutcome`, `PollResult` and `RunnerRunHooks` are all exported from
+`@schedjs/core`.
+
+- **`run`** is mandatory. It receives the claimed task, a unique `runId`, the start
+  timestamp, and optional `hooks` (`RunnerRunHooks`), and returns a `RunOutcome`.
+
+### `hooks.signal` — user cancel
+
+`hooks.signal` is an `AbortSignal` that fires when the operator cancels the run
+(`POST /runs/:id/cancel` → `engine.cancelRun`). A runner **must** react to it:
+
+```ts
+interface RunnerRunHooks {
+  onProgress?(progress: number): void | Promise<void>;
+  signal?: AbortSignal;
+}
+```
+
+- On `abort`, terminate the work and &#x2A;*reject with an `Error` whose `name` is
+  `'AbortError'`** — the engine maps it to a `cancelled` run. (Alternatively
+  return a `cancelled` outcome directly.)
+- Built-ins: process/docker/ssh kill the child (`SIGTERM` → `SIGKILL` after the
+  grace period), http aborts the request, internal rejects the in-flight handler.
+- The signal is optional and backward-compatible: a runner that ignores it simply
+  cannot be cancelled mid-flight (it stays cancellable while queued).
+- **`poll`** is optional. You only need it if `run` can return `accepted` (async jobs —
+  see below). A runner that never accepts doesn't implement it.
+- **`validateConfig`** is optional. The daemon calls it for every task at start; throwing
+  aborts startup with a clear error. Use it to reject a bad task config before any run
+  happens — the docker runner uses it to fail fast when a task's image is outside the
+  allowlist.
+
+## RunOutcome — four variants
+
+```ts
+type RunOutcome =
+  | { status: 'succeeded'; result?: unknown; progress?: number | null; log?: string | null; artifacts?: ArtifactRef[] | null }
+  | { status: 'failed';    error: string;    result?: unknown; progress?: number | null; log?: string | null; artifacts?: ArtifactRef[] | null }
+  | { status: 'cancelled'; error: string;    result?: unknown; progress?: number | null; log?: string | null; artifacts?: ArtifactRef[] | null }
+  | { status: 'accepted';  statusUrl: string; pollIntervalMs: number };
+```
+
+- `succeeded` / `failed` / `cancelled` are terminal. The engine stores everything the
+  outcome carries on the run record via `finishRun`.
+- `accepted` is for **async jobs**: the worker acknowledged the run and will expose status
+  at `statusUrl`. The engine marks the run `queued`, stores `workerRef = statusUrl`, and
+  polls `statusUrl` on its own cadence until a terminal result arrives.
+
+### PollResult
+
+When polling, intermediate responses keep the run alive without completing it:
+
+```ts
+type PollResult =
+  | { status: 'queued' | 'running'; progress?: number | null; log?: string | null; result?: unknown }
+  | { status: 'succeeded'; result?: unknown; progress?: number | null; log?: string | null; artifacts?: ArtifactRef[] | null }
+  | { status: 'failed';    error: string; result?: unknown; progress?: number | null; log?: string | null; artifacts?: ArtifactRef[] | null };
+```
+
+Intermediate `queued`/`running` responses write `progress`/`log`/`result` onto the run
+record without finishing it; terminal responses complete it.
+
+## Registering a runner
+
+Pass your implementations to `createDaemon` — a map of runner name → implementation.
+The daemon dispatches per task by the task's `runner` field.
+
+> `createDaemon&#x60; lives in &#x2A;*`@schedjs/daemon`** (not `@schedjs/core`); the runner
+> factories (`createHttpRunner`, `createDockerRunner`) and the `Runner` type are
+> exported from `@schedjs/core`.
+
+```ts
+import { createDaemon } from '@schedjs/daemon';
+import { createHttpRunner, createDockerRunner, type Runner } from '@schedjs/core';
+
+const echoRunner: Runner = {
+  async run(task, runId, startedAt) {
+    const message = (task.config as { message?: string }).message ?? 'hello';
+    return {
+      status: 'succeeded',
+      result: { message, runId },
+      log: `echo: ${message}`,
+    };
+  },
+};
+
+const daemon = createDaemon({
+  dbPath: 'sched.db',
+  tasksPath: 'tasks.json',
+  runners: {
+    http: createHttpRunner(),
+    docker: createDockerRunner(),
+    echo: echoRunner,
+  },
+});
+
+await daemon.start();
+```
+
+Then reference it from `tasks.json`:
+
+```json
+{
+  "tasks": [
+    {
+      "name": "greet",
+      "schedules": [{ "cron": "* * * * *" }],
+      "runner": "echo",
+      "config": { "message": "hello from sched" }
+    }
+  ]
+}
+```
+
+A cron schedule is an object — `{ "cron": "* * * * *" }` (a bare cron string
+`"* * * * *"` is not valid and fails at load). A cron object may carry an
+optional `timezone` (IANA, e.g. `"Europe/Moscow"`) — defaults to the task's
+`tz` / UTC.
+
+## Fail-fast
+
+An unregistered runner never silently no-ops:
+
+- **At daemon start** — `tasks.json` referencing a runner that isn't in the map aborts
+  startup: `task "greet": runner "echo" not implemented in this build (registered: http, docker)`.
+- **At dispatch** — if a runner disappears after start, the run fails fast instead of
+  hanging: `runner "echo": not implemented in this build`.
+
+## Async runners — accepted + poll
+
+For long-running jobs, return `accepted` and implement `poll`. Example — a worker that
+queues the work and reports progress:
+
+```ts
+import { createDaemon } from '@schedjs/daemon';
+import type { Runner } from '@schedjs/core';
+
+const asyncRunner: Runner = {
+  async run() {
+    return { status: 'accepted', statusUrl: 'http://worker.local/status/42', pollIntervalMs: 1000 };
+  },
+  async poll(_runId, statusUrl) {
+    const res = await fetch(statusUrl);
+    const body = await res.json();
+    if (!res.ok) throw new Error(`poll ${statusUrl} failed: ${res.status}`);
+    return body; // { status: 'running', progress: 50 } | { status: 'succeeded', result }
+  },
+};
+```
+
+Notes:
+
+- If `run` returns `accepted` but the runner has no `poll()`, the run fails fast.
+- Poll failures (non-2xx, malformed envelope) throw → the run is marked `failed`.
+- `pollTimeoutMs` (default 25 min, must be < `lockTtlMs` — 5 min margin under the 30 min default so the poll fails a hung async run before the zombie watchdog can re-dispatch it) caps a hung async run.
+- The poll queue is in-memory — a daemon restart leaves the run `queued`; idempotency by
+  `runId` closes the gap.
+
+## Artifacts — the runner owns them
+
+sched never generates reports or sends content emails — the runner does, it has the
+data and the credentials. Return a reference and let sched store and display it:
+
+```ts
+const reportingRunner: Runner = {
+  async run(task, runId) {
+    const markdown = `# ${task.name} report\n...`;
+    // Upload yourself (S3/Minio, email, webhook…) — this is your job, not sched's
+    const s3Key = await uploadToS3(`task-reports/${runId}.md`, markdown);
+    return {
+      status: 'succeeded',
+      result: { summary: { rows: 42 } },
+      artifacts: [{ kind: 's3', ref: `s3://bucket/${s3Key}`, label: 'Report' }],
+    };
+  },
+};
+```
+
+Rules of thumb:
+
+- **Upload failure is soft** — report it in `error`/`result`, don't fail the run over a
+  missing upload.
+- **Retries re-use** — if the artifact already exists (ref set), don't re-generate.
+- **Content emails go out from the worker** — sched only stores the receipt
+  (`kind: 'email'`).
+
+## Reference implementations
+
+- `packages/core/src/runners/http.ts` — request/response runner (sync + accepted/poll)
+- `packages/core/src/runners/docker.ts` — container runner (spawn, log ring-buffer, exit codes)
+- `packages/core/src/runners/process.ts` — local command runner (exit-code + stdio envelope modes)
+- `packages/core/src/runners/exec.ts` — shared lifecycle (spawn → ring-buffer → timeout → close)
+
+## A complete reference
+
+The simplest complete from-scratch runner — a **file-drop** runner — is on its own page:
+[Reference: file runner](https://schedjs.github.io/schedjs/custom/file-runner). Zero dependencies — filesystem only, so it runs anywhere.
+
+
+# File runner
+
+The complete reference — a **file-drop** runner: `run()` drops a job file into a directory,
+any process (in any language) picks it up and writes back a result file. Zero dependencies —
+filesystem only, so it runs anywhere. The same code lives in
+`packages/core/test/helpers/file-runner.ts`:
+
+```ts
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { RunOutcome, Runner, RunnerRunHooks } from '../../src/engine.js';
+import type { TaskRecord } from '../../src/types.js';
+
+export interface FileRunnerOptions {
+  /** Inbox directory where job files are dropped. Config `dir` wins over this. Default: cwd. */
+  dir?: string;
+  /** Filesystem poll interval. Default: 250ms. */
+  pollMs?: number;
+  /** How long `run` waits for the result file before failing. Default: 30s. */
+  timeoutMs?: number;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * File-drop runner: reference implementation for the "Custom runners" docs page.
+ *
+ * `run()` drops `<dir>/job-<runId>.json` (task config + runId + startedAt — any
+ * process, any language can pick it up), then polls the filesystem until a
+ * worker writes `<dir>/<runId>.result.json` (terminal outcome) or the timeout
+ * fires. Workers report live progress by writing `<dir>/<runId>.progress.json`
+ * with a `progress` number — the runner forwards it via `hooks.onProgress`.
+ *
+ * Cancellation: on `signal.abort` the runner deletes the job file and rejects
+ * with an `AbortError` (the engine maps it to a `cancelled` run). No external
+ * dependencies — filesystem only, so it runs anywhere and tests on tmp dirs.
+ */
+export function createFileRunner(options: FileRunnerOptions = {}): Runner {
+  const resolveDir = (task: { name: string; config?: unknown }): string => {
+    const cfg = (task.config ?? {}) as { dir?: string };
+    const dir = cfg.dir ?? options.dir ?? process.cwd();
+    if (!existsSync(dir)) throw new Error(`file runner: dir "${dir}" does not exist (task "${task.name}")`);
+    return dir;
+  };
+
+  return {
+    validateConfig(task) {
+      resolveDir(task); // throws → daemon aborts startup with a clear error
+    },
+
+    async run(task: TaskRecord, runId: string, startedAt: Date, hooks?: RunnerRunHooks): Promise<RunOutcome> {
+      const dir = resolveDir(task);
+      if (hooks?.signal?.aborted) {
+        return { status: 'cancelled', error: 'aborted before dispatch' };
+      }
+
+      const jobFile = join(dir, `job-${runId}.json`);
+      writeFileSync(
+        jobFile,
+        JSON.stringify(
+          { runId, taskName: task.name, config: task.config ?? null, startedAt: startedAt.toISOString() },
+          null,
+          2,
+        ),
+      );
+
+      const resultFile = join(dir, `${runId}.result.json`);
+      const progressFile = join(dir, `${runId}.progress.json`);
+      const timeoutMs = options.timeoutMs ?? 30_000;
+      const pollMs = options.pollMs ?? 250;
+      const deadline = Date.now() + timeoutMs;
+
+      try {
+        while (Date.now() < deadline) {
+          if (hooks?.signal?.aborted) throw abortError();
+
+          if (existsSync(progressFile)) {
+            try {
+              const { progress } = JSON.parse(readFileSync(progressFile, 'utf8')) as { progress?: number };
+              if (typeof progress === 'number') await hooks?.onProgress?.(progress);
+            } catch {
+              /* malformed progress file — ignore, keep polling */
+            }
+            rmSync(progressFile);
+          }
+
+          if (existsSync(resultFile)) {
+            let body: Record<string, unknown>;
+            try {
+              body = JSON.parse(readFileSync(resultFile, 'utf8')) as Record<string, unknown>;
+            } catch {
+              return { status: 'failed', error: `result file ${resultFile} is not valid JSON` };
+            }
+            rmSync(resultFile);
+            if (body.status === 'succeeded') {
+              return {
+                status: 'succeeded',
+                result: body.result,
+                log: typeof body.log === 'string' ? body.log : null,
+              };
+            }
+            return {
+              status: 'failed',
+              error: typeof body.error === 'string' ? body.error : 'worker reported failure',
+              result: body.result,
+            };
+          }
+
+          await sleep(pollMs);
+        }
+        return { status: 'failed', error: `file runner: no result file after ${timeoutMs}ms (${resultFile})` };
+      } finally {
+        if (existsSync(jobFile)) rmSync(jobFile); // cleanup: abort, timeout, or terminal result
+      }
+    },
+  };
+}
+
+function abortError(): Error {
+  const err = new Error('aborted');
+  err.name = 'AbortError';
+  return err;
+}
+```
+
+
+# SQLite (default)
+
+```ts
+import { DatabaseSync } from 'node:sqlite';
+import { createSqliteStorage } from '@schedjs/core';
+
+const storage = createSqliteStorage(new DatabaseSync('sched.db'));
+```
+
+One file, no server, migrations applied on open. Right choice for a single daemon.
+SQLite lives in `@schedjs/core` — nothing extra to install.
+
+## Locking
+
+Claim is a conditional `UPDATE … WHERE locked_at IS NULL` with a `changes`-count
+check — the same atomic semantics every adapter implements (see the
+[contract suite](https://schedjs.github.io/schedjs/../custom#the-contract-suite-is-the-insurance)).
+
+
+# MySQL / MariaDB
+
+```bash
+npm install @schedjs/storage-mysql
+```
+
+```ts
+import { createPool } from 'mysql2/promise';
+import { createMysqlStorage } from '@schedjs/storage-mysql';
+
+const pool = createPool('mysql://user:pass@db:3306/sched');
+const storage = await createMysqlStorage(pool);
+```
+
+One driver (`mysql2`) covers both dialects — the same contract suite runs against
+MariaDB 11 **and** MySQL 8, so neither dialect drifts. Right choice when sched must
+write into an existing MySQL-family database (e.g. a shared prod DB) instead of a
+SQLite file or a Mongo replica.
+
+## Known gotchas
+
+- Migrations are **applied on open** from a versioned list inside the adapter
+  (`sched_schema_version` table) — the daemon self-migrates an existing database on
+  first start, no external migration tooling needed. The mechanism ships in the
+  package, so the npm tarball and the docker image carry it.
+- Timestamps are epoch milliseconds (`BIGINT`); JSON payloads (`config`/`data`/
+  `result`/`artifacts`) are `TEXT` — same encoding as SQLite.
+- Claim is a conditional `UPDATE … WHERE locked_at IS NULL` — the same atomic
+  semantics as SQLite's `changes`-count check.
+- Concurrent first-opens are not advisory-lock guarded (single-writer assumption,
+  same as SQLite). See the adapter source for the `GET_LOCK` upgrade path if HA lands.
+
+
+# Postgres
+
+```bash
+npm install @schedjs/storage-postgres
+```
+
+```ts
+import { Pool } from 'pg';
+import { createPostgresStorage } from '@schedjs/storage-postgres';
+
+const pool = new Pool({ connectionString: 'postgres://user:pass@db:5432/sched' });
+const storage = await createPostgresStorage(pool);
+```
+
+Same pattern as MySQL/MariaDB: versioned migrations applied on open
+(`sched_schema_version`), atomic claim via conditional `UPDATE`, JSON-as-TEXT,
+placeholder `$1..$n`, upsert `ON CONFLICT … DO UPDATE SET … EXCLUDED`. The
+contract suite runs against Postgres 16 the same way it runs against SQLite,
+MySQL/MariaDB and Mongo.
+
+## Known gotchas
+
+- `pg` returns `BIGINT` columns as **strings** — the adapter converts explicitly
+  in its row mappers instead of mutating the global type parser (a host app
+  sharing the pool may rely on string bigints).
+- `paused`/`disabled` are native `BOOLEAN` (the one real type difference from
+  MySQL's `TINYINT(1)`); everything else — timestamps, JSON, locking — is
+  encoded identically to the other adapters.
+- No `SERIAL`/identity columns: task and run keys are TEXT primary keys
+  (run ids are generated by the engine).
+
+
+# Mongo
+
+```bash
+npm install @schedjs/storage-mongo
+```
+
+```ts
+import { MongoClient } from 'mongodb';
+import { createMongoStorage } from '@schedjs/storage-mongo';
+
+const client = new MongoClient('mongodb://...');
+const storage = await createMongoStorage(client.db('sched'));
+```
+
+Use when history must be shared (multi-replica, HA behind a queue).
+
+## Known gotchas
+
+- `insertOne` mutates the passed document (`_id` is injected) — clone before reuse.
+- Claim is an atomic findOneAndUpdate — the same lock semantics as SQLite.
+- Mongo is &#x2A;*schemaless — there is no `sched_schema_version`**: "migrations on
+  open" here means index creation (`nextRunAt`, `name` on tasks; `startedAt`,
+  `(taskName, startedAt)` on runs), not versioned schema migrations (by design).
+  The sort indexes (`name: 1` on `sched_tasks`, `startedAt: -1` on `sched_runs`)
+  were added in 0.5.0 — without them the admin endpoints fall over at \~55k runs
+  with Mongo's 32MB in-memory-sort cap.
+- `createStorage(env)` retries the **initial** connect for up to 30 s
+  (`MONGO_RETRY_MS` overrides) before failing — a brief mongo restart does not
+  crash-loop the daemon at boot. After the first connect the **adapter** owns
+  reconnection (0.5.1): every storage op is wrapped — on a connection-class
+  error (`MongoNetworkError`, `MongoNotConnectedError`, server-selection /
+  topology-closed) the adapter forces a fresh topology (`client.close()` +
+  `client.connect()`, which re-resolves DNS) and retries (bounded, 2). This is
+  the prod lesson from books 2026-08-24: the driver's SDAM did **not** rebuild
+  the pool after the mongo container was recreated — `connection 6 … closed`
+  for hours, tasks not scheduled, silent. Non-connection errors propagate
+  unchanged; a genuinely-down mongo still surfaces as a failed op, not an
+  infinite hang.
+
+
+# Build your own adapter
+
+Anything that isn't SQLite / MySQL / MariaDB / Postgres / Mongo can still be a
+storage backend: implement the `Storage` interface, run the contract suite, pass
+the adapter to `createEngine` / `createDaemon`. That's the whole integration
+test — parity with the shipped adapters is **test-pinned, not assumed**. No ORM
+needed: an adapter is a raw driver + the suite (see `@schedjs/storage-mysql` /
+`@schedjs/storage-postgres` for the \~400-line reference shape).
+
+For the **binary** (`schedd`) the custom adapter plugs in via
+`--storage <npm-package>` or `--storage <./path>` — the module must export the
+**same** `createStorage(env)` function the built-in adapters export (see
+[Storage overview](https://schedjs.github.io/schedjs/docs/storage)):
+
+```ts
+// my-sched-storage/package.json → main: index.js
+export async function createStorage(env: NodeJS.ProcessEnv): Promise<Storage> {
+  const client = new MyDriver({ url: env.MY_STORAGE_URL }); // your own env vars
+  await client.connect();
+  return createMyStorage(client); // a full Storage implementation
+}
+```
+
+```bash
+MY_STORAGE_URL=… schedd --tasks tasks.json --storage ./my-sched-storage
+```
+
+Specifier disjunction: `./`, `../`, `/` → a filesystem path (relative to the
+daemon's cwd); anything else → an npm package resolved from the image. Fail-fast
+at startup: module missing → `add it to your image (RUN yarn add …)`; module
+exporting something that isn't `createStorage(env)` → contract error pointing at
+this page.
+
+**The contract is interface + suite + published `.d.ts`** — the prose below
+describes semantics, but the precise method signatures and record shapes
+(`CompleteResult`, `RunUpdate`, `RunFilter`, `PruneRunsFilter`, `TaskRecord`,
+`RunRecord`) are the TypeScript types that ship with `@schedjs/core` (and the
+storage packages). When in doubt, the `.d.ts` is authoritative.
+
+## The contract
+
+`Storage` from `@schedjs/core` (`packages/core/src/storage.ts`) — 28 methods in
+four groups:
+
+- **Tasks** — `upsertTask` (upsert, never duplicates), `getTask`, `listTasks`,
+  `deleteTask`.
+- **Schedules** (schedule-as-entity) — `createSchedule` (dedup-aware:
+  a second create with the same `dedupKey` updates the existing row, id preserved —
+  the idempotent upsert handle; returns the stored schedule), `getSchedule`,
+  `updateSchedule` (partial mid-life patch, idempotent no-op for unknown ids),
+  `deleteSchedule`, `listSchedules` (`taskName` filter, ordered by id ASC,
+  paginated with limit/offset).
+- **Schedule tick loop / locking** —
+  `listDueSchedules` (due + unlocked + unpaused + enabled, **per-task ceiling**
+  — no sibling schedule of the same task locked, ordered
+  `priority DESC, nextRunAt ASC`), `claimSchedule` (**atomic, exactly-once**, the
+  per-task ceiling enforced in the same conditional UPDATE), `completeSchedule`
+  (clear lock, advance `nextRunAt`/`lastRunAt`/`lastRunId`, `failCount += failed`),
+  `reapZombieScheduleLocks` (unlock stale schedule locks, bump `failCount`),
+  `refreshScheduleLock` (the engine's heartbeat — extends a claimed schedule's
+  lock; no-op when not locked), `clearScheduleLocks` (startup recovery). The
+  task-level twins (`listDueTasks`/`claimTask`/`completeTask`/`reapZombieLocks`/
+  `refreshLock`/`clearLocks`) remain for manual-run reflection (`completeTask`
+  writes `lastRunId`/`lastRunAt` on the task row).
+- **Run history** — `createRun`, `getRun`, `updateRun` (partial mid-flight),
+  `finishRun` (terminal: sets `finishedAt` itself), `deleteRun` (idempotent
+  no-op for unknown runs), `listRuns` (newest-first, `taskName`/`status`
+  filters, `limit`/`offset`, hard cap 1000), `pruneRuns` (retention sweep:
+  delete terminal runs of one `temporary` class finished before `olderThan`;
+  the engine calls it twice — temp class at 24h, regular at 30d).
+
+## The contract suite is the insurance
+
+The shared suite ships as the `@schedjs/core/storage-contract` subpath — the same
+\~26 tests every shipped adapter runs (SQLite, MySQL, MariaDB, Postgres, Mongo);
+run it against yours:
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest'; // your own test runner
+import { storageContractTests } from '@schedjs/core/storage-contract';
+
+// pass your vitest api in — the subpath itself has zero runtime dependencies
+storageContractTests({ describe, it, expect, beforeEach }, 'my-custom', () => createMyStorage(/* … */));
+```
+
+The factory is called **synchronously** per test — pass a factory that returns
+the adapter, not a promise. The shipped SQL adapters are async (`createMysqlStorage`
+etc.); their own tests `await` the factory once in `beforeEach` and hand the
+resolved adapter in. Don't pass `async () => createMyStorage()` directly — the
+suite will treat the promise as the adapter.
+
+If it's green, the engine behaves identically on your backend — claiming,
+zombie reaping, JSON round-trips, pagination all included.
+
+## The template
+
+Every shipped adapter follows the same shape (mirror the closest dialect):
+
+1. **Row mapping** — snake\_case columns ↔ camelCase records; timestamps as
+   epoch milliseconds; booleans as `0/1` (SQL) or native `BOOLEAN` (Postgres)
+   or literal `true/false` (Mongo).
+2. **Upsert** — `INSERT … ON CONFLICT (name) DO UPDATE SET col = EXCLUDED.col`
+   (Postgres), `ON DUPLICATE KEY UPDATE col = VALUES(col)` (MySQL/MariaDB),
+   `replaceOne(…, { upsert: true })` (Mongo).
+3. **Atomic claim** — the one query that must be race-free:
+   ```ts
+   // changes/affectedRows/rowCount must be exactly 1
+   UPDATE scheduled_tasks SET locked_at = $1, updated_at = $2
+   WHERE name = $3 AND locked_at IS NULL AND paused = false AND disabled = false;
+   ```
+4. **JSON round-trip** — `JSON.stringify` on write, `JSON.parse` on read,
+   `null` ↔ SQL `NULL` (never `'null'`); fields: `config`, `data`, `result`,
+   `artifacts`, `retry`.
+5. **Migrations on open** — a versioned list inside the adapter + a
+   `sched_schema_version` table, applied idempotently on every open, so a
+   deployed daemon self-migrates an existing database.
+
+The complete reference — a full in-memory adapter, from scratch to the last
+method — is on its own page: [Reference: memory storage](https://schedjs.github.io/schedjs/custom/memory-storage). The same code
+lives in `packages/core/test/helpers/memory-storage.ts`; `packages/core/src/sqlite.ts`
+is the annotated SQL reference.
+
+
+# Memory storage
+
+The complete reference — a full in-memory storage adapter, from scratch to the last
+method. The same code lives in `packages/core/test/helpers/memory-storage.ts`:
+
+```ts
+import type { CompleteResult, RunFinish, RunUpdate, ScheduleListFilter, Storage } from '../../src/storage.js';
+import type { RunRecord, ScheduleRecord, TaskRecord } from '../../src/types.js';
+
+/**
+ * In-memory Storage fake for engine tests. Mirrors the semantics pinned by the
+ * shared contract suite (test/storage-contract.ts) — the engine tests exercise
+ * state-machine logic against this, while adapter correctness is the contract's
+ * job. Exposes the maps for direct inspection.
+ */
+export class MemoryStorage implements Storage {
+  tasks = new Map<string, TaskRecord>();
+  runs = new Map<string, RunRecord>();
+  schedules = new Map<string, ScheduleRecord>();
+
+  async upsertTask(task: TaskRecord): Promise<void> {
+    this.tasks.set(task.name, { ...task });
+  }
+
+  async getTask(name: string): Promise<TaskRecord | null> {
+    return this.tasks.get(name) ?? null;
+  }
+
+  async listTasks(filter: { limit?: number; offset?: number } = {}): Promise<TaskRecord[]> {
+    const list = [...this.tasks.values()].sort((a, b) => a.name.localeCompare(b.name));
+    return list.slice(filter.offset ?? 0, (filter.offset ?? 0) + (filter.limit ?? 100));
+  }
+
+  async deleteTask(name: string): Promise<void> {
+    this.tasks.delete(name);
+  }
+
+  async createSchedule(schedule: ScheduleRecord): Promise<ScheduleRecord> {
+    // dedupKey is the stable handle: a create whose dedupKey exists updates
+    // that row (id preserved), never a duplicate — mirrors the SQL adapters.
+    if (schedule.dedupKey !== null && schedule.dedupKey !== undefined) {
+      for (const [id, s] of this.schedules) {
+        if (s.dedupKey === schedule.dedupKey && id !== schedule.id) {
+          const merged = { ...s, ...schedule, id };
+          this.schedules.set(id, { ...merged, data: structuredClone(merged.data) });
+          return merged;
+        }
+      }
+    }
+    const stored = { ...schedule, data: structuredClone(schedule.data) };
+    this.schedules.set(schedule.id, stored);
+    return stored;
+  }
+
+  async getSchedule(id: string): Promise<ScheduleRecord | null> {
+    const s = this.schedules.get(id);
+    return s ? { ...s, data: structuredClone(s.data) } : null;
+  }
+
+  async updateSchedule(id: string, patch: Partial<ScheduleRecord>): Promise<void> {
+    const s = this.schedules.get(id);
+    if (!s) return; // idempotent no-op
+    const { id: _id, ...rest } = patch; // id is the identity, never patchable
+    this.schedules.set(id, { ...s, ...rest, data: structuredClone(rest.data ?? s.data) });
+  }
+
+  async deleteSchedule(id: string): Promise<void> {
+    this.schedules.delete(id);
+  }
+
+  async listSchedules(filter: ScheduleListFilter = {}): Promise<ScheduleRecord[]> {
+    let list = [...this.schedules.values()];
+    if (filter.taskName !== undefined) list = list.filter((s) => s.taskName === filter.taskName);
+    list.sort((a, b) => a.id.localeCompare(b.id));
+    return list.slice(filter.offset ?? 0, (filter.offset ?? 0) + (filter.limit ?? 100));
+  }
+
+  // --- schedule tick loop ---
+  async listDueSchedules(now: Date): Promise<ScheduleRecord[]> {
+    // per-task ceiling: a task's schedules are serialized — nothing is due while
+    // any sibling schedule of the same task is locked.
+    const lockedTasks = new Set(
+      [...this.schedules.values()].filter((s) => s.lockedAt !== null).map((s) => s.taskName),
+    );
+    return [...this.schedules.values()]
+      .filter(
+        (s) =>
+          s.nextRunAt !== null &&
+          s.nextRunAt <= now &&
+          s.lockedAt === null &&
+          !s.paused &&
+          !s.disabled &&
+          !lockedTasks.has(s.taskName),
+      )
+      .sort((a, b) => b.priority - a.priority || a.nextRunAt!.getTime() - b.nextRunAt!.getTime());
+  }
+
+  async claimSchedule(id: string, now: Date): Promise<boolean> {
+    const s = this.schedules.get(id);
+    if (!s || s.lockedAt !== null || s.paused || s.disabled) return false;
+    for (const other of this.schedules.values()) {
+      if (other.taskName === s.taskName && other.lockedAt !== null) return false; // per-task ceiling 1
+    }
+    s.lockedAt = now;
+    return true;
+  }
+
+  async completeSchedule(id: string, result: CompleteResult): Promise<void> {
+    const s = this.schedules.get(id);
+    if (!s) return;
+    s.nextRunAt = result.nextRunAt;
+    s.lastRunAt = result.lastRunAt;
+    s.lockedAt = null;
+    if (result.failed) s.failCount += 1;
+    if (result.retryCount !== undefined) s.retryCount = result.retryCount;
+    if (result.lastRunId !== undefined) s.lastRunId = result.lastRunId;
+  }
+
+  async reapZombieScheduleLocks(olderThan: Date): Promise<number> {
+    let count = 0;
+    for (const s of this.schedules.values()) {
+      if (s.lockedAt !== null && s.lockedAt < olderThan) {
+        s.lockedAt = null;
+        s.failCount += 1;
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  async refreshScheduleLock(id: string, now: Date): Promise<void> {
+    const s = this.schedules.get(id);
+    if (!s || s.lockedAt === null) return; // never re-locks a reaped/finished schedule
+    s.lockedAt = now;
+  }
+
+  async clearScheduleLocks(): Promise<number> {
+    let count = 0;
+    for (const s of this.schedules.values()) {
+      if (s.lockedAt !== null) {
+        s.lockedAt = null;
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  async listDueTasks(now: Date): Promise<TaskRecord[]> {
+    return [...this.tasks.values()]
+      .filter(
+        (t) => t.nextRunAt !== null && t.nextRunAt <= now && t.lockedAt === null && !t.paused && !t.disabled,
+      )
+      .sort((a, b) => b.priority - a.priority || a.nextRunAt!.getTime() - b.nextRunAt!.getTime());
+  }
+
+  async claimTask(name: string, now: Date): Promise<boolean> {
+    const t = this.tasks.get(name);
+    if (!t || t.lockedAt !== null || t.paused || t.disabled) return false;
+    t.lockedAt = now;
+    return true;
+  }
+
+  async completeTask(name: string, result: CompleteResult): Promise<void> {
+    const t = this.tasks.get(name);
+    if (!t) return;
+    t.nextRunAt = result.nextRunAt;
+    t.lastRunAt = result.lastRunAt;
+    t.lockedAt = null;
+    if (result.failed) t.failCount += 1;
+    if (result.retryCount !== undefined) t.retryCount = result.retryCount;
+    if (result.lastRunId !== undefined) t.lastRunId = result.lastRunId;
+  }
+
+  async reapZombieLocks(olderThan: Date): Promise<number> {
+    let count = 0;
+    for (const t of this.tasks.values()) {
+      if (t.lockedAt !== null && t.lockedAt < olderThan) {
+        t.lockedAt = null;
+        t.failCount += 1;
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  async refreshLock(name: string, now: Date): Promise<void> {
+    const t = this.tasks.get(name);
+    if (!t || t.lockedAt === null) return; // never re-locks a reaped/finished task
+    t.lockedAt = now;
+  }
+
+  async clearLocks(): Promise<number> {
+    let count = 0;
+    for (const t of this.tasks.values()) {
+      if (t.lockedAt !== null) {
+        t.lockedAt = null;
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  async createRun(run: RunRecord): Promise<void> {
+    this.runs.set(run.id, { ...run, data: structuredClone(run.data), result: structuredClone(run.result) });
+  }
+
+  async getRun(runId: string): Promise<RunRecord | null> {
+    return this.runs.get(runId) ?? null;
+  }
+
+  async updateRun(runId: string, patch: RunUpdate): Promise<void> {
+    const r = this.runs.get(runId);
+    if (!r) return;
+    this.runs.set(runId, { ...r, ...patch });
+  }
+
+  async finishRun(runId: string, finish: RunFinish): Promise<void> {
+    const r = this.runs.get(runId);
+    if (!r) return;
+    const { status, ...rest } = finish;
+    this.runs.set(runId, { ...r, ...rest, status, finishedAt: new Date() });
+  }
+
+  async deleteRun(runId: string): Promise<void> {
+    this.runs.delete(runId);
+  }
+
+  async pruneRuns(filter: { olderThan: Date; temporary: boolean }): Promise<number> {
+    const terminal = new Set(['succeeded', 'failed', 'cancelled']);
+    let count = 0;
+    for (const [id, r] of [...this.runs]) {
+      if (
+        r.finishedAt !== null &&
+        r.finishedAt < filter.olderThan &&
+        r.temporary === filter.temporary &&
+        terminal.has(r.status)
+      ) {
+        this.runs.delete(id);
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  async listRuns(filter: { taskName?: string; status?: string; limit?: number; offset?: number } = {}): Promise<RunRecord[]> {
+    let list = [...this.runs.values()];
+    if (filter.taskName !== undefined) list = list.filter((r) => r.taskName === filter.taskName);
+    if (filter.status !== undefined) list = list.filter((r) => r.status === filter.status);
+    list.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
+    return list.slice(filter.offset ?? 0, (filter.offset ?? 0) + (filter.limit ?? 100));
+  }
+}
+```
+
+
+# Storage
+
+sched talks to persistence through a single `Storage` contract. SQLite is the default
+(embedded, zero-config, shipped inside `@schedjs/core`); MySQL/MariaDB, Postgres and Mongo
+are separate adapter packages you install when history must live elsewhere (shared prod
+DB, multi-replica).
+
+| Backend          | Package                     | Driver                               | Page                                                                         |
+| ---------------- | --------------------------- | ------------------------------------ | ---------------------------------------------------------------------------- |
+| SQLite (default) | `@schedjs/core`             | built-in (`node:sqlite`)             | [sqlite](https://schedjs.github.io/schedjs/docs/storage/adapters/sqlite)     |
+| MySQL / MariaDB  | `@schedjs/storage-mysql`    | `mysql2` (one driver, both dialects) | [mysql](https://schedjs.github.io/schedjs/docs/storage/adapters/mysql)       |
+| Postgres         | `@schedjs/storage-postgres` | `pg`                                 | [postgres](https://schedjs.github.io/schedjs/docs/storage/adapters/postgres) |
+| Mongo            | `@schedjs/storage-mongo`    | `mongodb`                            | [mongo](https://schedjs.github.io/schedjs/docs/storage/adapters/mongo)       |
+| Anything else    | your own adapter            | any driver                           | [custom](https://schedjs.github.io/schedjs/docs/storage/custom)              |
+
+Each adapter is a thin package over the same contract: install it, pass it to
+`createEngine` / `createDaemon`, done. Versions are independent, so an adapter can
+move at its own pace without forcing a core bump.
+
+### The CLI-ready surface — `createStorage(env)`
+
+Every adapter package also exports a `createStorage(env: NodeJS.ProcessEnv): Promise<Storage>` helper — the **same** BYO contract a custom adapter uses (see
+[custom](https://schedjs.github.io/schedjs/docs/storage/custom)). It reads its own connection-string env vars and
+returns a ready `Storage`:
+
+| Package                     | Reads                                                         | Returns                               |
+| --------------------------- | ------------------------------------------------------------- | ------------------------------------- |
+| `@schedjs/storage-mongo`    | `MONGO_URL` (+`MONGO_DB`, fallback db name from the URI path) | adapter over a connected mongo client |
+| `@schedjs/storage-mysql`    | `MYSQL_URL`                                                   | adapter over a mysql2 pool            |
+| `@schedjs/storage-postgres` | `PG_URL`                                                      | adapter over a pg pool                |
+
+```ts
+import { createStorage } from '@schedjs/storage-mongo';
+
+const storage = await createStorage(process.env); // reads MONGO_URL / MONGO_DB
+createDaemon({ tasksPath: 'tasks.json', storage });
+```
+
+The daemon binary uses the same helper for `--storage mongo|mysql|postgres`
+(see [CLI](https://schedjs.github.io/schedjs/docs/cli#storage-selection-storage)) — it never imports the drivers, only
+this one function. Connection strings are read from env, never passed as
+arguments.
+
+## What the contract covers
+
+- **Tasks** — upsert/list/get, claim (locking), pause/resume, disable
+- **Schedules** — create (dedup-aware upsert), get/update/delete, list (per-task filter)
+- **Runs** — create, mid-flight update (`progress`/`log`/`result`), terminal finish,
+  list with filters, get, delete; every run carries `scheduleId` (which schedule fired)
+- **Locking** — atomic claim + release (zombie reaping by `lockTtlMs`)
+
+Storage adapters ship with a **contract test-suite** — the same tests run against SQLite,
+MySQL/MariaDB, Postgres and Mongo, so parity is enforced, not assumed.
+
+## Run-record schema
+
+Runs are stored as full records. The fields split into four groups:
+
+**Identity & lifecycle**
+
+- `id` — run UUID
+- `taskName` — the task that ran
+- `runner` — `'http' | 'docker' | 'internal' | custom`
+- `status` — `queued | running | succeeded | failed | cancelled`
+- `startedAt` / `finishedAt` — timestamps (`finishedAt` null while running)
+
+**Data & outcome**
+
+- `data` — run parameters snapshot at dispatch (JSON)
+- `result` — final result reported by the worker (JSON)
+- `error` — error message, null on success
+- `progress` — 0–100, written mid-flight
+- `log` — captured stdout/stderr, soft-capped
+- `artifacts` — `ArtifactRef[]` (S3 keys, email receipts, URLs)
+- `workerRef` — statusUrl (http) / container id (docker)
+
+**Run metadata**
+
+- `trigger` — `'schedule'` (the tick) or `'manual'` (`triggerTask` / retry)
+- `triggeredBy` — caller identity of a manual run (null for schedule runs)
+- `temporary` — retention class: true = 24h TTL, false = 30d
+- `retryOf` — predecessor run id (manual retry / engine auto-retry); null = fresh
+- `attempt` — 1-based attempt within the retry cycle (1 = first try)
+- `scheduleId` — the schedule that fired the run (null for manual runs)
+
+**Relations**
+
+- Tasks carry `lastRunId` (retry-linking); schedules carry `lastRunId` too (their
+  own last run). `data`/`result`/`artifacts` are JSON columns (`null` ↔ SQL `NULL`).
+
+
+# Logging & observability
+
+sched separates **three levels** of observability: run logs (stored with each run),
+terminal events (a hook per finished run), and engine events (claim/dispatch/retry —
+the wiring is yours today).
+
+## 1. Run logs — what a run did
+
+Each `RunRecord` carries a `log` field — the captured output of that run:
+
+- **Internal runner** — `ctx.log(line)` in your handler appends to the run's log;
+  `ctx.setProgress(percent)` reports progress. A thrown handler carries the log lines
+  collected so far into the failed run.
+- **Docker runner** — the container's stdout/stderr are captured into a ring buffer
+  (soft-capped by `maxLogKb`) and attached to the run on completion.
+- **HTTP runner** — the run's `log` is whatever the worker reports back via the poll
+  envelope (`{ status: 'running', log: '...', progress: 50 }`).
+
+Run logs are stored, not streamed — read them back anytime:
+
+```ts
+const runs = await storage.listRuns({ taskName: 'generate-thumbnail', limit: 10 });
+for (const r of runs) console.log(r.log, r.status, r.attempt);
+```
+
+## 2. Terminal events — `onRunFinal`
+
+The `onRunFinal` hook fires once per run reaching a **terminal** state
+(`succeeded` / `failed` / `cancelled`) — with the finished `RunRecord`. Wire it to your
+logger, metrics, or the built-in status alerts (`createAlerts` — webhook):
+
+```ts
+const engine = createEngine({
+  // ...
+  onRunFinal: (run) => {
+    console.log(`[sched] ${run.taskName} ${run.status} attempt=${run.attempt} ${run.error ?? ''}`);
+  },
+});
+```
+
+Two semantics worth knowing:
+
+- **Retries defer the hook.** A failed run with retries left does *not* fire — the alert
+  lands only on the **final, exhausted** failure (that's what "persistent failure"
+  means; see [Tasks → retry](https://schedjs.github.io/schedjs/tasks#retry)).
+- **Manual triggers always fire** — `triggerTask` is a one-shot, its result alerts
+  immediately, and it never auto-retries.
+
+`createAlerts` (webhook) is a ready-made `onRunFinal` consumer — wire it as
+`onRunFinal: createAlerts(config).handleFinal` and
+`onEvent: createAlerts(config).handleEvent` (daemon: the `alerts` option; see
+[Self-hosting → Status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts)).
+
+## 3. Engine events — claim / dispatch / retry / zombie reap
+
+The engine core stays silent by default, but ships a native event stream via
+`onEvent` — a typed union of lifecycle events, one per claim, dispatch, run
+outcome, retry schedule, poll and zombie reap. This is the supported way to
+watch *why* a task fired (or didn't):
+
+```ts
+import { createEngine, createEventLogger } from '@schedjs/core';
+
+const engine = createEngine({
+  storage,
+  runner,
+  onEvent: createEventLogger(), // ready-made console formatter
+});
+```
+
+The events (all carry `taskName` / `runId` / `attempt` where relevant):
+
+| Event                                                                | When                                                                                                                                                        | Extra fields                                         |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `tick`                                                               | a scan found due tasks (never a 0-due tick)                                                                                                                 | `dueCount`                                           |
+| `claim`                                                              | a task lock was taken                                                                                                                                       | —                                                    |
+| `dispatch`                                                           | the runner was invoked                                                                                                                                      | `runner`                                             |
+| `run-succeeded` / `run-failed` / `run-cancelled`                     | per-attempt terminal outcome                                                                                                                                | `error` (fail/cancel)                                |
+| `retry-scheduled`                                                    | a failure still has retries left                                                                                                                            | `nextRunAt`, `backoffMs`                             |
+| `missed-slot`                                                        | a schedule dispatched later than the grace window (downtime catch-up / wedged lock)                                                                         | `scheduledAt`, `delayMs`                             |
+| `poll`                                                               | an async run was polled                                                                                                                                     | `status`, `progress`                                 |
+| `cancel-sent` / `cancel-ack` / `cancel-failed` / `cancel-no-channel` | an async cancel signal was POSTed to the worker's `cancelUrl`, acked with a status, failed with a reason, or skipped (no `cancelUrl` — legacy stop-polling) | `cancelUrl` (sent), `status` (ack), `error` (failed) |
+| `zombie-reaped`                                                      | stale locks were released (only when > 0)                                                                                                                   | `count`                                              |
+| `recovered-orphans`                                                  | startup recovery cancelled orphaned in-flight runs                                                                                                          | `count`, `clearedLocks`                              |
+| `error`                                                              | a storage/runner failure was caught by the tick boundary                                                                                                    | `message`                                            |
+
+The four `cancel-*&#x60; events are the async-cancel channel's observability contract
+(battle-stand debugging, 2026-08-21) — one line per cancel attempt, so the
+operator can tell &#x2A;*«signal never sent»** (`cancel-no-channel&#x60;) from
+&#x2A;*«sent and failed»** (`cancel-failed&#x60;) from &#x2A;*«acked»** (`cancel-ack`). The
+daemon writes them to stdout as `[cancel] POST <url> runId=<id>` / `[cancel] ack status=<n>` / `[cancel] failed: <причина>` / `[cancel] no cancelUrl — legacy stop-polling` — grep `[cancel]` in `docker logs` to follow a cancel attempt.
+
+```ts
+const engine = createEngine({
+  // ...
+  onEvent: (e) => {
+    if (e.type === 'run-failed') console.error(`[sched] ${e.taskName} attempt ${e.attempt}: ${e.error}`);
+    if (e.type === 'retry-scheduled') console.warn(`[sched] retry ${e.taskName} in ${e.backoffMs}ms`);
+  },
+});
+```
+
+Semantics worth knowing:
+
+- **Retries.** A failed attempt always emits `run-failed`; if a retry is still
+  planned it is *also* followed by `retry-scheduled` (the backoff plan). The
+  final, exhausted failure emits only `run-failed` — the persistent-fail alert
+  lands via `onRunFinal` (see section 2).
+- **Noise guards.** `tick` fires only when something is due; `zombie-reaped`
+  only when locks were actually reaped — at 1s/60s cadence a "0 due" line would
+  drown the signal.
+- **Manual triggers.** `triggerTask` emits `dispatch` + the outcome (no `claim`
+  — nothing was claimed) and never a `retry-scheduled`.
+- **Observer safety.** A throwing `onEvent` is swallowed — a logging bug must
+  never take the scheduler down.
+
+`createEventLogger` formats the stream into single-line `[sched] …` entries
+(console by default; point `write` at pino for structured output, or use
+`filter` to keep only the event types you care about):
+
+```text
+[sched] tick: 3 due
+[sched] claim publish-video run=ab12cd34 attempt=1
+[sched] dispatch publish-video run=ab12cd34 runner=http attempt=1
+[sched] retry publish-video run=ab12cd34 attempt=1 backoff=60000ms (next 2026-08-16 12:01:00Z)
+[sched] missed-slot publish-video sched=publish-video scheduled 2026-08-16 03:00:00Z (32400000ms late)
+[sched] reaped 2 zombie lock(s) older than 2026-08-16 11:30:00Z
+```
+
+### Still possible: wrapping the Storage seam
+
+The engine's storage calls remain a valid, lower-level observation point —
+every engine action (due scan, claim, completion, zombie reap) is a `Storage`
+method call, so a proxy logs the lifecycle at a coarser granularity (e.g. to
+capture *skipped* claims, which the event stream intentionally leaves silent):
+
+```ts
+import type { Storage } from '@schedjs/core';
+
+function loggingStorage(s: Storage): Storage {
+  return {
+    ...s,
+    async listDueTasks(now) {
+      const due = await s.listDueTasks(now);
+      console.log(`[sched] tick: ${due.length} due`);
+      return due;
+    },
+    async claimTask(name, at) {
+      const ok = await s.claimTask(name, at);
+      console.log(`[sched] claim ${name} → ${ok ? 'taken' : 'skipped (locked/paused)'}`);
+      return ok;
+    },
+    async completeTask(name, result) {
+      await s.completeTask(name, result);
+      console.log(`[sched] done ${name} failed=${result.failed} next=${result.nextRunAt?.toISOString()}`);
+    },
+    async reapZombieLocks(olderThan) {
+      const n = await s.reapZombieLocks(olderThan);
+      if (n > 0) console.log(`[sched] reaped ${n} zombie lock(s)`);
+      return n;
+    },
+  };
+}
+
+// pass the wrapper to the engine:
+createEngine({ storage: loggingStorage(createSqliteStorage(db)), /* ... */ });
+```
+
+## What's not logged yet
+
+- **Claim skips** (a due task that lost the claim race to another replica) are
+  silent in the event stream — see the Storage-proxy recipe above.
+- **0-due ticks** are silent by design (cadence noise) — `tick` fires only when
+  a scan found due tasks.
+- **Run output** (stdout/stderr) is not streamed live — read the stored `log`
+  field of the `RunRecord` (section 1).
+
+
+# Admin API
+
+The daemon serves a small JSON API under `--admin-port` (mount point `/api`). Bearer auth
+is required when `SCHED_ADMIN_KEY` is set:
+
+```text
+Authorization: Bearer <SCHED_ADMIN_KEY>
+```
+
+Unauthenticated requests get `401 { "error": "unauthorized" }`. When no key is configured,
+the API is open (bind to a private host in that case).
+
+**Exception: `GET /health` is always open** — even with a key configured, the health
+probe answers without credentials (compose healthchecks / LB probes carry none, and the
+payload has no secrets). Every other route 401s without the key.
+
+> **Machine-readable contract.** An OpenAPI 3.1 spec ships with the server package:
+> `@schedjs/admin-api/openapi.json` — generate a client in any language with
+> `openapi-generator` / `kiota` / fern. The spec is route-parity-tested against the
+> router (every documented path is exercised; a removed route fails the suite).
+>
+> **Download without running anything:** the same file is served by this docs site at
+> [/openapi.json](https://schedjs.github.io/schedjs/openapi.json) (byte-identical to the package spec, guarded by
+> `packages/admin-api/test/ts-client-guard.test.ts`).
+>
+> **Verified flavors:** Python (`openapi-generator` 7.24.0, suite
+> 24/24 + smoke 19/19 against a live daemon) and TypeScript (`typescript-axios`,
+> compiles clean under `tsc --strict`; pinned spec copies are byte-identical to the
+> package one, guarded by `packages/admin-api/test/ts-client-guard.test.ts`). Two
+> generator families over one spec — the 3.1 nullable unions
+> (`type: [..., "null"]`) map to `string | null` in both.
+>
+> **Generator-compatible shapes:**\*\*
+>
+> - Mutations return **wrapped** records — `{ task }`, `{ run }`, `{ schedule }` —
+>   singular GETs return the bare record; the spec declares exactly that.
+> - `Schedule` is a **flat output schema** (kind + optional cron/timezone/ms/at) —
+>   one-shot rules normalize to `{ kind: "once", at }`, intervals to `{ kind: "interval", ms }`.
+> - No `const: true` / no oneOf+discriminator — constructs that make `openapi-generator`
+>   emit broken models (string-enums for booleans, `actual_instance=None`).
+> - `GET /runs/{id}?logFromOffset=N` declares the incremental-chunk shape
+>   (`logChunk` + `logTotalLength` alongside the run).
+> - Unknown top-level body fields on `POST /schedules` / `PATCH /schedules/{id}`
+>   are rejected with 400 (fail-fast) — a silent-ignored `dedupKey` used to create
+>   a duplicate schedule.
+
+> **Cache control.** Every JSON response is sent with `Cache-Control: no-store` (and the
+> artifact proxy with `no-cache`), so the browser never serves a cached snapshot of a run.
+> The standalone UI (`sched-ui serve`) additionally forces `no-cache` on its `/api/*` proxy
+> responses. If a browser still shows a stale list, hard-refresh (Ctrl+F5) once.
+
+> The same API is available to embedded apps: `createAdminApi` from `@schedjs/admin-api`
+> returns an `AdminApi` whose `handleRequest(req, res)` you can mount at any path
+> (see [Admin UI](https://schedjs.github.io/schedjs/ui) § Embedded apps).
+
+## Health
+
+```text
+GET /api/health   → { "ok": true, "uptimeMs": 1234, "version": "0.16.0" }
+```
+
+`version` is the daemon's own package version (falls back to `@schedjs/admin-api` for
+embedded hosts — pass `version` to `createAdminApi` to override).
+
+```json
+{ "ok": true, "uptimeMs": 123456 }
+```
+
+## Runs
+
+```text
+GET /runs?task=greet&status=failed&limit=20&offset=0
+```
+
+| Query             | Description                                                                    |
+| ----------------- | ------------------------------------------------------------------------------ |
+| `task`            | filter by task name                                                            |
+| `status`          | filter by status (`queued` / `running` / `succeeded` / `failed` / `cancelled`) |
+| `limit`, `offset` | pagination                                                                     |
+
+```json
+{ "runs": [ { "id": "...", "taskName": "greet", "status": "failed", ... } ] }
+```
+
+```text
+GET /runs/:id          → the RunRecord, or 404
+GET /runs/:id?logFromOffset=N → { run, logChunk, logTotalLength } (incremental log read)
+DELETE /runs/:id       → delete a finished run (404 unknown, 409 while active — cancel first)
+POST /runs/:id/retry   → re-run a run (404 if unknown, 409 if its task is gone)
+POST /runs/:id/cancel  → cancel an active run (404 unknown, 409 if already finished)
+```
+
+`GET /runs/:id?logFromOffset=N` reads the log **incrementally**:
+instead of the full `log` snapshot, the response carries `logChunk` (the tail
+starting at offset `N`) and `logTotalLength` (the current total), so a UI can
+poll for growth while a run is still writing:
+
+```text
+GET /runs/ab12cd34?logFromOffset=64
+→ { "id": "ab12cd34", ..., "log": null,
+     "logChunk": "line2\nline3", "logTotalLength": 21 }
+```
+
+- Offset `0` → the whole log as a chunk (same content as the full `log`).
+- Offset `≥ logTotalLength` → empty `logChunk` (the UI keeps polling).
+- Without the parameter the response is unchanged (full `log` included).
+
+### Manual retry
+
+`POST /runs/:id/retry` executes the run again through its runner (like the task
+actions below, it does not touch the schedule). The new run: `data` = the
+original run's snapshot, `retryOf` = the original id, `trigger = 'manual'`,
+`temporary` inherited from the original, `triggeredBy` fresh — who retries now
+(null when the body omits it). The original run is left untouched for audit.
+Chains are allowed — a retry can itself be retried.
+
+Accepts an optional JSON body to name the retry actor:
+
+```text
+POST /runs/ab12cd34/retry
+Content-Type: application/json
+{ "triggeredBy": "boss@books" }
+```
+
+- `triggeredBy` — caller-supplied audit identity (string or null; absent/null =
+  anonymous). sched does not verify it — caller-declared, audit-grade not
+  auth-grade. Malformed / non-object body → `400`.
+
+```text
+POST /runs/ab12cd34/retry   → 200 { "run": { "id": "ef56…", "retryOf": "ab12cd34", "trigger": "manual", ... } }
+```
+
+### Cancel
+
+`POST /runs/:id/cancel` stops an active run — the worker is
+really stopped, not just re-labelled:
+
+```text
+POST /runs/ab12cd34/cancel   → 200 { "run": { "id": "ab12cd34", "status": "cancelled", ... } }
+POST /runs/ab12cd34/cancel   → 409 (already succeeded/failed/cancelled)
+POST /runs/nope/cancel       → 404
+```
+
+- `queued` (async, being polled) → the worker is told to stop first (when the
+  accepted envelope advertised a `cancelUrl`, sched POSTs `{ runId }` there — see
+  [Runner protocol → Cancel](https://schedjs.github.io/schedjs/protocol#cancel)); then dropped from the poll queue,
+  finished `cancelled`, schedule advanced, task lock released. A failed cancel
+  signal is recorded in the run's error (`cancel signal failed: <reason>`) — the
+  worker may still be running.
+- `running` (sync, in flight) → the runner is aborted via `hooks.signal`
+  (see [Custom runners → hooks.signal](https://schedjs.github.io/schedjs/runners/custom#hookssignal-user-cancel));
+  the response is sent after the worker actually stopped.
+- A terminal run cannot be cancelled (`409`).
+
+`DELETE /runs/:id` refuses an **active** run (`409` — cancel it first); finished
+runs delete normally.
+
+## Tasks
+
+```text
+GET /tasks?limit=&offset=   → { "tasks": [...] } (name ASC, limit capped at 1000)
+GET /tasks/:name            → one task, or 404
+POST /tasks                 → create/upsert a task, returns { task } (201 created / 200 updated)
+```
+
+### Runtime registration — POST /tasks
+
+Creates a task, or **upserts** an existing one (same semantics as `tasks.json` sync —
+the body is a full `TaskDefinition`, validated eagerly with the same fail-fast rules):
+
+```text
+POST /tasks
+Content-Type: application/json
+
+{
+  "name": "generate-thumbnail",
+  "runner": "http",
+  "schedules": [{ "cron": "0 9 * * *" }],
+  "config": { "url": "http://worker/thumbnails", "method": "POST" }
+}
+
+→ 201
+
+{ "task": { "name": "generate-thumbnail", ..., "nextRunAt": "..." } }
+```
+
+- No daemon restart needed — the task is live immediately (a second POST with the same
+  name updates it in place; schedule change recomputes `nextRunAt` from now).
+- Runtime state is preserved on upsert: `paused`, `failCount`, `retryCount`, `disabled`
+  and `nextRunAt` (unless the schedule changed) are never reset.
+- Validation failures → `400` with the same messages `tasks.json` uses (fail-fast — a
+  typo must not become silent failed runs). Malformed / non-object body → `400`.
+- `tasks.json` remains the source of truth for *declared* tasks; a task **removed**
+  from the file gets **disabled** by the next sync (see
+  [Tasks → Sync semantics](https://schedjs.github.io/schedjs/tasks#sync-semantics)). Runtime-registered tasks
+  (`fileManaged: false`) are **never** disabled by sync — they live until removed
+  via `DELETE /tasks/:name`.
+- Embedded callers can register without HTTP: `upsertTaskDefinition(storage, def, now)`
+  (exported from `@schedjs/core`).
+
+Actions (ad-hoc, do not touch the schedule):
+
+```text
+POST /tasks/:name/run      → trigger the task now (engine.triggerTask), returns { run }
+DELETE /tasks/:name        → remove a task (204), unknown → 404 (runtime tasks live until deleted)
+POST /tasks/:name/pause    → pause the task
+POST /tasks/:name/resume   → resume the task
+```
+
+`triggerTask` executes immediately through the runner and records run history — it works
+for paused/disabled tasks too (explicit manual trigger). A manual run updates the task's
+`lastRunId`/`lastRunAt` but never touches the schedule (`nextRunAt` stays put).
+
+> The call **blocks until the run finishes** for sync runners — the response is the
+> terminal run. For long sync runs use a scheduled interval (or an async runner)
+> if you need the HTTP call to return promptly.
+
+`POST /tasks/:name/run` accepts an optional JSON body to pick the run's retention class,
+name the caller, and override its parameters (otherwise the run is `temporary: false`,
+`triggeredBy: null` with the task's default `config.data`):
+
+```text
+POST /tasks/:name/run
+Content-Type: application/json
+{ "temporary": true, "triggeredBy": "boss@books", "data": { "videoId": "v-42" } }
+```
+
+- `temporary: true` → short retention class (24h TTL, see [Runs → Retention](https://schedjs.github.io/schedjs/runs#retention)).
+- `data` → merged over the task's default `config.data` (`{ ...config.data, ...data }`).
+  The worker is dispatched with the merged payload — the override reaches the
+  run's execution, not just the audit record.
+- `triggeredBy` → caller-supplied audit identity (string or null; absent/null =
+  anonymous). sched is identity-agnostic — it does not verify the value
+  (caller-declared, audit-grade not auth-grade); embedded callers pass it to
+  `triggerTask(name, { triggeredBy })` directly.
+- Malformed / non-object body → `400`.
+
+> `POST /tasks/:name/schedule` is **removed**: it answers `404` pointing at
+> `POST /schedules` below. Imperative schedules are created there — one schedule
+> per rule, each with its own data/policy.
+
+## Schedules (schedule-as-entity)
+
+```text
+POST   /schedules                → create/upsert, { schedule } — 201 created / 200 updated
+GET    /schedules?limit=&offset= → { schedules } (id ASC, limit capped at 1000)
+GET    /schedules/:id            → ScheduleRecord | 404
+DELETE /schedules/:id            → 204 | 404 (remove a schedule; runs keep their history)
+POST   /schedules/:id/pause      → { ok } | 404
+POST   /schedules/:id/resume     → { ok } | 404
+```
+
+A **schedule** is one firing rule of a task with its own `data`/policy — the
+entity that replaced the task's single `schedule` field (one task, one
+schedule per channel).
+
+### POST /schedules
+
+```text
+POST /schedules
+Content-Type: application/json
+
+{
+  "taskName": "sync-channel-stats",
+  "schedule": {
+    "cron": "0 9 * * *",
+    "data": { "channelId": "UC-ada" },
+    "externalId": "ada",
+    "dedupKey": "channel-ada"
+  }
+}
+
+→ 201
+
+{
+  "schedule": {
+    "id": "...uuid...",
+    "taskName": "sync-channel-stats",
+    "schedule": { "cron": "0 9 * * *" },
+    "tz": "UTC",
+    "data": { "channelId": "UC-ada" },
+    "nextRunAt": "...",
+    "fileManaged": false,
+    ...
+  }
+}
+```
+
+- Body: `{ taskName, schedule: { cron | interval | once, timezone?, data?, externalId?, dedupKey?, retry?, priority? }, tz? }` — the `schedule` object is the same shape as a
+  `tasks.json` schedules element. `tz` defaults to the **task's** timezone; an inner
+  `timezone` on cron overrides it.
+- **`dedupKey` is the idempotent upsert handle**: a second POST with the same key updates
+  the existing schedule in place (its id is preserved) and answers `200`; a fresh schedule
+  answers `201`. Without a `dedupKey` every POST creates a new schedule.
+- Validation is identical to `tasks.json` (fail-fast): unknown task → `404`; a malformed
+  schedule, bad tz, invalid policy → `400`.
+- Created schedules are **runtime-owned** (`fileManaged: false`) — sync never disables
+  them; remove one with `DELETE /schedules/:id`.
+
+### GET /schedules
+
+Returns every schedule as a first-class row: `id/taskName/schedule/tz/data/externalId/ dedupKey/nextRunAt/lastRunAt/lastRunId/failCount/retryCount/priority/retry/paused/disabled`
+plus two resolved fields (no N+1 — three reads total):
+
+- `lastRunStatus` — how the schedule's most recent run ended (`null` when it has no run,
+  or its last run fell out of the recent window; listRuns is recent-first, capped at 1000).
+- `effectiveStatus` — the **AND-semantics made visible**: `'paused-task'`
+  (the family stop holds), `'paused-schedule'` (only this instance), or `'active'`. The UI
+  renders 🔴 for paused-task and 🟡 for paused-schedule, so «снял паузу, а оно молчит»
+  never happens.
+
+```json
+{
+  "schedules": [
+    { "id": "channel-ada", "taskName": "sync-channel-stats", "schedule": { "cron": "0 9 * * *" },
+      "tz": "UTC", "data": { "channelId": "UC-ada" }, "nextRunAt": "...", "lastRunAt": null,
+      "lastRunId": null, "lastRunStatus": null, "failCount": 0, "retryCount": 0,
+      "priority": 0, "retry": null, "paused": false, "disabled": false,
+      "effectiveStatus": "active" }
+  ]
+}
+```
+
+`GET /schedules/:id` returns the same shape for one schedule (with `effectiveStatus`);
+`PATCH /schedules/:id` edits a schedule **in place** (partial merge — only the
+fields present in the body change; an explicit `null` clears, an absent field
+keeps its current value). `nextRunAt` recomputes from now when the rule or the
+effective tz changed; runtime state (lock, fail count, retry count, last run) is
+preserved. Body: `{ schedule: { cron | interval | once, timezone?, data?, externalId?, dedupKey?, retry?, priority? }, tz? }` — same entry shape as
+`POST /schedules`, so a rule-only patch like `{ "schedule": { "cron": "0 9 * * *" } }`
+updates the rule and leaves `data`/`dedupKey`/`retry` untouched. 404 on unknown
+id, 400 on a bad rule/tz.
+
+`DELETE /schedules/:id` removes the schedule but **keeps its runs** — the audit trail
+survives. `POST /schedules/:id/pause|resume` toggles only the schedule-level flag
+(`pauseTask` remains the family stop).
+
+## Errors
+
+- `404` — unknown resource
+- `405` — method not allowed on a route
+- `500` — internal error with the message in `{ "error": "..." }`
+
+
+# Admin UI
+
+The admin UI ships as &#x2A;*`@schedjs/ui`** — Lit web components (framework-agnostic:
+plain HTML, Vue, React, Svelte) plus a standalone shell. It talks to the
+[admin api](https://schedjs.github.io/schedjs/admin-api) (`createAdminApi` from `@schedjs/admin-api`), which the daemon
+mounts at `/api/*` and embedded apps can mount at any path. The shell page
+footer shows the `@schedjs/ui` version, the daemon version (fetched from
+`/health`), the admin-api mount and a GitHub link.
+
+Four consumption modes:
+
+| Mode                      | How                                                       | When                                 |
+| ------------------------- | --------------------------------------------------------- | ------------------------------------ |
+| 1. **Standalone**         | `sched-ui serve --proxy http://127.0.0.1:8080`            | a UI next to a daemon in one command |
+| 2. **Embedded at a path** | host `dist/` statically under `/sched`, `?api=/sched/api` | mount the UI inside your app         |
+| 3. **Components**         | `<sched-runs base="/api" token="…">` in your page         | build the UI into your own markup    |
+| 4. **Custom UI**          | `createAdminApi` from `@schedjs/admin-api`                | your own panel, CLI, or client       |
+
+## 1. Standalone
+
+```bash
+npm i -g @schedjs/ui        # or: npx @schedjs/ui
+sched-ui serve --proxy http://127.0.0.1:8080 --port 8081
+```
+
+Open &#x2A;*<http://127.0.0.1:8081>{rel="&#x22;nofollow&#x22;"}**. `/api/*` is proxied to the daemon on the same
+origin — no CORS setup, and the Bearer token never leaves the browser→sched-ui hop.
+
+> **Cache control.** The bundle (`/sched-ui.bundle.js`) is served with
+> `Cache-Control: no-store` and `/api/*` proxy responses with `no-cache` — a
+> rebuilt UI or a fresh run snapshot is never served stale from the browser cache.
+
+## 2. Embedded at a path
+
+Host the built `dist/` of `@schedjs/ui` under any path (nginx, CDN, your app's static
+folder) and point it at your admin api mount:
+
+- `dist/index.html` is the shell — open `https://you.example/sched/`
+- query overrides: `?api=…`, `?token=…`, `?refresh=…` (e.g. `?api=/sched/api`)
+
+## 3. Components
+
+```html
+<script type="module" src="/sched-ui.bundle.js"></script>
+<sched-runs base="/api" token="…" limit="50"></sched-runs>
+<sched-tasks base="/api"></sched-tasks>
+<sched-schedules base="/api"></sched-schedules>
+```
+
+Components are Lit custom elements — they work in any framework. Theming is via CSS
+custom properties (`--sched-bg`, `--sched-card`, `--sched-line`, `--sched-text`,
+`--sched-muted`, `--sched-ok`, `--sched-bad`, `--sched-run`): override them in your
+own stylesheet to match your brand.
+
+Run deletion in `<sched-runs>` is two-step: the row's **del** button arms to &#x2A;*sure?**
+and only a second click within 3s deletes (auto-disarms on timeout or refresh) — a
+stray click can't wipe a run.
+
+**Auto-refresh** — every list (`<sched-runs>`, `<sched-tasks>`, `<sched-schedules>`)
+polls the admin api on the `refreshMs` interval (property, or the `refresh-ms`
+attribute; default 5000 ms) so live fields — run status/progress, next-run and
+last-run times, fail counts — stay current; set `refreshMs=0` to disable polling.
+The shell sets this from the `?refresh=…` query override.
+
+**Last status** — `<sched-schedules>` and `<sched-tasks>` show a `last status`
+column (✔ succeeded / ✘ failed / ⊘ cancelled) so you can see how the most recent
+run ended at a glance. The value comes from the server (`lastRunStatus` in
+`GET /schedules` / `GET /tasks`), resolved in one pass — the browser does not
+fetch the run per row.
+
+**Schedules are first-class** (schedule-as-entity) — `<sched-schedules>` lists each
+schedule row: `task`, rule, `tz&#x60;, &#x2A;*`data`** (the per-tenant parameters), next run,
+last run + status, and the **effective pause status**: 🔴 `paused (task)` when the
+family stop holds the schedule, 🟡 `paused (schedule)` when only this instance is
+paused, ▶ `active`. The two levels are shown separately so «снял паузу, а оно
+молчит» never happens — `resume` on a schedule held by the task still shows 🔴
+until `resume` is called on the task.
+
+**Runtime rows** — a schedule whose task is runtime-only (`fileManaged=false`, e.g.
+created via the API, not `tasks.json`) shows a `runtime` badge next to the task name.
+File-managed rows (from `tasks.json`) have no badge.
+
+**Manage schedules** — the `+ new` button opens a form (task picker from `GET /tasks`, kind cron/interval/once + value, tz, data JSON, externalId, dedupKey,
+retry JSON, priority); it POSTs `/schedules` (a `dedupKey` makes the second save an
+upsert, not a duplicate). Each row has **pause / resume**, **edit** (`PATCH /schedules/:id` — the rule/tz/data/policy change in place, `nextRunAt` recomputes
+on a rule change) and **delete** with a confirm (runs are kept — the audit
+survives).
+
+**Pagination** — every list (`<sched-runs>`, `<sched-tasks>`, `<sched-schedules>`) has a
+footer: `‹ prev` / page-size select (10/25/50/100) / row range / `next ›`. Lists are
+fetched with `limit + 1` rows to detect whether a next page exists (the probe row is
+trimmed), so **next** is disabled on the last page and **prev** on the first. Changing
+the page size resets to the first page. Page size defaults to 50 (set the `limit`
+attribute); the current page offset is the `offset` attribute — set both to start the
+list elsewhere.
+
+## 4. Custom UI
+
+`createAdminApi` exposes the same REST surface the components use — health, runs,
+tasks, schedules, plus trigger / pause / resume / delete. See [Admin API](https://schedjs.github.io/schedjs/admin-api).
+
+## Auth (SCHED\_ADMIN\_KEY)
+
+With a key set on the daemon, the shell prompts for it in the header (saved to
+localStorage) — or pass `?token=…` on the URL, or set `el.token` on components.
+
+## Embedded apps (no daemon)
+
+An embedded engine can mount the admin api itself and use any UI mode:
+
+```ts
+import { createEngine, createInternalRunner, createSqliteStorage } from '@schedjs/core';
+import { createAdminApi } from '@schedjs/admin-api';
+
+const engine = createEngine({ /* … */ });
+const admin = createAdminApi({ engine, storage, auth: { apiKey: '…' } });
+
+// in your http server, mount /sched/api → admin.handleRequest(req, res)
+```
+
+Then point the shell at it with `?api=/sched/api` (mode 2), or drop components into
+your page (mode 3).
+
+
+# MCP server
+
+`@schedjs/mcp` exposes sched's control plane as a [Model Context Protocol](https://modelcontextprotocol.org){rel="&#x22;nofollow&#x22;"} server.
+An AI client (Claude Desktop, codex, pi, Cursor) can inspect and drive a running daemon — list tasks, read
+run history, trigger runs, pause/resume — from natural language, with the same guarantees as the admin API.
+
+The MCP server is a **projection of the admin API**: it never opens storage itself, it calls the daemon's
+REST API with the same bearer key. The daemon stays the single owner of state.
+
+> Docs MCP (search over these docs) is a separate, built-in server: Docus serves `/mcp` on the docs site
+> (list-pages + read-page). This page is about the **product** MCP for managing sched.
+
+## Install
+
+```text
+yarn workspace @schedjs/mcp build
+```
+
+## Run (stdio)
+
+Default transport for local AI clients:
+
+```text
+sched-mcp --admin-url http://127.0.0.1:8080 --api-key <SCHED_ADMIN_KEY>
+```
+
+Point your client at `npx sched-mcp` (or the built `dist/cli.js`) with the same arguments.
+
+## Run (Streamable HTTP)
+
+For remote/daemon-side hosting:
+
+```text
+sched-mcp --http 8091 --admin-url http://127.0.0.1:8080 --api-key <SCHED_ADMIN_KEY>
+```
+
+The HTTP mode is **session-based** (stateful Streamable HTTP): each client gets its own MCP
+session — a `Mcp-Session-Id` header is issued on `initialize` and must be echoed on later
+requests. Sessions are removed when the client sends `DELETE`, and are garbage-collected
+after 30 min of inactivity, so a long-running server neither leaks transports nor clashes
+on a shared connection. Unknown session ids are rejected with `404`.
+
+## Options
+
+| Flag              | Env               | Default                 | Meaning                                          |
+| ----------------- | ----------------- | ----------------------- | ------------------------------------------------ |
+| `--admin-url URL` | `SCHED_ADMIN_URL` | `http://127.0.0.1:8080` | Admin API base URL                               |
+| `--api-key KEY`   | `SCHED_ADMIN_KEY` | —                       | Admin API bearer key (open in dev mode if unset) |
+| `--http PORT`     | —                 | stdio                   | Serve Streamable HTTP on PORT                    |
+| `--readonly`      | —                 | off                     | Reject mutations; only list/get tools respond    |
+
+## Tools
+
+| Tool             | Args                           | Description                                                                                           |
+| ---------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `list_tasks`     | —                              | All tasks: name, runner, schedule, paused, next run                                                   |
+| `get_task`       | `name`                         | One task, full config                                                                                 |
+| `list_schedules` | —                              | Schedules: taskName, schedule (cron/interval/once), tz, nextRunAt, lastRunAt, paused, effectiveStatus |
+| `list_runs`      | `task? status? limit? offset?` | Runs, newest first; filter by task/status                                                             |
+| `get_run`        | `runId`                        | One run: status, error, log, result, artifacts                                                        |
+| `trigger_task`   | `name`                         | Run a task immediately (mutation)                                                                     |
+| `pause_task`     | `name`                         | Stop scheduling a task (mutation)                                                                     |
+| `resume_task`    | `name`                         | Resume a paused task (mutation)                                                                       |
+| `delete_run`     | `runId`                        | Delete a run from history (mutation)                                                                  |
+
+Mutations (`trigger_task`, `pause_task`, `resume_task`, `delete_run`) are disabled in `--readonly` mode.
+
+## Safety model
+
+- **Server-side validation** — schedules/statuses are validated by the admin API; unknown tasks/runs
+  return a clear error, never a crash.
+- **Read-only mode** — hard gate for automation: mutations answer with an explicit error.
+- **Human approval** — the MCP server does not invent a confirm protocol; the confirm gate lives in
+  the AI-client layer: the AI proposes, a human approves, the AI calls the mutation tool.
+
+
+# CLI & daemon
+
+Two binaries, one product:
+
+| Binary   | Package           | Role                                                                                                                  |
+| -------- | ----------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `schedd` | `@schedjs/daemon` | the process server (SQLite + tasks.json + runners + engine + optional admin api)                                      |
+| `sched`  | `@schedjs/cli`    | the operator CLI — a thin client of the admin api (status/runs/tasks/schedules/trigger/pause/resume) + `check-worker` |
+
+The daemon's binary was renamed `sched` → `schedd` (docker/dockerd precedent) so
+the operator CLI could take the `sched` name. A global install of both packages
+no longer collides.
+
+---
+
+# Daemon — `schedd`
+
+A single process: SQLite storage + tasks.json desired state + per-task runners +
+engine loops + optional admin server.
+
+> **Node 24 requirement.** `schedd` requires Node >= 24 (`engines`): `node:sqlite`
+> is stable there, so the one-line `ExperimentalWarning: SQLite …` that Node 22
+> printed on every start is gone.
+
+## Usage
+
+```bash
+schedd [--tasks tasks.json] [--db sched.db] [--lock-ttl SECONDS]
+       [--lock-heartbeat SECONDS] [--retention-ttl SECONDS] [--temporary-retention-ttl SECONDS]
+       [--poll-timeout SECONDS] [--tick-interval MS] [--watchdog-interval MS]
+       [--admin-port PORT] [--admin-host HOST] [--storage SPECIFIER]
+```
+
+| Flag                        | Default        | Description                                                                                                                                                                                                          |
+| --------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--tasks`                   | `tasks.json`   | Path to the desired-state file                                                                                                                                                                                       |
+| `--db`                      | `sched.db`     | SQLite database path — &#x2A;*only valid with `--storage sqlite`** (XOR: a non-sqlite storage with an explicit `--db` fails fast)                                                                                    |
+| `--storage`                 | `sqlite`       | Exactly **one** storage (see below)                                                                                                                                                                                  |
+| `--lock-ttl`                | 1800 (30 min)  | Zombie-lock threshold in seconds                                                                                                                                                                                     |
+| `--lock-heartbeat`          | 600 (10 min)   | Lock refresh cadence for long sync runs, seconds — &#x2A;*must be `< lock-ttl` (enforced at parse; the engine throws too)** (default: `lock-ttl / 3`)                                                                |
+| `--retention-ttl`           | 2592000 (30 d) | Retention TTL for regular terminal runs, seconds from `finishedAt&#x60;. **`0` = retention off** — terminal runs are kept forever (archive semantics, see [Retention](https://schedjs.github.io/schedjs/#retention)) |
+| `--temporary-retention-ttl` | 86400 (24 h)   | Retention TTL for `temporary&#x60; runs. **`0` = retention off for the temporary class**                                                                                                                             |
+| `--poll-timeout`            | 1500 (25 min)  | Async (accepted) run ceiling in seconds — must be `< lock-ttl`                                                                                                                                                       |
+| `--tick-interval`           | 1000           | Tick cadence in ms (due-task scan)                                                                                                                                                                                   |
+| `--watchdog-interval`       | 60000          | Watchdog cadence in ms (zombie reaping)                                                                                                                                                                              |
+| `--admin-port`              | —              | Serve the admin API (`/api/*`) on this port                                                                                                                                                                          |
+| `--admin-host`              | `127.0.0.1`    | Bind host for the admin server                                                                                                                                                                                       |
+
+## Environment
+
+| Env var                   | Description                                                                                                                                                                                                              |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `SCHED_ADMIN_KEY`         | Bearer key for the admin API/UI. Unset → API open (bind private host!). With a key set, the web UI accepts it via the **admin key** field in the header (saved to localStorage) or `?token=…` on the shell URL           |
+| `DOCKER_HOST`             | Override the docker CLI context (used by the docker runner)                                                                                                                                                              |
+| `MONGO_URL` (+`MONGO_DB`) | Connection string for `--storage mongo`. `MONGO_DB` overrides the db name from the URI path                                                                                                                              |
+| `MONGO_RETRY_MS`          | Startup-connect retry budget for `--storage mongo` (default 30000). The initial connect is retried every 500 ms up to this budget before the daemon fails — a brief mongo restart does not crash-loop the daemon at boot |
+| `MYSQL_URL`               | Connection string for `--storage mysql`                                                                                                                                                                                  |
+| `PG_URL`                  | Connection string for `--storage postgres`                                                                                                                                                                               |
+
+> **Connection strings live in env / config-volume only — never in arguments.**
+> A connstring passed as a flag would leak into the process list (`ps`, `docker inspect`). The startup banner prints the kind + db name only
+> (`storage=mongo db=<name>`), never the URL or credentials.
+
+## Storage selection (`--storage`)
+
+The daemon supports exactly **one** storage per process — the `--storage`
+specifier (XOR with `--db`, which is the sqlite knob):
+
+| Specifier                    | Storage                     | How it's wired                        |
+| ---------------------------- | --------------------------- | ------------------------------------- |
+| `sqlite` (default)           | SQLite file (`--db`)        | built into `@schedjs/daemon`          |
+| `mongo`                      | `@schedjs/storage-mongo`    | env `MONGO_URL` (+`MONGO_DB`)         |
+| `mysql`                      | `@schedjs/storage-mysql`    | env `MYSQL_URL`                       |
+| `postgres`                   | `@schedjs/storage-postgres` | env `PG_URL`                          |
+| `<npm-package>` / `<./path>` | **custom** BYO module       | dynamic import → `createStorage(env)` |
+
+Built-in kinds (`mongo|mysql|postgres`) resolve to their `@schedjs/storage-*`
+package **at runtime** — the package must be present in the image, otherwise
+startup fails fast:
+
+```text
+schedd: fatal: --storage mongo: add @schedjs/storage-mongo to your image (RUN yarn add @schedjs/storage-mongo)
+```
+
+A custom module must export `createStorage(env): Promise<Storage>` — the same
+BYO contract as the built-in adapters ([Storage](https://schedjs.github.io/schedjs/storage)). `./`, `../`, `/`
+prefixes resolve to a filesystem path (relative to the daemon's cwd); anything
+else is an npm package.
+
+```bash
+MONGO_URL=mongodb://user:pass@db.internal:27017/sched schedd --tasks tasks.json --storage mongo
+```
+
+## Signals
+
+| Signal                         | Behavior                                                 |
+| ------------------------------ | -------------------------------------------------------- |
+| `SIGINT` (Ctrl+C)              | Graceful stop — engine loops stop, sqlite closes, exit 0 |
+| `SIGTERM`                      | Same graceful stop (POSIX; systemd, docker stop)         |
+| `SIGBREAK` (Ctrl+Break, win32) | Same graceful stop — added for Windows operators         |
+
+On Windows, `taskkill` sends a termination that does **not** always reach a
+console process as `SIGTERM` — the reliable paths are Ctrl+C / Ctrl+Break.
+
+## What the daemon does on start
+
+1. Resolves the storage (`--storage`); a non-sqlite storage validates its
+   connstring env **before** anything starts (missing env → fail-fast).
+2. Syncs `tasks.json` into storage (desired state; removed tasks get disabled).
+3. Validates every task's runner is registered — a missing runner **aborts startup**:
+   `task "greet": runner "custom" not implemented in this build (registered: http, docker)`.
+4. Starts the tick loop (fires due tasks), the watchdog (reaps zombie locks), the
+   poll loop (async `accepted` runs), and the retention loop (hourly sweep of
+   terminal runs past their TTL — `--retention-ttl` / `--temporary-retention-ttl`).
+
+## Retention
+
+Terminal runs (`succeeded` / `failed` / `cancelled`) are pruned by the retention
+loop (hourly) once they're past their class TTL, measured from `finishedAt`:
+
+- `temporary` runs → `--temporary-retention-ttl` (default **24 h**);
+- regular runs → `--retention-ttl` (default **30 d**).
+
+Set the TTL to **`0` to turn retention off for that class** — run history is kept
+forever. This is the archive mode for deployments that migrate legacy history
+into sched (books: migrated `task_runs` carry old `finishedAt` timestamps, and
+with the 30 d default the first hourly pass would silently prune everything
+older than a month — `--retention-ttl 0 --temporary-retention-ttl 0` keeps the
+archive).
+
+> Note: `0` was added in daemon 0.11.0. Earlier versions had no way to disable
+> retention — a migration onto the 30 d default pruned aged history.
+
+## Example
+
+```bash
+SCHED_ADMIN_KEY=dev-key schedd \
+  --tasks tasks.json \
+  --db sched.db \
+  --admin-port 8080
+```
+
+Then the admin api answers on <http://127.0.0.1:8080/api/>{rel="&#x22;nofollow&#x22;"}\*. The operator CLI
+(`sched status --admin-url http://127.0.0.1:8080/api`) and the web UI
+(`npx @schedjs/ui` → `sched-ui serve --proxy http://127.0.0.1:8080`, see
+[Admin UI](https://schedjs.github.io/schedjs/ui)) both speak to it.
+
+---
+
+# Operator CLI — `sched`
+
+`@schedjs/cli` — a thin projection of the admin REST API ([Admin API](https://schedjs.github.io/schedjs/admin-api)):
+status, runs, tasks, schedules, trigger, pause/resume. Zero dependencies
+(`node:fetch` only); the daemon stays the single owner of state. Machine output
+is `--json`; tables are for TTY eyes only.
+
+## Install
+
+```bash
+npm install -g @schedjs/cli
+```
+
+## Usage
+
+```text
+sched <command> [args] [--admin-url URL] [--api-key KEY] [--json]
+
+Commands:
+  status                   daemon health + task/schedule/run counts + next runs
+  runs [--task T] [--status S] [--limit N] [--offset N]
+  tasks
+  schedules
+  trigger <task> [--data JSON]
+  pause <task> | pause --schedule <id>
+  resume <task> | resume --schedule <id>
+  check-worker <url> [--api-key KEY] [--timeout SECONDS]
+```
+
+Global flags:
+
+| Flag                                | Env               | Default                     | Description                                                      |
+| ----------------------------------- | ----------------- | --------------------------- | ---------------------------------------------------------------- |
+| `--admin-url URL`                   | `SCHED_ADMIN_URL` | `http://127.0.0.1:8080/api` | Admin API base — note the `/api` mount point is already included |
+| `--api-key KEY`                     | `SCHED_ADMIN_KEY` | —                           | Bearer key for the admin API                                     |
+| `--json`                            | —                 | —                           | Stable machine-readable JSON contract                            |
+| `-h` / `--help`, `-v` / `--version` | —                 | —                           | Help / version                                                   |
+
+Exit codes: **0** ok / **1** api·network·data error / **2** usage.
+
+`--api-key` before the command is the admin key; after `check-worker` it is the
+*worker's* key (a different secret — see below).
+
+## Examples
+
+```bash
+sched status                                   # is my daemon alive? next runs?
+sched runs --status failed --limit 20 --json   # failed runs as JSON
+sched trigger publish-video --data '{"videoId":"v-42"}'
+sched pause --schedule channel-ada             # pause one channel's schedule, not the task
+sched resume sync-channel-stats
+```
+
+`status` composes one view: `/health` + `/tasks` + `/schedules` + a bounded
+failed-runs fetch, and lists the five soonest `nextRunAt` schedules.
+
+## PowerShell note
+
+Windows PowerShell 5.1 pipes UTF-16 by default — `ConvertFrom-Json` can garble
+UTF-8 JSON from `sched --json`. Use `pwsh` (PS 7, native UTF-8) or `chcp 65001`
+in cmd. Quote paths with spaces in examples.
+
+## check-worker — conformance validator
+
+Validates that an HTTP envelope worker ([Runner protocol](https://schedjs.github.io/schedjs/protocol)) speaks the
+wire contract correctly — a fake-sched client that sends exactly the envelopes
+sched sends and checks the answers. Never touches the daemon or the admin api.
+
+```bash
+sched check-worker http://127.0.0.1:8081 --api-key $SCHED_API_KEY --timeout 30
+```
+
+Six scenarios, each PASS/FAIL:
+
+| # | Scenario           | Check                                                                                         |
+| - | ------------------ | --------------------------------------------------------------------------------------------- |
+| 1 | Sync success       | POST ping → 200 `{status:"succeeded"}`                                                        |
+| 2 | Sync failure       | POST with `data.fail` → `{status:"failed", error}`                                            |
+| 3 | Async lifecycle    | POST long → 202 accepted → GET statusUrl → running (progress grows) → succeeded, timeout trap |
+| 4 | Auth               | only with `--api-key`: no key → non-2xx, with key → 2xx (skipped otherwise)                   |
+| 5 | Run-id idempotency | two dispatches with the same run id → identical envelope                                      |
+| 6 | Dirty input        | garbage body → worker answers 4xx/500 and stays alive (re-ping works)                         |
+
+Verdict: `N/N PASS`, exit 0 all-green / 1 a scenario failed / 2 usage.
+`--json` prints `{ ok, pass, fail, scenarios: [{name, pass, skipped, detail}] }`.
+
+Worker contract for scenarios 1–5: `POST` with `content-type: application/json`,
+`x-sched-run-id` (the idempotency key), optional `x-sched-api-key`, body
+`{ task: { name, config }, data }` — exactly what the HTTP runner dispatches
+(see [HTTP runner](https://schedjs.github.io/schedjs/runners/http) and the examples in `examples/workers/`).
+
+
+# Self-hosting
+
+sched is self-hosted by design — a single daemon + SQLite, or the full Docker stack with
+the web UI (shell).
+
+## The daemon image
+
+The official image is built from the **published** `@schedjs/daemon` npm package —
+the artifact that passed the test/parity gates — not from monorepo sources:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM node:24-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+RUN echo '{"name":"schedd","private":true,"packageManager":"yarn@4.18.0"}' > package.json \
+ && corepack enable \
+ && printf 'nodeLinker: node-modules\nnpmMinimalAgeGate: 0\n' > .yarnrc.yml \
+ && CI=1 yarn add @schedjs/daemon@0.10.2 \
+ && yarn cache clean
+ENV PATH="/app/node_modules/.bin:${PATH}"
+ENTRYPOINT ["schedd"]
+```
+
+We publish `sched-daemon:<version>` to our registry
+(`ghcr.io/schedjs`). Internal builds pull `@schedjs/daemon` from a private npm
+registry: the token is passed as a **BuildKit secret** (never an
+`ARG`/`ENV` — that would land in the image layers and `docker history`) and the
+registry is pointed at it for the duration of the install only:
+
+```bash
+# private-registry build (public builds omit the secret + registry arg)
+docker build \
+  --secret id=registry_token,env=NPM_REGISTRY_TOKEN \
+  --build-arg NPM_REGISTRY=https://registry.npmjs.org \
+  -t ghcr.io/schedjs/sched-daemon:0.11.0 apps/daemon
+```
+
+`npmMinimalAgeGate: 0` — yarn 4.18 quarantines packages whose publish-time
+metadata the private registry doesn't serve; the gate is a supply-chain
+nicety we can't satisfy against a private registry.
+
+### Storage adapters are composition
+
+A daemon with a non-sqlite storage is a derived image: `FROM` the base and
+`yarn add` the adapter — the same `node_modules` the daemon dynamic-imports at
+runtime (`--storage <kind>`, [CLI](https://schedjs.github.io/schedjs/cli)). A private npm registry needs a token
+for `yarn add` — pass it as a **BuildKit secret** (never an `ARG`/`ENV`: that
+lands in the image layers and `docker history`):
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM ghcr.io/schedjs/sched-daemon:0.11.0
+RUN --mount=type=secret,id=registry_token \
+    printf 'nodeLinker: node-modules\nnpmMinimalAgeGate: 0\nnpmRegistryServer: "https://registry.npmjs.org"\nnpmAlwaysAuth: true\nnpmAuthToken: "%s"\n' "$(cat /run/secrets/registry_token)" > .yarnrc.yml \
+ && CI=1 yarn add @schedjs/storage-mongo@0.5.0 \
+ && rm -f .yarnrc.yml
+```
+
+```bash
+# build it — the token enters via the secret mount, not a build arg
+docker build --secret id=registry_token,env=NPM_REGISTRY_TOKEN -t schedd-mongo .
+```
+
+`npmMinimalAgeGate: 0` is required against a private registry (yarn 4.18 quarantines
+packages whose publish-time metadata the private registry doesn't serve), and
+**pin the adapter version explicitly** — an unpinned `yarn add @schedjs/storage-mongo`
+can silently resolve an older version (age-gate window), and an adapter without
+`createStorage(env)` breaks `--storage mongo` at runtime (books T2 finding
+2026-08-22). Pin: `yarn add @schedjs/storage-mongo@0.5.0`.
+
+```bash
+# run it — connstring only in env, never in arguments
+docker run --rm -e MONGO_URL=mongodb://user:pass@db.internal:27017/sched \
+  schedd-mongo --tasks /app/tasks.json --storage mongo
+```
+
+Same pattern for `@schedjs/storage-mysql` (`MYSQL_URL`) and
+`@schedjs/storage-postgres` (`PG_URL`). A **custom** adapter is an npm package
+(or a path mounted into the image) exporting `createStorage(env): Promise<Storage>`
+([BYO contract](https://schedjs.github.io/schedjs/storage/custom)):
+
+```dockerfile
+FROM ghcr.io/schedjs/sched-daemon:0.11.0
+RUN --mount=type=secret,id=registry_token \
+    printf '…registry block (see above)…' > .yarnrc.yml \
+ && CI=1 yarn add my-org/sched-storage-redis \
+ && rm -f .yarnrc.yml
+```
+
+```bash
+docker run --rm schedd-mongo --tasks /app/tasks.json --storage my-org/sched-storage-redis
+```
+
+If the adapter package is missing from the image, the daemon fails fast with
+the exact fix (`RUN yarn add @schedjs/storage-mongo`).
+
+> **Windows (git-bash) operators**: docker run with POSIX-style container paths
+> mangles `/app/…` and `/data/…` into `C:/Program Files/Git/…` (→ `unable to open database file`). Prefix the command with `MSYS_NO_PATHCONV=1` (or use
+> PowerShell / cmd).
+
+## Docker stack (dev)
+
+`docker-compose.dev.yml` at the repo root runs two services:
+
+| Service  | Image                                                              | Ports       | Notes                                                                                          |
+| -------- | ------------------------------------------------------------------ | ----------- | ---------------------------------------------------------------------------------------------- |
+| `daemon` | built from `apps/daemon/Dockerfile` (npm-based, `--storage` ready) | 8080        | `--admin-host 0.0.0.0`, `SCHED_ADMIN_KEY=dev-key`, healthcheck with Bearer, SQLite in a volume |
+| `shell`  | built from `packages/ui/Dockerfile.serve`                          | 8095 → 8081 | `sched-ui serve`: static UI + proxies `/api` → daemon                                          |
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+Web UI: <http://127.0.0.1:8095>{rel="&#x22;nofollow&#x22;"} (shell) · Admin API: <http://127.0.0.1:8080>{rel="&#x22;nofollow&#x22;"} (daemon).
+
+## Security model
+
+Auth lives **at the boundaries** — a private network is not authorization:
+
+- **Admin API / UI** — `SCHED_ADMIN_KEY` (Bearer). In production the daemon binds
+  `127.0.0.1`/private network, and a reverse proxy (traefik) terminates TLS.
+- **Docker runner** — image allowlist (exact + `prefix*`, fail-fast before spawn) and a
+  read-only docker-socket proxy (`POST=0`) instead of a raw socket.
+- **HTTP runner** — outbound `x-sched-api-key` per task (see
+  [HTTP runner](https://schedjs.github.io/schedjs/runners/http)).
+
+## Production deployment (VDS)
+
+Recommended layout behind traefik:
+
+```text
+traefik ── basicAuth / forwardAuth ──▶ shell (static UI) + /api
+                                         │
+daemon ── listens 127.0.0.1 / private ──┘  (SCHED_ADMIN_KEY = second layer)
+docker runner ──▶ docker-socket proxy (tecnativa, POST=0) + image allowlist
+```
+
+- Terminate TLS at traefik; protect the shell + `/api` with basicAuth (or forwardAuth),
+  `SCHED_ADMIN_KEY` adds a second layer.
+- The daemon never listens on a public interface.
+- Deployment artifacts go through the standard admin flow (Portainer, traefik labels).
+
+## Status alerts
+
+sched can push a notification when a run reaches a **terminal state** — failed by
+(default) — or when a **schedule slot fired late** (missed-slot, see below). The
+channel is a single **universal outbound webhook** (HTTP `POST` + JSON): the
+de-facto standard every external world speaks — Slack / Discord / Teams / Telegram /
+ntfy / PagerDuty are all POSTs with different JSON, so one endpoint covers them all.
+This is the platform-level signal *that* something finished (and how); content
+emails and artifact generation stay with the runner
+([who generates what](https://schedjs.github.io/schedjs/runs#artifacts-who-generates-what)).
+
+Configure it two ways — the daemon accepts an `alerts` option in its
+`createDaemon` options, **or** (binary workflow, no code) a top-level `alerts`
+block in `tasks.json` (`schedd --tasks tasks.json` picks it up like it picks up
+`runners`). A programmatic `alerts` option overrides the file block:
+
+```ts
+createDaemon({
+  tasksPath: 'tasks.json',
+  dbPath: 'sched.db',
+  alerts: {
+    on: ['failed'],   // default — alert on failures only (also: 'succeeded', 'cancelled')
+    onMissed: true,   // default — alert on late schedule slots too; set false to silence
+    onSyncFailed: true, // default — alert when the tasks.json sync fails (see below); set false to silence
+    webhook: {
+      url: 'https://hooks.example.com/sched',
+      secret: 'whsec_…',              // optional — enables HMAC signature (see below)
+      headers: { 'X-Ops-Token': '…' }, // optional — extra headers for your service
+      timeoutMs: 10_000,               // optional — per-attempt timeout, default 10s
+    },
+    tasks: {                          // optional — per-task routing overrides
+      'generate-thumbnail': { on: [] },      // silence a cosmetic task
+      'sync-payments': { webhook: { url: 'https://hooks.example.com/pagerduty' } }, // different channel
+    },
+  },
+  missedSlotGraceMs: 120_000, // optional — how late a dispatch must be to count as missed (default 2 min)
+});
+```
+
+**Sync health — `sync.failed`.** The daemon re-reads `tasks.json` on the sync
+interval and reconciles. When that sync fails (storage unreachable — a dead
+mongo pool means **nothing** schedules, so a `run.failed` alert could never
+fire; or a broken file), the daemon POSTs `sync.failed` to the webhook. Payload:
+
+```json
+{ "version": 1, "event": "sync.failed", "error": "…", "consecutiveFailures": 1 }
+```
+
+Only the **first failure of a streak** fires (dedupe) — a storage that stays
+down for a day does not spam one alert per 60s sync tick. When a sync succeeds,
+the streak resets and the next incident alerts again.
+
+**Per-task routing.** The root `alerts` block is the channel + defaults; a task can
+override its own routing with a task-level `alerts` block in `tasks.json` (or the
+`tasks` map above for the programmatic path) — field-wise merge, **task wins,
+arrays replace**:
+
+```json
+{
+  "tasks": [
+    { "name": "generate-thumbnail", "runner": "internal", "alerts": { "on": [] } },
+    { "name": "sync-payments", "runner": "http", "alerts": { "webhook": { "url": "https://hooks.example.com/pagerduty" } } }
+  ],
+  "alerts": {
+    "on": ["failed"],
+    "onMissed": true,
+    "webhook": { "url": "https://hooks.example.com/sched", "secret": "whsec_…" }
+  }
+}
+```
+
+- `generate-thumbnail` (`on: []`) stays silent on failure — the root `on` does not
+  apply to it. A task **without** an `alerts` block keeps the root defaults.
+- `sync-payments` keeps the root `on`/`onMissed` but routes to **its own webhook** —
+  the multi-channel escape hatch for criticality ≠ channel.
+- Malformed task `alerts` fails at load (see [Tasks → Per-task alert routing](https://schedjs.github.io/schedjs/tasks#per-task-alert-routing)).
+
+Instead of SQLite you can hand the daemon any storage adapter (see
+[Storage](https://schedjs.github.io/schedjs/storage)) — pass `storage` and omit `dbPath`:
+
+```ts
+const storage = await createMysqlStorage(pool); // or postgres / mongo / custom
+createDaemon({ tasksPath: 'tasks.json', storage, alerts: { … } });
+```
+
+At the **binary** level the same choice is `--storage` (see
+[CLI → Storage selection](https://schedjs.github.io/schedjs/cli#storage-selection-storage)) — the daemon
+builds the storage from the connstring env, no code.
+
+```ts
+const storage = await createMysqlStorage(pool); // or postgres / mongo / custom
+createDaemon({ tasksPath: 'tasks.json', storage, alerts: { … } });
+```
+
+### Payload
+
+Every POST carries a JSON body with a `version` (starts at 1 — bump-proof your
+consumer against evolution) and an `event` discriminator.
+
+Terminal run states — event is `run.<status>` (`run.failed` / `run.succeeded` /
+`run.cancelled`):
+
+```json
+{
+  "version": 1,
+  "event": "run.failed",
+  "task": { "name": "publish-video", "runner": "http" },
+  "run": {
+    "id": "9f1c…",
+    "status": "failed",
+    "attempt": 3,
+    "error": "connection refused",
+    "startedAt": "2026-08-19T09:00:00.000Z",
+    "finishedAt": "2026-08-19T09:00:01.000Z"
+  }
+}
+```
+
+Missed slot — a schedule dispatched more than the grace window after its slot
+(downtime catch-up, wedged lock):
+
+```json
+{
+  "version": 1,
+  "event": "missed-slot",
+  "task": { "name": "publish-video", "runner": "http" },
+  "schedule": { "id": "publish-video#0", "scheduledAt": "2026-08-19T09:00:00.000Z", "delayMs": 32400000 }
+}
+```
+
+### Signature (HMAC)
+
+When `webhook.secret` is set, sched signs the **exact request body** with
+HMAC-SHA256 and sends it as `X-Sched-Signature-256`:
+
+```text
+X-Sched-Signature-256: sha256=<hex>
+```
+
+Verify on your side (Node):
+
+```ts
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+function verify(secret: string, body: string, sig: string | undefined): boolean {
+  if (!sig?.startsWith('sha256=')) return false;
+  const expected = createHmac('sha256', secret).update(body).digest();
+  const received = Buffer.from(sig.slice('sha256='.length), 'hex');
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
+```
+
+No `secret` → the POST is unsigned (plain webhook, e.g. into a chat gateway).
+
+### Delivery semantics
+
+- **Bounded retry, never fails the run flow.** Up to **3 attempts** total with
+  backoff `5s / 30s`. Network errors, timeouts and `5xx&#x60; are retried; **`4xx` is
+  not** (a config error on the sender's side — retrying is pointless, it logs and
+  stops). Exhausted → `[alerts]` error log. The run itself is never affected.
+- **Persistent failure = the alert point.** A failed run that still has retries
+  scheduled does *not* alert — the notification lands only on the final,
+  exhausted failure ([Tasks → retry](https://schedjs.github.io/schedjs/tasks#retry)). Manual `triggerTask` alerts
+  immediately and never auto-retries.
+- **Missed-slot semantics.** A schedule with run history dispatched more than
+  `missedSlotGraceMs` (default 2 min) after its slot fires `missed-slot` —
+  engine down at the slot / wedged lock / long queue. The signal is
+  cause-agnostic: tune the grace up if your engine legitimately queues runs
+  longer than that. Freshly created schedules never fire it — a new schedule's
+  first slot is always in the future (past slots are never catch-up-dispatched),
+  and the check additionally requires run history (`lastRunAt`), so a
+  history-less schedule that is ever dispatched late (e.g. a one-shot with `at`
+  in the past) is not reported as a miss either. If the daemon itself is down, detection happens on
+  restart — an external uptime monitor covers the gap.
+- **Embedded / any engine** — same hooks: `onRunFinal: createAlerts(config).handleFinal`
+  plus `onEvent: createAlerts(config).handleEvent` (see
+  [Logging → terminal events](https://schedjs.github.io/schedjs/logging#_2-terminal-events-onrunfinal)).
+
+> CLI/env wiring for alerts is not implemented yet — the surfaces are the
+> `createDaemon({ alerts })` option and the `tasks.json` `alerts` block. On
+> request it becomes a daemon flag / `SCHED_ALERTS_*` env.
+
+## Storage
+
+SQLite by default (single file, `--db`). MySQL/MariaDB, Postgres and Mongo are
+available as storage adapters (shared history across replicas) via `--storage` —
+see [CLI → Storage selection](https://schedjs.github.io/schedjs/cli#storage-selection-storage) and
+[Storage](https://schedjs.github.io/schedjs/storage).
+
+
+# Security (allowedTools)
+
+Every runner ships a **sandbox** on top of its transport: a deny-by-default-style
+allowlist of *tools* a task may use, enforced **before anything spawns** — no
+process, container, connection or tool call happens for a non-allowlisted tool.
+
+The model is uniform across runners:
+
+- **Per-task** — `config.allowedTools` declares what *this task* may do. Omitted
+  → allow all (the runner ceiling still applies).
+- **Runner ceiling** — `options.allowedTools` (daemon: the `runners` block in
+  tasks.json) is the *maximum* the runner may ever run. A task whose
+  `config.allowedTools` is not a subset of its runner's ceiling **fails at
+  load**, before any run.
+- **Validation order** — policy first, mechanics second: `allowedTools` shape →
+  ceiling subset → runner-specific config (image/command presence, etc.).
+  Enforced at load (fail-fast) **and** at every run (a task upserted after
+  start is checked too).
+
+## Tool spec format
+
+Uniform pattern language: **exact match or trailing-`*` prefix** (`node`,
+`python*`, `alpine:*`, `read_*`). Leading wildcards are not supported. What a
+"tool" means is per runner:
+
+| Runner                                                       | Tool identity                     | Example                                        |
+| ------------------------------------------------------------ | --------------------------------- | ---------------------------------------------- |
+| [process](https://schedjs.github.io/schedjs/runners/process) | `argv[0]` (the executable)        | `["node", "python*"]`                          |
+| [ssh](https://schedjs.github.io/schedjs/runners/ssh)         | first token of `config.command`   | `["backup.sh", "systemctl*"]`                  |
+| [docker](https://schedjs.github.io/schedjs/runners/docker)   | `image@command` (both dimensions) | `["alpine@echo", "registry/*"]`                |
+| [mcp](https://schedjs.github.io/schedjs/runners/mcp)         | `server:tool`                     | `["node:read_*", "https://mcp.example.com:*"]` |
+
+### Docker: `image@command`
+
+Docker restricts **two** dimensions — image and explicit entrypoint — in one
+spec, separated by `@` (image tags use `:`, so `image:cmd` would be ambiguous):
+
+```json
+{ "allowedTools": ["alpine@echo", "alpine", "*@echo"] }
+```
+
+- `alpine@echo` — image `alpine`, only when the explicit command is `echo`
+- `alpine` (no `@`) — image `alpine`, any command (including the image default)
+- `*@echo` — any image, only command `echo`
+
+### MCP: `server:tool`
+
+`server` is the server identity (the URL for http, `command[0]` for stdio), split
+on the **last** colon (http servers with ports work:
+`https://mcp.example.com:8443:read_data`). A stdio spec without a colon
+(`["node"]`) means any tool on that server. Because http URLs carry `:`, a
+server-only http spec must be written explicitly as `url:*`. A bare http spec
+(`"https://mcp.example.com"` with no `:*`) fails at load with a clear error — it
+would otherwise parse as server `https` and silently match nothing.
+
+## Tasks.json
+
+The runner ceiling lives in the top-level `runners` block — policy next to the
+desired state:
+
+```json
+{
+  "runners": {
+    "process": { "allowedTools": ["node"] },
+    "docker": { "allowedTools": ["alpine@echo"] },
+    "ssh": { "allowedTools": ["backup.sh"] },
+    "mcp": { "allowedTools": ["node:read_*"] }
+  },
+  "tasks": [
+    {
+      "name": "export-captions",
+      "runner": "process",
+      "schedules": [{ "cron": "0 9 * * *" }],
+      "config": {
+        "command": ["node", "/opt/scripts/captions.mjs"],
+        "allowedTools": ["node"]
+      }
+    }
+  ]
+}
+```
+
+Embedded hosts set ceilings directly:
+`createDockerRunner({ allowedTools: ['alpine@echo'] })`.
+
+## Security posture
+
+- Omit = allow all (opt-in). A task that declares nothing keeps today's
+  behaviour; the ceiling, when set, still applies at run time.
+- A non-allowlisted tool never spawns — `failed` with a clear error, not a
+  silent skip.
+- The allowlist protects the daemon host / remote boxes / tool surface from a
+  task whose config came from an untrusted source (agents authoring tasks).

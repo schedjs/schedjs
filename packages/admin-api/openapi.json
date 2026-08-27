@@ -1,0 +1,593 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sched admin API",
+    "description": "REST control-plane of the sched scheduler (daemon `--admin-port`, mounted at `/api/*` by default). Plain HTTP + JSON, Bearer auth when `SCHED_ADMIN_KEY` is set (unset → open, dev mode). Contract lives in `docs/content/docs/09.admin-api.md`; generate a client in any language from this spec (`openapi-generator`, `kiota`, …).",
+    "version": "0.2.1",
+    "contact": { "name": "sched", "url": "https://github.com/schedjs" }
+  },
+  "servers": [
+    { "url": "/api", "description": "Default daemon mount point" }
+  ],
+  "security": [
+    { "bearerAuth": [] }
+  ],
+  "tags": [
+    { "name": "health" },
+    { "name": "tasks" },
+    { "name": "schedules" },
+    { "name": "runs" }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["health"],
+        "summary": "Liveness + version",
+        "operationId": "health",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok", "uptimeMs", "version"],
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "uptimeMs": { "type": "number" },
+                    "version": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs": {
+      "get": {
+        "tags": ["runs"],
+        "summary": "List runs (DESC by startedAt, cap 1000)",
+        "operationId": "listRuns",
+        "parameters": [
+          { "name": "task", "in": "query", "description": "Filter by task name", "schema": { "type": "string" } },
+          { "name": "status", "in": "query", "description": "Filter by run status", "schema": { "$ref": "#/components/schemas/RunStatus" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["runs"],
+                  "properties": { "runs": { "type": "array", "items": { "$ref": "#/components/schemas/RunRecord" } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/RunId" }],
+      "get": {
+        "tags": ["runs"],
+        "summary": "Get one run (log snapshot; `logFromOffset` → incremental chunk)",
+        "operationId": "getRun",
+        "parameters": [
+          { "name": "logFromOffset", "in": "query", "description": "Return logChunk from this char offset + logTotalLength instead of the full log", "schema": { "type": "integer", "minimum": 0 } }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/RunLogChunk" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["runs"],
+        "summary": "Delete a run (terminal runs only; active runs must be cancelled first — 409)",
+        "operationId": "deleteRun",
+        "responses": {
+          "204": { "description": "deleted" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/runs/{id}/retry": {
+      "parameters": [{ "$ref": "#/components/parameters/RunId" }],
+      "post": {
+        "tags": ["runs"],
+        "summary": "Retry a finished run (new run, same retention class; optional { triggeredBy? } — fresh actor, not inherited)",
+        "operationId": "retryRun",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "triggeredBy": { "type": ["string", "null"], "description": "caller identity for audit (sched does not verify); null/absent = anonymous" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/RunMutation" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/runs/{id}/cancel": {
+      "parameters": [{ "$ref": "#/components/parameters/RunId" }],
+      "post": {
+        "tags": ["runs"],
+        "summary": "Cancel an in-flight run (AbortSignal to the runner)",
+        "operationId": "cancelRun",
+        "responses": {
+          "200": { "$ref": "#/components/responses/RunMutation" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/runs/{id}/artifacts/{idx}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/RunId" },
+        { "name": "idx", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 0 } }
+      ],
+      "get": {
+        "tags": ["runs"],
+        "summary": "Proxy one stored artifact (s3 kind) so the bucket stays private",
+        "operationId": "getRunArtifact",
+        "responses": {
+          "200": {
+            "description": "artifact bytes",
+            "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/tasks": {
+      "get": {
+        "tags": ["tasks"],
+        "summary": "List tasks",
+        "operationId": "listTasks",
+        "responses": {
+          "200": {
+            "description": "tasks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["tasks"],
+                  "properties": { "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/TaskRecord" } } }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["tasks"],
+        "summary": "Register/upsert a runtime task (validated exactly like tasks.json)",
+        "operationId": "upsertTask",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/TaskDefinition" } }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/TaskMutation", "description": "updated (existed)" },
+          "201": { "$ref": "#/components/responses/TaskMutation", "description": "created" },
+          "400": { "$ref": "#/components/responses/BadRequest" }
+        }
+      }
+    },
+    "/tasks/{name}": {
+      "parameters": [{ "$ref": "#/components/parameters/TaskName" }],
+      "get": {
+        "tags": ["tasks"],
+        "summary": "Get one task",
+        "operationId": "getTask",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Task" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["tasks"],
+        "summary": "Delete a task (runs keep their history)",
+        "operationId": "deleteTask",
+        "responses": {
+          "204": { "description": "deleted" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/tasks/{name}/run": {
+      "parameters": [{ "$ref": "#/components/parameters/TaskName" }],
+      "post": {
+        "tags": ["tasks"],
+        "summary": "Trigger a manual run (optional { temporary?, data?, triggeredBy? })",
+        "operationId": "triggerTask",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "temporary": { "type": "boolean", "description": "short retention class (24h default)" },
+                  "data": { "description": "run parameters override" },
+                  "triggeredBy": { "type": ["string", "null"], "description": "caller identity for audit (sched does not verify — caller-declared); null/absent = anonymous" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/RunMutation" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/tasks/{name}/pause": {
+      "parameters": [{ "$ref": "#/components/parameters/TaskName" }],
+      "post": {
+        "tags": ["tasks"],
+        "summary": "Pause a task (family stop — all its schedules hold)",
+        "operationId": "pauseTask",
+        "responses": { "200": { "$ref": "#/components/responses/PauseResult" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/tasks/{name}/resume": {
+      "parameters": [{ "$ref": "#/components/parameters/TaskName" }],
+      "post": {
+        "tags": ["tasks"],
+        "summary": "Resume a paused task",
+        "operationId": "resumeTask",
+        "responses": { "200": { "$ref": "#/components/responses/PauseResult" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/schedules": {
+      "get": {
+        "tags": ["schedules"],
+        "summary": "List schedules (first-class rows: taskName, rule, tz, data, effective pause state, last run)",
+        "operationId": "listSchedules",
+        "responses": {
+          "200": {
+            "description": "schedules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["schedules"],
+                  "properties": { "schedules": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleRecord" } } }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["schedules"],
+        "summary": "Create or upsert a schedule (dedupKey → update, id preserved)",
+        "operationId": "createSchedule",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["taskName", "schedule"],
+                "properties": {
+                  "taskName": { "type": "string" },
+                  "schedule": { "$ref": "#/components/schemas/ScheduleEntry" },
+                  "tz": { "type": "string", "description": "IANA timezone; defaults to the task's tz. Body-level, valid for every kind. Inner `timezone` only exists on cron entries." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScheduleMutation", "description": "updated (dedup collision)" },
+          "201": { "$ref": "#/components/responses/ScheduleMutation", "description": "created" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound", "description": "task not found" }
+        }
+      }
+    },
+    "/schedules/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/ScheduleId" }],
+      "get": {
+        "tags": ["schedules"],
+        "summary": "Get one schedule",
+        "operationId": "getSchedule",
+        "responses": { "200": { "$ref": "#/components/responses/Schedule" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "patch": {
+        "tags": ["schedules"],
+        "summary": "Partial update (RFC 7396 merge: rule/tz/data/policy change in place, untouched fields stay; nextRunAt recomputes on rule/tz change)",
+        "operationId": "patchSchedule",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PatchScheduleBody" } } }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/ScheduleMutation" }, "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["schedules"],
+        "summary": "Delete a schedule (runs keep their history — audit survives)",
+        "operationId": "deleteSchedule",
+        "responses": { "204": { "description": "deleted" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/schedules/{id}/pause": {
+      "parameters": [{ "$ref": "#/components/parameters/ScheduleId" }],
+      "post": {
+        "tags": ["schedules"],
+        "summary": "Pause one schedule (effective status stays 🔴 paused-task if the task holds it)",
+        "operationId": "pauseSchedule",
+        "responses": { "200": { "$ref": "#/components/responses/PauseResult" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/schedules/{id}/resume": {
+      "parameters": [{ "$ref": "#/components/parameters/ScheduleId" }],
+      "post": {
+        "tags": ["schedules"],
+        "summary": "Resume one schedule",
+        "operationId": "resumeSchedule",
+        "responses": { "200": { "$ref": "#/components/responses/PauseResult" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "RunId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "TaskName": { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+      "ScheduleId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+    },
+    "responses": {
+      "Run": {
+        "description": "run record",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunRecord" } } }
+      },
+      "Task": {
+        "description": "task record",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TaskRecord" } } }
+      },
+      "Schedule": {
+        "description": "schedule record",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleRecord" } } }
+      },
+      "TaskMutation": {
+        "description": "mutated task (POST /tasks upsert)",
+        "content": { "application/json": { "schema": { "type": "object", "required": ["task"], "properties": { "task": { "$ref": "#/components/schemas/TaskRecord" } } } } }
+      },
+      "RunMutation": {
+        "description": "mutated run (POST run/retry/cancel)",
+        "content": { "application/json": { "schema": { "type": "object", "required": ["run"], "properties": { "run": { "$ref": "#/components/schemas/RunRecord" } } } } }
+      },
+      "ScheduleMutation": {
+        "description": "mutated schedule (POST /schedules, PATCH /schedules/{id})",
+        "content": { "application/json": { "schema": { "type": "object", "required": ["schedule"], "properties": { "schedule": { "$ref": "#/components/schemas/ScheduleRecord" } } } } }
+      },
+      "PauseResult": {
+        "description": "pause state",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["ok", "paused"],
+              "properties": {
+                "ok": { "type": "boolean" },
+                "id": { "type": "string" },
+                "name": { "type": "string" },
+                "paused": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      },
+      "RunLogChunk": {
+        "description": "run with incremental log (GET /runs/{id}?logFromOffset=N): the full log is replaced by logChunk (tail from the offset) + logTotalLength; both fields absent when the query param is not given",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                { "$ref": "#/components/schemas/RunRecord" },
+                {
+                  "type": "object",
+                  "properties": {
+                    "logChunk": { "type": "string", "description": "tail of the log from logFromOffset" },
+                    "logTotalLength": { "type": "integer", "description": "total log length" }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "validation error",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "resource or route not found",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Conflict": {
+        "description": "conflict (e.g. deleting an active run)",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Authorization: Bearer <SCHED_ADMIN_KEY>. Required when the daemon runs with the key; unset → open (dev mode)."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": { "error": { "type": "string" } }
+      },
+      "RunStatus": { "type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled"] },
+      "RunTrigger": { "type": "string", "enum": ["schedule", "manual"] },
+      "ArtifactRef": {
+        "type": "object",
+        "required": ["name", "kind"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["s3", "url", "file", "email"] },
+          "ref": { "type": "string" },
+          "url": { "type": "string" }
+        }
+      },
+      "RetryPolicy": {
+        "type": "object",
+        "required": ["maxAttempts", "backoffMs"],
+        "properties": {
+          "maxAttempts": { "type": "integer", "minimum": 1 },
+          "backoffMs": { "type": "integer", "minimum": 0 },
+          "multiplier": { "type": "number" }
+        }
+      },
+      "Schedule": {
+        "type": "object",
+        "description": "Normalized firing rule as stored/reported (output form): cron keeps {kind,cron,timezone?}; interval normalizes to {kind,ms}; once normalizes to {kind,at}. Flat (no oneOf/discriminator) for generator compatibility — per-kind shape is enforced server-side by parseScheduleEntry.",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["cron", "interval", "once"] },
+          "cron": { "type": "string", "description": "5/6-field cron expression (kind=cron)" },
+          "timezone": { "type": "string", "description": "inner timezone, valid only on cron entries" },
+          "ms": { "type": "integer", "minimum": 1, "description": "interval period in milliseconds (kind=interval)" },
+          "at": { "type": "string", "format": "date-time", "description": "one-shot ISO instant (kind=once)" }
+        }
+      },
+      "ScheduleEntry": {
+        "type": "object",
+        "description": "one tasks.json-style firing rule: cron | interval | once + optional tenant fields",
+        "properties": {
+          "cron": { "type": "string" },
+          "interval": { "type": "string", "description": "human interval, e.g. 'every 5 minutes'" },
+          "once": { "type": "string", "description": "date expression, e.g. '2026-08-19T12:00:00Z'" },
+          "timezone": { "type": "string", "description": "inner timezone — cron only" },
+          "data": {},
+          "externalId": { "type": "string" },
+          "dedupKey": { "type": "string" },
+          "retry": { "$ref": "#/components/schemas/RetryPolicy" },
+          "priority": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PatchScheduleBody": {
+        "type": "object",
+        "description": "partial merge (RFC 7396): only given fields change; re-targeting a schedule to another task is a delete+create, NOT a patch",
+        "properties": {
+          "schedule": { "$ref": "#/components/schemas/ScheduleEntry" },
+          "tz": { "type": "string" }
+        }
+      },
+      "TaskRecord": {
+        "type": "object",
+        "required": ["name", "runner", "schedule", "tz", "config"],
+        "properties": {
+          "name": { "type": "string" },
+          "runner": { "type": "string" },
+          "schedule": { "oneOf": [{ "$ref": "#/components/schemas/Schedule" }, { "type": "null" }] },
+          "tz": { "type": "string" },
+          "config": { "type": "object" },
+          "label": { "type": ["string", "null"] },
+          "description": { "type": ["string", "null"] },
+          "nextRunAt": { "type": ["string", "null"], "format": "date-time" },
+          "lastRunAt": { "type": ["string", "null"], "format": "date-time" },
+          "lockedAt": { "type": ["string", "null"], "format": "date-time" },
+          "failCount": { "type": "integer" },
+          "priority": { "type": "integer" },
+          "retry": { "oneOf": [{ "$ref": "#/components/schemas/RetryPolicy" }, { "type": "null" }] },
+          "retryCount": { "type": "integer" },
+          "lastRunId": { "type": ["string", "null"] },
+          "fileManaged": { "type": "boolean", "description": "true/absent = tasks.json-managed; false = runtime" },
+          "paused": { "type": "boolean" },
+          "disabled": { "type": "boolean" },
+          "lastRunStatus": { "oneOf": [{ "$ref": "#/components/schemas/RunStatus" }, { "type": "null" }], "description": "how the last run ended — present on list responses" }
+        }
+      },
+      "TaskDefinition": {
+        "type": "object",
+        "description": "runtime task body — same shape as one tasks.json task",
+        "required": ["name", "runner"],
+        "properties": {
+          "name": { "type": "string" },
+          "runner": { "type": "string" },
+          "schedule": { "$ref": "#/components/schemas/ScheduleEntry" },
+          "tz": { "type": "string" },
+          "config": { "type": "object" },
+          "label": { "type": "string" },
+          "description": { "type": "string" },
+          "retry": { "$ref": "#/components/schemas/RetryPolicy" },
+          "priority": { "type": "integer", "minimum": 0 },
+          "data": {},
+          "allowedTools": { "type": "array", "items": {} }
+        }
+      },
+      "RunRecord": {
+        "type": "object",
+        "required": ["id", "taskName", "runner", "status", "attempt", "trigger", "temporary", "startedAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "taskName": { "type": "string" },
+          "runner": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/RunStatus" },
+          "data": {},
+          "result": {},
+          "error": { "type": ["string", "null"] },
+          "progress": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+          "log": { "type": ["string", "null"] },
+          "artifacts": { "type": ["array", "null"], "items": { "$ref": "#/components/schemas/ArtifactRef" } },
+          "workerRef": { "type": ["string", "null"] },
+          "attempt": { "type": "integer", "minimum": 1 },
+          "trigger": { "$ref": "#/components/schemas/RunTrigger" },
+          "triggeredBy": { "type": ["string", "null"] },
+          "scheduleId": { "type": ["string", "null"] },
+          "temporary": { "type": "boolean" },
+          "retryOf": { "type": ["string", "null"] },
+          "startedAt": { "type": "string", "format": "date-time" },
+          "finishedAt": { "type": ["string", "null"], "format": "date-time" }
+        }
+      },
+      "ScheduleRecord": {
+        "type": "object",
+        "required": ["id", "taskName", "schedule", "tz"],
+        "properties": {
+          "id": { "type": "string" },
+          "taskName": { "type": "string" },
+          "schedule": { "$ref": "#/components/schemas/Schedule" },
+          "tz": { "type": "string" },
+          "data": {},
+          "externalId": { "type": ["string", "null"] },
+          "dedupKey": { "type": ["string", "null"] },
+          "nextRunAt": { "type": ["string", "null"], "format": "date-time" },
+          "lastRunAt": { "type": ["string", "null"], "format": "date-time" },
+          "lockedAt": { "type": ["string", "null"], "format": "date-time" },
+          "failCount": { "type": "integer" },
+          "priority": { "type": "integer" },
+          "retry": { "oneOf": [{ "$ref": "#/components/schemas/RetryPolicy" }, { "type": "null" }] },
+          "retryCount": { "type": "integer" },
+          "lastRunId": { "type": ["string", "null"] },
+          "paused": { "type": "boolean" },
+          "disabled": { "type": "boolean" },
+          "fileManaged": { "type": "boolean" },
+          "lastRunStatus": { "oneOf": [{ "$ref": "#/components/schemas/RunStatus" }, { "type": "null" }], "description": "how the last run ended (list + single GET)" },
+          "effectiveStatus": { "oneOf": [{ "type": "string", "enum": ["active", "paused-schedule", "paused-task"] }, { "type": "null" }], "description": "AND-semantics pause: paused-task (task holds the family) / paused-schedule / active" }
+        }
+      }
+    }
+  }
+}

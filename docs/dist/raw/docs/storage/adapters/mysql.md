@@ -1,0 +1,33 @@
+# MySQL / MariaDB
+
+> One driver (mysql2), both dialects — when history must live in an existing MySQL-family database
+
+```bash
+npm install @schedjs/storage-mysql
+```
+
+```ts
+import { createPool } from 'mysql2/promise';
+import { createMysqlStorage } from '@schedjs/storage-mysql';
+
+const pool = createPool('mysql://user:pass@db:3306/sched');
+const storage = await createMysqlStorage(pool);
+```
+
+One driver (`mysql2`) covers both dialects — the same contract suite runs against
+MariaDB 11 **and** MySQL 8, so neither dialect drifts. Right choice when sched must
+write into an existing MySQL-family database (e.g. a shared prod DB) instead of a
+SQLite file or a Mongo replica.
+
+## Known gotchas
+
+- Migrations are **applied on open** from a versioned list inside the adapter
+(`sched_schema_version` table) — the daemon self-migrates an existing database on
+first start, no external migration tooling needed. The mechanism ships in the
+package, so the npm tarball and the docker image carry it.
+- Timestamps are epoch milliseconds (`BIGINT`); JSON payloads (`config`/`data`/
+`result`/`artifacts`) are `TEXT` — same encoding as SQLite.
+- Claim is a conditional `UPDATE … WHERE locked_at IS NULL` — the same atomic
+semantics as SQLite's `changes`-count check.
+- Concurrent first-opens are not advisory-lock guarded (single-writer assumption,
+same as SQLite). See the adapter source for the `GET_LOCK` upgrade path if HA lands.

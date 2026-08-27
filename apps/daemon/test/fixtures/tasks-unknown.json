@@ -1,0 +1,5 @@
+{
+  "tasks": [
+    { "name": "kafka-task", "runner": "kafka", "schedules": [{ "cron": "0 9 * * *" }], "config": {} }
+  ]
+}

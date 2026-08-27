@@ -1,0 +1,9 @@
+# generator scaffold (dropped by generate.ps1, never committed)
+client/docs/
+client/.openapi-generator/
+client/git_push.sh
+client/.openapi-generator-ignore
+
+# deps
+node_modules/
+package-lock.json

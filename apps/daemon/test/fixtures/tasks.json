@@ -1,0 +1,6 @@
+{
+  "tasks": [
+    { "name": "every-minute", "runner": "test", "schedules": [{ "interval": "every 1 minute" }], "config": { "url": "http://worker:3000/tasks/every-minute" } },
+    { "name": "daily", "runner": "test", "schedules": [{ "cron": "0 9 * * *" }], "config": { "url": "http://worker:3000/tasks/daily" } }
+  ]
+}

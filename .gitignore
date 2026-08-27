@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Build outputs
+dist/
+!docs/dist/
+build/
+*.egg-info/
+examples/workers/csharp/bin/
+examples/workers/csharp/obj/
+*.class
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# AI обвеска — слой 2: переопределяем глобальный ~/.config/git/ignore
+# для своих репо (см. global wiki concept meta-out-of-repo)
+!.claude/
+!.tasks/
+!.wiki/
+!.brainstorm/
+!.archive/
+!.mcp/
+!.mcp.json
+!MEMORY.md
+
+# Task lock (ephemeral runtime state)
+.tasks/.lock
+
+# Yarn (node-modules linker; no zero-install cache)
+.yarn/
+.agents/.lock
+daemon.pid
+
+# docs site build output
+docs/.output/
+docs/.nuxt/
+docs/.data/
+sched-smoke.db

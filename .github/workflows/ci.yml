@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install
+        run: yarn install --immutable
+      - name: Build packages (dist for cross-package types)
+        run: yarn workspaces foreach --all -pt --exclude docs run build
+      - name: Typecheck
+        run: yarn tsc --noEmit
+      - name: Test (unit; storage adapters need live DBs — run locally/on release)
+        run: yarn vitest run --config vitest.ci.config.ts
+
+  docs:
+    name: docs (GitHub Pages)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install
+        run: yarn install --immutable
+      - name: Build docs
+        run: yarn workspace docs build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

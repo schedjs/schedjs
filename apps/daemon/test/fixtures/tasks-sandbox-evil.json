@@ -1,0 +1,6 @@
+{
+  "runners": { "process": { "allowedTools": ["node"] } },
+  "tasks": [
+    { "name": "evil", "runner": "process", "schedules": [{ "interval": "every 1 minute" }], "config": { "command": ["bash", "evil.sh"] } }
+  ]
+}

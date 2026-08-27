@@ -1,0 +1,8 @@
+/* Nav link trailing (badges) — the Nuxt UI theme concats `ms-auto` onto the
+   linkTrailing slot, pushing page badges (e.g. Admin UI PRE) to the aside
+   edge. Reset it so the badge sits right after the label. The app.config
+   override already replaces Docus' `hidden`; this only neutralizes the
+   theme's margin. */
+[data-slot='linkTrailing'] {
+  margin-inline-start: 0;
+}

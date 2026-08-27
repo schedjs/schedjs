@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# openapi-generator python scaffold (regenerated every generate.ps1 run; not part of the example)
+docs/
+test/
+.gitlab-ci.yml
+.travis.yml
+.github/
+git_push.sh
+openapitools.json
+pyproject.toml
+setup.py
+setup.cfg
+test-requirements.txt
+tox.ini
+*.egg-info/
+.openapi-generator-ignore

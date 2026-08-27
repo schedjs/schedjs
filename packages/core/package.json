@@ -1,0 +1,66 @@
+{
+  "name": "@schedjs/core",
+  "version": "0.53.0",
+  "description": "Cron done right — queue-based scheduler engine for Node.js: cron-parser, retries with backoff, idempotent runId, cancellation, pluggable storage",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./storage-contract": {
+      "types": "./dist/storage-contract.d.ts",
+      "import": "./dist/storage-contract.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/clean.mjs && tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "chrono-node": "^2.10.1",
+    "cron-parser": "^5.10.0",
+    "ssh2": "^1.17.0"
+  },
+  "keywords": [
+    "cron",
+    "scheduler",
+    "job-scheduler",
+    "job-queue",
+    "task-scheduler",
+    "agenda",
+    "background-jobs",
+    "self-hosted",
+    "queue",
+    "nodejs",
+    "typescript",
+    "cron-parser",
+    "schedule"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "devDependencies": {
+    "@types/ssh2": "^1.15.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schedjs/schedjs.git"
+  },
+  "homepage": "https://schedjs.github.io/schedjs",
+  "bugs": {
+    "url": "https://github.com/schedjs/schedjs/issues"
+  },
+  "author": {
+    "name": "schedjs",
+    "url": "https://github.com/schedjs"
+  }
+}

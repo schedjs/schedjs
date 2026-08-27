@@ -1,0 +1,61 @@
+{
+  "name": "@schedjs/storage-mysql",
+  "version": "0.4.0",
+  "description": "Cron scheduler MySQL/MariaDB storage adapter for Node.js — one mysql2 driver, both dialects, contract-tested",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/clean.mjs && tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@schedjs/core": "workspace:*",
+    "mysql2": "^3.23.3"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  },
+  "keywords": [
+    "cron",
+    "scheduler",
+    "job-scheduler",
+    "job-queue",
+    "task-scheduler",
+    "background-jobs",
+    "self-hosted",
+    "queue",
+    "nodejs",
+    "typescript",
+    "storage",
+    "mysql",
+    "mariadb"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schedjs/schedjs.git"
+  },
+  "homepage": "https://schedjs.github.io/schedjs",
+  "bugs": {
+    "url": "https://github.com/schedjs/schedjs/issues"
+  },
+  "author": {
+    "name": "schedjs",
+    "url": "https://github.com/schedjs"
+  }
+}

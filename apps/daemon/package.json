@@ -1,0 +1,65 @@
+{
+  "name": "@schedjs/daemon",
+  "version": "0.12.1",
+  "description": "Self-hosted cron scheduler daemon for Node.js — SQLite + HTTP runner + tasks.json in one process (binary schedd)",
+  "type": "module",
+  "main": "./dist/daemon.js",
+  "types": "./dist/daemon.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/daemon.d.ts",
+      "import": "./dist/daemon.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "schedd": "dist/entry.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "cron",
+    "scheduler",
+    "job-scheduler",
+    "job-queue",
+    "task-scheduler",
+    "background-jobs",
+    "self-hosted",
+    "queue",
+    "nodejs",
+    "typescript",
+    "daemon",
+    "docker",
+    "sqlite",
+    "http-runner"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/clean.mjs && tsc -p tsconfig.build.json",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1111.0",
+    "@schedjs/admin-api": "workspace:*",
+    "@schedjs/core": "workspace:*",
+    "@schedjs/mcp": "^0.4.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schedjs/schedjs.git"
+  },
+  "homepage": "https://schedjs.github.io/schedjs",
+  "bugs": {
+    "url": "https://github.com/schedjs/schedjs/issues"
+  },
+  "author": {
+    "name": "schedjs",
+    "url": "https://github.com/schedjs"
+  }
+}

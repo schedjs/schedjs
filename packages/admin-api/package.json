@@ -1,0 +1,64 @@
+{
+  "name": "@schedjs/admin-api",
+  "version": "0.3.0",
+  "description": "Cron scheduler admin REST API for Node.js — control plane over engine+storage (daemon, UI, CLI, MCP consumers)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./openapi.json": "./openapi.json"
+  },
+  "files": [
+    "dist",
+    "openapi.json"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/clean.mjs && tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@schedjs/core": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  },
+  "keywords": [
+    "cron",
+    "scheduler",
+    "job-scheduler",
+    "job-queue",
+    "task-scheduler",
+    "background-jobs",
+    "self-hosted",
+    "queue",
+    "nodejs",
+    "typescript",
+    "admin",
+    "rest",
+    "api",
+    "rest-api",
+    "control-plane"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schedjs/schedjs.git"
+  },
+  "homepage": "https://schedjs.github.io/schedjs",
+  "bugs": {
+    "url": "https://github.com/schedjs/schedjs/issues"
+  },
+  "author": {
+    "name": "schedjs",
+    "url": "https://github.com/schedjs"
+  }
+}

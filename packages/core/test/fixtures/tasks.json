@@ -1,0 +1,6 @@
+{
+  "tasks": [
+    { "name": "sync", "runner": "http", "label": "Sync", "schedules": [{ "interval": "every 5 minutes" }], "config": { "url": "http://worker:3000/tasks/sync" } },
+    { "name": "daily", "schedules": [{ "cron": "0 9 * * *" }], "tz": "Europe/Moscow", "config": {} }
+  ]
+}

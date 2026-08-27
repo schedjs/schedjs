@@ -1,0 +1,37 @@
+# sched
+
+> Cron done right — a queue-based, self-hosted cron scheduler for Node.js: reliable delivery, retries, run history, cancellation, web UI, CLI, MCP server, pluggable storage (SQLite/Postgres/MySQL/Mongo).
+
+## Documentation Sets
+
+- [docs](https://schedjs.github.io/schedjs/llms-full.txt)
+
+## Docs
+
+- [Introduction](https://schedjs.github.io/schedjs/raw/docs/introduction.md): What sched is and how it works
+- [Quick start](https://schedjs.github.io/schedjs/raw/docs/quick-start.md): Three ways to run sched — pick your scale
+- [Tasks](https://schedjs.github.io/schedjs/raw/docs/tasks.md): The tasks.json format — schedules, runners, config
+- [Runs](https://schedjs.github.io/schedjs/raw/docs/runs.md): The run lifecycle and RunRecord
+- [Runner protocol](https://schedjs.github.io/schedjs/raw/docs/protocol.md): The wire contract between sched and workers
+- [HTTP runner](https://schedjs.github.io/schedjs/raw/docs/runners/http.md): Run tasks over HTTP — request/response, sync or accepted + poll
+- [Docker runner](https://schedjs.github.io/schedjs/raw/docs/runners/docker.md): Run tasks in containers
+- [Process runner](https://schedjs.github.io/schedjs/raw/docs/runners/process.md): Run local commands as tasks
+- [SSH runner](https://schedjs.github.io/schedjs/raw/docs/runners/ssh.md): Run remote commands over SSH
+- [MCP runner](https://schedjs.github.io/schedjs/raw/docs/runners/mcp.md): Call a tool on an MCP server (stdio or Streamable HTTP)
+- [Internal runner (embedded)](https://schedjs.github.io/schedjs/raw/docs/runners/internal.md): Run in-process functions — no HTTP, no Docker, no daemon
+- [Custom runners](https://schedjs.github.io/schedjs/raw/docs/runners/custom.md): Write your own runner against the Runner contract
+- [File runner](https://schedjs.github.io/schedjs/raw/docs/runners/custom/file-runner.md): A complete file-drop runner — the reference implementation for the build-your-own runner story
+- [SQLite (default)](https://schedjs.github.io/schedjs/raw/docs/storage/adapters/sqlite.md): The embedded default — zero-config, one file, inside @schedjs/core
+- [MySQL / MariaDB](https://schedjs.github.io/schedjs/raw/docs/storage/adapters/mysql.md): One driver (mysql2), both dialects — when history must live in an existing MySQL-family database
+- [Postgres](https://schedjs.github.io/schedjs/raw/docs/storage/adapters/postgres.md): pg driver — same contract, placeholder syntax and native booleans
+- [Mongo](https://schedjs.github.io/schedjs/raw/docs/storage/adapters/mongo.md): mongodb driver — shared history across replicas, schemaless by design
+- [Build your own adapter](https://schedjs.github.io/schedjs/raw/docs/storage/custom.md): Anything that isn't SQLite / MySQL / MariaDB / Postgres / Mongo can still be a storage backend
+- [Memory storage](https://schedjs.github.io/schedjs/raw/docs/storage/custom/memory-storage.md): A complete in-memory storage adapter — the reference implementation for the build-your-own storage story
+- [Storage](https://schedjs.github.io/schedjs/raw/docs/storage.md): The pluggable storage contract — SQLite, MySQL/MariaDB, Postgres, Mongo, or build-your-own
+- [Logging & observability](https://schedjs.github.io/schedjs/raw/docs/logging.md): Run logs, terminal events, engine events — what sched logs and how to wire your own
+- [Admin API](https://schedjs.github.io/schedjs/raw/docs/admin-api.md): REST reference — health, runs, tasks, schedules
+- [Admin UI](https://schedjs.github.io/schedjs/raw/docs/ui.md): Four ways to consume the sched admin UI — standalone, embedded at a path, components, or your own on the admin api
+- [MCP server](https://schedjs.github.io/schedjs/raw/docs/mcp.md): Product MCP — AI control plane over the admin API (list/get tasks & runs, trigger/pause/resume, delete)
+- [CLI & daemon](https://schedjs.github.io/schedjs/raw/docs/cli.md): schedd (daemon) flags, env vars, config + sched (operator CLI) commands, exit codes
+- [Self-hosting](https://schedjs.github.io/schedjs/raw/docs/self-hosting.md): Docker stack, security, deployment
+- [Security (allowedTools)](https://schedjs.github.io/schedjs/raw/docs/security.md): The unified sandbox model — what a task may do, enforced before anything spawns
