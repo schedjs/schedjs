@@ -22,6 +22,8 @@ export function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
     schedule: { kind: 'cron', cron: '0 9 * * *' },
     tz: 'UTC',
     config: {},
+    // contract default: no inputSchema (any data is accepted)
+    inputSchema: null,
     label: null,
     description: null,
     nextRunAt: new Date('2026-08-16T09:00:00Z'),

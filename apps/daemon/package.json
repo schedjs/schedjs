@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/daemon",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Self-hosted cron scheduler daemon for Node.js — SQLite + HTTP runner + tasks.json in one process (binary schedd)",
   "type": "module",
   "main": "./dist/daemon.js",

@@ -98,6 +98,26 @@ through any package manager:
 
 ### Library — `@schedjs/core`
 
+> `@schedjs/core` lives in our private registry (`https://registry.npmjs.org`). Configure your
+> package manager once — the access token comes with registry credentials.
+
+npm / pnpm / bun — `.npmrc` (project or `~/.npmrc`):
+
+```ini
+registry=https://registry.npmjs.org
+//registry.npmjs.org/:_authToken=${NPM_TOKEN}
+```
+
+yarn — `.yarnrc.yml`:
+
+```yaml
+npmRegistryServer: "https://registry.npmjs.org"
+npmAlwaysAuth: true
+npmAuthToken: "${NPM_TOKEN:-}"
+# fresh publishes are quarantined by default — allow ours
+npmMinimalAgeGate: 0
+```
+
 Install `@schedjs/core` — pick your package manager:
 
 ```bash
@@ -108,6 +128,26 @@ bun add @schedjs/core
 ```
 
 ### Daemon — `@schedjs/daemon` (global, binary `schedd`)
+
+> `@schedjs/daemon` lives in our private registry (`https://registry.npmjs.org`). Configure your
+> package manager once — the access token comes with registry credentials.
+
+npm / pnpm / bun — `.npmrc` (project or `~/.npmrc`):
+
+```ini
+registry=https://registry.npmjs.org
+//registry.npmjs.org/:_authToken=${NPM_TOKEN}
+```
+
+yarn — `.yarnrc.yml`:
+
+```yaml
+npmRegistryServer: "https://registry.npmjs.org"
+npmAlwaysAuth: true
+npmAuthToken: "${NPM_TOKEN:-}"
+# fresh publishes are quarantined by default — allow ours
+npmMinimalAgeGate: 0
+```
 
 Install `@schedjs/daemon` — pick your package manager:
 
@@ -129,7 +169,7 @@ sched status --admin-url http://127.0.0.1:8080/api
 
 ```bash
 git clone https://github.com/schedjs/schedjs
-cd schedjs
+cd sched
 ```
 
 ```bash
@@ -302,7 +342,7 @@ No local Node needed — run the daemon in a container. Get the repo first
 
 ```bash
 git clone https://github.com/schedjs/schedjs
-cd schedjs
+cd sched
 ```
 
 Then put `worker.js` and `tasks.json` next to this `docker-compose.yml`:

@@ -7,8 +7,10 @@ services:
       context: .
       dockerfile: apps/daemon/Dockerfile
       args:
-        # npm-based image: pulls @schedjs/daemon from the public npm registry
-        # (override NPM_REGISTRY to install from a private mirror).
+        # npm-based image: pull @schedjs/daemon from the public npm registry.
+        # Public builds can drop these (defaults to the public registry).
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+        NPM_TOKEN: ${NPM_TOKEN:-}
         DAEMON_VERSION: ${SCHED_DAEMON_VERSION:-0.10.2}
     environment:
       SCHED_ADMIN_KEY: dev-key

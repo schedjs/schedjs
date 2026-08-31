@@ -22,7 +22,7 @@
 #   npx tsc --noEmit   # must exit 0
 #
 # Input:  openapi.json — the published spec, pinned from
-#         @schedjs/admin-api@0.2.0 subpath export; byte-identical to
+#         @schedjs/admin-api@0.2.0; byte-identical to
 #         packages/admin-api/openapi.json (guarded by packages/admin-api/test/
 #         ts-client-guard.test.ts).
 # Output: client/ — refreshed typescript-axios client (api.ts + support files).

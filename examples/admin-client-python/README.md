@@ -8,7 +8,7 @@ strictly from the published OpenAPI spec.
 |---|---|
 | Language | Python 3 (no TS/JS by task design) |
 | Generator | `openapi-generator` 7.24.0 (`-g python`), as named in the docs |
-| Input spec | `openapi.json` — `@schedjs/admin-api/openapi.json`, **0.2.0** subpath export (identical to the repo copy) |
+| Input spec | `openapi.json` — `@schedjs/admin-api/openapi.json`, npm **0.2.0** subpath export (identical to the repo copy) |
 | Verified against | published `@schedjs/daemon` **0.3.5**, live stand on `:8127` (no auth, scratch sqlite) |
 | Coverage | all **15 paths / 21 operations** of the spec + error paths (400/404/409) |
 | Method | TDD — test suite written first (RED: no client), generator run (GREEN), 24/24 passing, re-runs stable |

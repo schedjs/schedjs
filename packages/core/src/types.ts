@@ -99,6 +99,13 @@ export interface TaskRecord {
   tz: string;
   /** Runner-specific config (e.g. HTTP url/method/headers) — opaque to the engine. */
   config: Record<string, unknown>;
+  /**
+   * JSON Schema for run `data` (tenant params) — task:1658. Declares types/
+   * bounds/defaults/descriptions; the engine validates `data` at run_once and
+   * schedule create/update (400 with details), applies defaults, and the UI/
+   * MCP render forms from it (trigger.dev model). Null = no schema (any data).
+   */
+  inputSchema?: unknown | null;
   /** Human-readable label (admin UI). Ignored by the engine. */
   label: string | null;
   /** Longer description (admin UI). Ignored by the engine. */

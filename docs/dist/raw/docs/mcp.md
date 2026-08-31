@@ -227,6 +227,124 @@ on a shared connection. Unknown session ids are rejected with `404`.
   <tr>
     <td>
       <code>
+        get_schedule
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        scheduleId
+      </code>
+    </td>
+    
+    <td>
+      One schedule: rule, tz, data, effectiveStatus
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        create_schedule
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        taskName schedule tz?
+      </code>
+    </td>
+    
+    <td>
+      Create (or upsert by <code>
+        dedupKey
+      </code>
+      
+      ) a schedule (mutation); <code>
+        data
+      </code>
+      
+       validated against the task <code>
+        inputSchema
+      </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        update_schedule
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        scheduleId schedule? tz?
+      </code>
+    </td>
+    
+    <td>
+      Edit a schedule in place (mutation, partial merge)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        pause_schedule
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        scheduleId
+      </code>
+    </td>
+    
+    <td>
+      Pause one schedule instance (mutation)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        resume_schedule
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        scheduleId
+      </code>
+    </td>
+    
+    <td>
+      Resume a paused schedule (mutation)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        delete_schedule
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        scheduleId
+      </code>
+    </td>
+    
+    <td>
+      Delete a schedule; runs keep history (mutation)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
         list_runs
       </code>
     </td>
@@ -269,12 +387,54 @@ on a shared connection. Unknown session ids are rejected with `404`.
     
     <td>
       <code>
-        name
+        name data?
       </code>
     </td>
     
     <td>
-      Run a task immediately (mutation)
+      Run a task immediately (mutation); <code>
+        data
+      </code>
+      
+       validated against the task <code>
+        inputSchema
+      </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        cancel_run
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        runId
+      </code>
+    </td>
+    
+    <td>
+      Cancel a running/queued run (mutation); a terminal run → 409
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        retry_run
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        runId triggeredBy?
+      </code>
+    </td>
+    
+    <td>
+      Re-execute a finished run with its original data (mutation)
     </td>
   </tr>
   
@@ -317,6 +477,24 @@ on a shared connection. Unknown session ids are rejected with `404`.
   <tr>
     <td>
       <code>
+        delete_task
+      </code>
+    </td>
+    
+    <td>
+      <code>
+        name
+      </code>
+    </td>
+    
+    <td>
+      Delete a task; runs keep history (mutation)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
         delete_run
       </code>
     </td>
@@ -334,7 +512,7 @@ on a shared connection. Unknown session ids are rejected with `404`.
 </tbody>
 </table>
 
-Mutations (`trigger_task`, `pause_task`, `resume_task`, `delete_run`) are disabled in `--readonly` mode.
+Mutations (`trigger_task`, `pause_task`, `resume_task`, `delete_run`, `cancel_run`, `retry_run`, `delete_task`, `create_schedule`, `update_schedule`, `pause_schedule`, `resume_schedule`, `delete_schedule`) are disabled in `--readonly` mode.
 
 ## Safety model
 

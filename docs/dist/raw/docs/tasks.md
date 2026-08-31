@@ -425,6 +425,34 @@ one-shot, its result alerts immediately.
   <tr>
     <td>
       <code>
+        inputSchema
+      </code>
+    </td>
+    
+    <td>
+      object
+    </td>
+    
+    <td>
+      —
+    </td>
+    
+    <td>
+      JSON Schema for run <code>
+        data
+      </code>
+      
+       (types, bounds, defaults, descriptions). Data is validated at schedule create/update and run_once; defaults are applied (see <a href="#inputschema">
+        inputSchema
+      </a>
+      
+      )
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
         label
       </code>
     </td>
@@ -463,6 +491,275 @@ one-shot, its result alerts immediately.
   </tr>
 </tbody>
 </table>
+
+## `inputSchema`
+
+Declare the shape of the run's `data` (tenant parameters) as a JSON Schema
+object. The schema is **self-describing** — the admin UI renders a form from it
+and MCP/API consumers get the schema back with the task, so parameter editors
+never hard-code the fields (trigger.dev model).
+
+```json
+{
+  "name": "sync-seller",
+  "inputSchema": {
+    "type": "object",
+    "description": "Seller sync parameters",
+    "properties": {
+      "idSeller": { "type": "integer", "minimum": 1, "description": "Ozon seller id" },
+      "mode": { "type": "string", "enum": ["auto", "manual"], "default": "auto" },
+      "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 10 }
+    },
+    "required": ["idSeller"],
+    "additionalProperties": false
+  },
+  "config": { "url": "http://worker/sync" }
+}
+```
+
+**Supported keywords** — the documented subset (unknown keywords are ignored,
+per JSON Schema semantics):
+
+<table>
+<thead>
+  <tr>
+    <th>
+      Keyword
+    </th>
+    
+    <th>
+      Applies to
+    </th>
+    
+    <th>
+      Effect
+    </th>
+  </tr>
+</thead>
+
+<tbody>
+  <tr>
+    <td>
+      <code>
+        type
+      </code>
+    </td>
+    
+    <td>
+      any
+    </td>
+    
+    <td>
+      <code>
+        string
+      </code>
+      
+       | <code>
+        number
+      </code>
+      
+       | <code>
+        integer
+      </code>
+      
+       | <code>
+        boolean
+      </code>
+      
+       | <code>
+        object
+      </code>
+      
+       | <code>
+        array
+      </code>
+      
+       | <code>
+        null
+      </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        enum
+      </code>
+    </td>
+    
+    <td>
+      any
+    </td>
+    
+    <td>
+      Value must be one of the listed literals
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        minimum
+      </code>
+      
+       / <code>
+        maximum
+      </code>
+    </td>
+    
+    <td>
+      number, integer
+    </td>
+    
+    <td>
+      Inclusive numeric bounds
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        minLength
+      </code>
+      
+       / <code>
+        maxLength
+      </code>
+    </td>
+    
+    <td>
+      string
+    </td>
+    
+    <td>
+      Length bounds
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        minItems
+      </code>
+      
+       / <code>
+        maxItems
+      </code>
+    </td>
+    
+    <td>
+      array
+    </td>
+    
+    <td>
+      Item-count bounds
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        items
+      </code>
+    </td>
+    
+    <td>
+      array
+    </td>
+    
+    <td>
+      Single schema applied to every item
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        properties
+      </code>
+      
+       / <code>
+        required
+      </code>
+    </td>
+    
+    <td>
+      object
+    </td>
+    
+    <td>
+      Per-key subschemas + required keys
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        additionalProperties
+      </code>
+    </td>
+    
+    <td>
+      object
+    </td>
+    
+    <td>
+      <code>
+        false
+      </code>
+      
+       rejects undeclared keys (typo guard)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        default
+      </code>
+    </td>
+    
+    <td>
+      any
+    </td>
+    
+    <td>
+      Filled in when the property is absent (never overwrites a present value)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        description
+      </code>
+    </td>
+    
+    <td>
+      any
+    </td>
+    
+    <td>
+      Metadata for UI/MCP forms — ignored by validation
+    </td>
+  </tr>
+</tbody>
+</table>
+
+A node **without type** validates as *any* (no checks at that node).
+
+**Where it is enforced** (all return 400 with detailed issues, e.g.
+`input data does not match the task's inputSchema: idSeller: must be >= 1`):
+
+- `tasks.json` load — the schema is shape-checked and every declared
+schedule's `data` is validated eagerly (a typo fails the *file*, not the
+first run); defaults are materialized into the stored data.
+- `POST /schedules` and `PATCH /schedules/:id` — schedule `data` is validated
+and defaults applied before the row is written.
+- `POST /tasks/:name/run` and `triggerTask` — the merged run `data` is
+validated; defaults applied; the run records the effective data.
+
+A task **without** `inputSchema` accepts any `data` (legacy behavior).
 
 ## Schedule kinds
 

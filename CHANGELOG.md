@@ -7,9 +7,27 @@ history is summarized below and fully preserved in the git log.
 
 ## [Unreleased]
 
+- **Волна 0.54.0/0.13.0 опубликована на npm** (2026-08-30): core 0.54.0,
+  daemon 0.13.0, mcp 0.5.0, admin-api 0.3.1, ui 0.3.1, storage-mysql/pg 0.4.1;
+  publish:check npm-часть зелёная, install-smoke OK. Docker-образ — отдельный
+  VDS-шаг.
+
+- **@schedjs/mcp full control-plane (task:1364)** — tools grown from 9 to 18:
+  schedule CRUD (`get/create/update/pause/resume/delete_schedule`), run
+  lifecycle (`cancel_run`, `retry_run`), `delete_task`. `data`/inputSchema
+  validation flows through to the admin API.
+
+- **inputSchema in TaskDefinition (core)** — declare the shape of run `data`
+  (tenant parameters) as a JSON Schema subset (types, min/max, minLength/
+  maxLength, minItems/maxItems, enum, required, default, description). The
+  engine validates `data` at create_schedule / update_schedule / run_once
+  (400 with detailed issues), applies defaults, and the admin UI / MCP render
+  forms from the schema (trigger.dev model). `input_schema` persisted on the
+  task row (sqlite v0.9, mysql/pg v7).
+
 - **daemon 0.12.1 published** (cancel-on-poll-timeout wave: core 0.53.0 →
   daemon 0.12.1 → npm). Publish:check green for all 9 npm packages;
-  docker image pushed separately on the release step.
+  docker image pushed separately on the VDS release step.
 
 - **Cancel-on-timeout (core 0.53.0)** — a poll/run timeout is no longer a
   silent stop-polling: when the accepted envelope advertised a `cancelUrl`,
@@ -26,7 +44,7 @@ history is summarized below and fully preserved in the git log.
   streak (dedupe), resets on heal. Prod lesson 2026-08-24 (books: dead mongo
   pool, tasks not scheduled, no alerts). core 0.52.0 / daemon 0.12.0.
 - **daemon 0.11.3 published** (release-hardening wave: core 0.51.0 → daemon
-  0.11.3 → sched-daemon docker image + latest). Retention
+  0.11.3 → `ghcr.io/schedjs/sched-daemon:0.11.3` + latest). Retention
   regression suite (c3e60c7) + falsy-drop audit landed; publish:check green
   (9 npm + 1 docker).
 - **Mongo reconnect ownership (storage-mongo 0.5.1)** — the adapter, not the

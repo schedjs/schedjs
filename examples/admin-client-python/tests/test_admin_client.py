@@ -2,7 +2,7 @@
 sched admin API — client conformance suite (15 paths / 21 operations).
 
 The client under test is GENERATED from the published OpenAPI spec
-(`@schedjs/admin-api/openapi.json`, 0.2.0) with `openapi-generator`
+(`@schedjs/admin-api/openapi.json`, npm 0.2.0) with `openapi-generator`
 (python generator). Every operation documented by the spec is exercised
 against a LIVE daemon; error paths (400/404/409) are asserted where the spec
 declares them.

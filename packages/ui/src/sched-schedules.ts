@@ -52,6 +52,10 @@ interface ScheduleFormState {
   retry: string;
   priority: string;
   error: string;
+  /** The selected task's inputSchema (task:1658) — renders a dynamic field form. */
+  schema: Record<string, unknown> | null;
+  /** Raw per-property values (strings) assembled into `data` on save. */
+  fields: Record<string, string>;
 }
 
 const emptyForm = (): ScheduleFormState => ({
@@ -65,12 +69,138 @@ const emptyForm = (): ScheduleFormState => ({
   retry: '',
   priority: '',
   error: '',
+  schema: null,
+  fields: {},
 });
 
 /** Parse a JSON string field; returns undefined when blank, throws on invalid JSON. */
 function parseField(s: string): unknown {
   const t = s.trim();
   return t === '' ? undefined : (JSON.parse(t) as unknown);
+}
+
+/**
+ * Prefill schema-driven field values (task:1658): existing `data` wins, then
+ * the schema `default`, else empty. Values are kept as raw strings; the typed
+ * assembly happens at save (buildDataFromFields).
+ */
+function prefillFields(
+  schema: Record<string, unknown> | null,
+  data: unknown,
+): Record<string, string> {
+  const fields: Record<string, string> = {};
+  if (!schema || typeof schema.properties !== 'object' || schema.properties === null) return fields;
+  const props = schema.properties as Record<string, unknown>;
+  const obj =
+    data !== null && typeof data === 'object' && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : {};
+  for (const [key, prop] of Object.entries(props)) {
+    const p = prop as Record<string, unknown>;
+    const v = obj[key];
+    if (v !== undefined) {
+      fields[key] = typeof v === 'object' ? JSON.stringify(v) : String(v);
+    } else if (p.default !== undefined) {
+      fields[key] = typeof p.default === 'object' ? JSON.stringify(p.default) : String(p.default);
+    } else {
+      fields[key] = '';
+    }
+  }
+  return fields;
+}
+
+/**
+ * Assemble the `data` object from schema-driven field values (task:1658).
+ * Empty fields are skipped — the server applies schema defaults for the rest.
+ * Returns { error } on a type/JSON violation (the server is the backstop).
+ */
+function buildDataFromFields(
+  schema: Record<string, unknown>,
+  fields: Record<string, string>,
+): { data?: Record<string, unknown>; error?: string } {
+  if (typeof schema.properties !== 'object' || schema.properties === null) return {};
+  const props = schema.properties as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, prop] of Object.entries(props)) {
+    const p = prop as Record<string, unknown>;
+    const raw = fields[key] ?? '';
+    if (raw.trim() === '') continue; // server applies defaults
+    try {
+      switch (p.type) {
+        case 'integer': {
+          const n = Number(raw);
+          if (!Number.isFinite(n)) return { error: `${key}: must be an integer` };
+          out[key] = Math.trunc(n);
+          break;
+        }
+        case 'number': {
+          const n = Number(raw);
+          if (!Number.isFinite(n)) return { error: `${key}: must be a number` };
+          out[key] = n;
+          break;
+        }
+        case 'boolean':
+          out[key] = raw === 'true';
+          break;
+        case 'array':
+        case 'object':
+          out[key] = JSON.parse(raw) as unknown;
+          break;
+        default:
+          out[key] = raw;
+      }
+    } catch {
+      return { error: `${key}: invalid ${String(p.type)} value` };
+    }
+  }
+  return { data: out };
+}
+
+function hasSchemaProperties(schema: Record<string, unknown>): boolean {
+  return typeof schema.properties === 'object' && schema.properties !== null;
+}
+
+/**
+ * Render schema-driven parameter fields (task:1658, trigger.dev model): one
+ * input per inputSchema property — select for enums, checkbox for booleans,
+ * number for integer/number, text otherwise (array/object → JSON).
+ */
+function renderSchemaFields(
+  f: ScheduleFormState,
+  setForm: (patch: Partial<ScheduleFormState>) => void,
+): ReturnType<typeof html> {
+  if (!f.schema || !hasSchemaProperties(f.schema)) return html``;
+  const props = f.schema.properties as Record<string, unknown>;
+  const required = Array.isArray(f.schema.required) ? new Set(f.schema.required as string[]) : new Set();
+  const set = (key: string, v: string) => setForm({ fields: { ...f.fields, [key]: v } });
+  return html`
+    ${Object.entries(props).map(([key, prop]) => {
+      const p = prop as Record<string, unknown>;
+      const desc = typeof p.description === 'string' && p.description ? ` — ${p.description}` : '';
+      const req = required.has(key) ? html`<span class="req" title="required">*</span>` : '';
+      if (Array.isArray(p.enum)) {
+        return html`<label>${key}${req}${desc}
+          <select @change=${(e: Event) => set(key, (e.target as HTMLSelectElement).value)}>
+            <option value="">— choose —</option>
+            ${p.enum.map((opt) => html`<option value=${String(opt)} ?selected=${String(opt) === (f.fields[key] ?? '')}>${String(opt)}</option>`)}
+          </select></label>`;
+      }
+      if (p.type === 'boolean') {
+        return html`<label>${key}${req}${desc}
+          <input type="checkbox" ?checked=${(f.fields[key] ?? '') === 'true'}
+            @change=${(e: Event) => set(key, (e.target as HTMLInputElement).checked ? 'true' : 'false')} /></label>`;
+      }
+      if (p.type === 'integer' || p.type === 'number') {
+        return html`<label>${key}${req}${desc}
+          <input type="number" .value=${f.fields[key] ?? ''}
+            @input=${(e: Event) => set(key, (e.target as HTMLInputElement).value)} /></label>`;
+      }
+      return html`<label>${key}${req}${desc}
+        <input .value=${f.fields[key] ?? ''}
+          @input=${(e: Event) => set(key, (e.target as HTMLInputElement).value)}
+          placeholder=${p.type === 'array' || p.type === 'object' ? 'JSON' : typeof p.default === 'string' ? p.default : ''} /></label>`;
+    })}
+  `;
 }
 
 /**
@@ -110,7 +240,7 @@ export class SchedSchedules extends LitElement {
   }
 
   private schedules: ScheduleRow[] = [];
-  private tasks: Array<{ name: string }> = [];
+  private tasks: Array<{ name: string; inputSchema?: unknown | null }> = [];
   private error = '';
   private hasMore = false;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -181,6 +311,11 @@ export class SchedSchedules extends LitElement {
     void this.loadTasks();
     this.editingId = s.id;
     const kind = s.schedule.kind;
+    const task = this.tasks.find((t) => t.name === s.taskName);
+    const schema =
+      task?.inputSchema && typeof task.inputSchema === 'object'
+        ? (task.inputSchema as Record<string, unknown>)
+        : null;
     this.form = {
       taskName: s.taskName,
       kind,
@@ -200,6 +335,8 @@ export class SchedSchedules extends LitElement {
       retry: s.retry === null ? '' : JSON.stringify(s.retry),
       priority: String(s.priority),
       error: '',
+      schema,
+      fields: prefillFields(schema, s.data),
     };
     this.requestUpdate();
   }
@@ -219,11 +356,34 @@ export class SchedSchedules extends LitElement {
   private async loadTasks(): Promise<void> {
     try {
       const body = (await apiGet(this.base, '/tasks?limit=1000', this.token)) as { tasks: TaskRecord[] };
-      this.tasks = body.tasks.map((t) => ({ name: t.name }));
+      this.tasks = body.tasks.map((t) => ({ name: t.name, inputSchema: t.inputSchema }));
+      // the form may have opened before tasks loaded — upgrade to the schema now
+      if (this.form && this.form.schema === null && this.form.taskName) {
+        const task = this.tasks.find((t) => t.name === this.form!.taskName);
+        const schema =
+          task?.inputSchema && typeof task.inputSchema === 'object'
+            ? (task.inputSchema as Record<string, unknown>)
+            : null;
+        if (schema) {
+          this.form = { ...this.form, schema, fields: prefillFields(schema, null) };
+        }
+      }
       this.requestUpdate();
     } catch {
       this.tasks = [];
     }
+  }
+
+  /** Task selection in the create form — switch the schema-driven fields. */
+  private onTaskChange(name: string): void {
+    if (!this.form) return;
+    const task = this.tasks.find((t) => t.name === name);
+    const schema =
+      task?.inputSchema && typeof task.inputSchema === 'object'
+        ? (task.inputSchema as Record<string, unknown>)
+        : null;
+    this.form = { ...this.form, taskName: name, schema, fields: prefillFields(schema, null) };
+    this.requestUpdate();
   }
 
   private async saveForm(): Promise<void> {
@@ -240,7 +400,18 @@ export class SchedSchedules extends LitElement {
     let data: unknown;
     let retry: unknown;
     try {
-      data = parseField(f.data);
+      // task:1658 — with an inputSchema the form builds data from its fields;
+      // without one the raw JSON text field is the source.
+      if (f.schema) {
+        const built = buildDataFromFields(f.schema, f.fields);
+        if (built.error) {
+          this.setForm({ error: built.error });
+          return;
+        }
+        data = built.data;
+      } else {
+        data = parseField(f.data);
+      }
       retry = parseField(f.retry);
     } catch (err) {
       this.setForm({ error: `invalid JSON: ${err instanceof Error ? err.message : String(err)}` });
@@ -313,9 +484,9 @@ export class SchedSchedules extends LitElement {
         </div>
         <div class="form">
           <label>task
-            <select @change=${(e: Event) => this.setForm({ taskName: (e.target as HTMLSelectElement).value })}>
+            <select @change=${(e: Event) => this.onTaskChange((e.target as HTMLSelectElement).value)}>
               <option value="">— choose —</option>
-              ${this.tasks.map((t) => html`<option value=${t.name} ?selected=${f.taskName === t.name}>${t.name}</option>`)}
+              ${this.tasks.map((t) => html`<option value=${t.name} ?selected=${f.taskName === t.name}>${t.name}${t.inputSchema ? ' (schema)' : ''}</option>`)}
             </select>
           </label>
           <label>kind
@@ -332,9 +503,12 @@ export class SchedSchedules extends LitElement {
           <label>tz
             <input .value=${f.tz} @input=${(e: Event) => this.setForm({ tz: (e.target as HTMLInputElement).value })} placeholder="UTC" />
           </label>
-          <label>data (JSON)
-            <input .value=${f.data} @input=${(e: Event) => this.setForm({ data: (e.target as HTMLInputElement).value })} placeholder='{"idSeller": 2}' />
-          </label>
+          ${renderSchemaFields(f, (patch: Partial<ScheduleFormState>) => this.setForm(patch))}
+          ${f.schema && hasSchemaProperties(f.schema)
+            ? html`<div class="hint">Parameters come from the task inputSchema — the server validates and applies defaults.</div>`
+            : html`<label>data (JSON)
+                <input .value=${f.data} @input=${(e: Event) => this.setForm({ data: (e.target as HTMLInputElement).value })} placeholder='{"idSeller": 2}' />
+              </label>`}
           <label>externalId
             <input .value=${f.externalId} @input=${(e: Event) => this.setForm({ externalId: (e.target as HTMLInputElement).value })} placeholder="tenant-7" />
           </label>

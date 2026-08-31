@@ -4,6 +4,8 @@ export { parseSchedule, ScheduleParseError } from './human.js';
 export type { Schedule, ParseScheduleOptions } from './human.js';
 export { createSqliteStorage } from './sqlite.js';
 export type { Storage, CompleteResult, RunUpdate, RunFinish, RunFilter, PruneRunsFilter, TaskListFilter, ScheduleListFilter } from './storage.js';
+export { assertValidInputSchema, applyInputDefaults, validateInput, InputValidationError } from './input-schema.js';
+export type { InputValidationIssue, InputValidationResult } from './input-schema.js';
 export { createEngine } from './engine.js';
 export type { Engine, EngineConfig, Runner, RunnerRunHooks, RunOutcome, PollResult, EngineEvent, TriggerTaskOptions } from './engine.js';
 export { createEventLogger } from './event-logger.js';

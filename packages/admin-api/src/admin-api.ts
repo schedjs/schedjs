@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import type { Engine } from '@schedjs/core';
 import type { RunFilter, ScheduleListFilter, Storage, TaskListFilter } from '@schedjs/core';
 import { createTaskOps, type TaskOps } from '@schedjs/core';
+import { InputValidationError, validateInput } from '@schedjs/core';
 import {
   initialNextRun,
   parseScheduleEntry,
@@ -128,6 +129,21 @@ class HttpError extends Error {
     super(message);
     this.name = 'HttpError';
   }
+}
+
+/**
+ * Validate data against the task's inputSchema (task:1658) — returns the
+ * EFFECTIVE data (defaults applied) or throws 400 with detailed issues.
+ * A task without a schema accepts any data (legacy behavior).
+ */
+function applyInputSchema(task: TaskRecord, data: unknown, ctx: string): unknown {
+  if (task.inputSchema === null || task.inputSchema === undefined) return data;
+  const res = validateInput(task.inputSchema as Record<string, unknown>, data);
+  if (!res.ok) {
+    const detail = res.issues.map((i) => `${i.path || '(root)'}: ${i.message}`).join('; ');
+    throw new HttpError(400, `${ctx} does not match the task's inputSchema: ${detail}`);
+  }
+  return res.data;
 }
 
 /** Read a request body and parse it as a JSON object; throws HttpError(400) on malformed input. */
@@ -432,7 +448,15 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
                 ...(triggeredBy !== undefined ? { triggeredBy } : {}),
               };
             }
-            const run = await options.engine.triggerTask(name, opts);
+            const run = await options.engine.triggerTask(name, opts).catch((err: unknown) => {
+              // task:1658 — run_once data must match the task's inputSchema
+              // (engine throws InputValidationError; anything else propagates)
+              if (err instanceof InputValidationError) {
+                const detail = err.issues.map((i) => `${i.path || '(root)'}: ${i.message}`).join('; ');
+                throw new HttpError(400, `input data does not match the task's inputSchema: ${detail}`);
+              }
+              throw err;
+            });
             if (!run) return json(res, 404, { error: `task ${name} not found` });
             json(res, 200, { run });
             return;
@@ -494,6 +518,8 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
           }
           // imperative schedules get a fresh UUID id; dedupKey (when given) is the
           // stable upsert handle — a second POST with the same key updates in place.
+          // task:1658 — the entry data must match the task's inputSchema (defaults applied).
+          entry.data = applyInputSchema(task, entry.data, 'schedule data');
           const id = randomUUID();
           const schedule = await storage.createSchedule({
             id,
@@ -586,6 +612,7 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
             // let the next dedup-upsert duplicate the schedule).
             const schedule = await storage.getSchedule(id);
             if (!schedule) return json(res, 404, { error: `schedule ${id} not found` });
+            const task = await storage.getTask(schedule.taskName);
             const body = await readJsonObject(req);
             // F&F openapi-client F-5: PATCH is a partial merge over { schedule, tz }
             // only — anything else is a contract violation (re-targeting a
@@ -622,7 +649,12 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
               // explicit null) → set. parseScheduleEntry collapses "unset" to
               // null, so read presence off the RAW body, not the parsed entry.
               const raw = rawEntry as Record<string, unknown>;
-              if ('data' in raw) patch.data = raw.data;
+              if ('data' in raw) {
+                // task:1658 — the patched data must match the task's inputSchema
+                // (defaults applied; absent → keep current, explicit null → clear)
+                if (task) patch.data = applyInputSchema(task, raw.data, 'schedule data');
+                else patch.data = raw.data;
+              }
               if ('externalId' in raw) patch.externalId = raw.externalId;
               if ('dedupKey' in raw) patch.dedupKey = raw.dedupKey;
               if ('retry' in raw) patch.retry = raw.retry;

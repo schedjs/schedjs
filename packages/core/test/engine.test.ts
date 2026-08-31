@@ -199,6 +199,56 @@ describe('engine — tick', () => {
     expect(run!.temporary).toBe(false);
   });
 
+  it('triggerTask validates the merged data against inputSchema and throws on mismatch', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(
+      storage,
+      makeTask({
+        inputSchema: {
+          type: 'object',
+          properties: { idSeller: { type: 'integer', minimum: 1 } },
+          required: ['idSeller'],
+        },
+      }),
+    );
+    const { runner } = makeRunner();
+    const engine = createEngine({ storage, runner, now: () => NOON });
+
+    await expect(engine.triggerTask('task-a', { data: { idSeller: 'two' } })).rejects.toThrow(/inputSchema/);
+    await expect(engine.triggerTask('task-a', { data: {} })).rejects.toThrow(/required property is missing/);
+  });
+
+  it('triggerTask applies inputSchema defaults — the run records the effective data', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(
+      storage,
+      makeTask({
+        inputSchema: {
+          type: 'object',
+          properties: { idSeller: { type: 'integer' }, mode: { type: 'string', default: 'auto' } },
+          required: ['idSeller'],
+        },
+      }),
+    );
+    const { runner } = makeRunner();
+    const engine = createEngine({ storage, runner, now: () => NOON });
+
+    const run = await engine.triggerTask('task-a', { data: { idSeller: 7 } });
+
+    expect(run!.data).toEqual({ idSeller: 7, mode: 'auto' });
+    expect(run!.status).toBe('succeeded');
+  });
+
+  it('triggerTask without inputSchema accepts any data (legacy behavior)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask());
+    const { runner } = makeRunner();
+    const engine = createEngine({ storage, runner, now: () => NOON });
+
+    const run = await engine.triggerTask('task-a', { data: { anything: [1, 2, 3] } });
+    expect(run!.data).toEqual({ anything: [1, 2, 3] });
+  });
+
   it('manual trigger dispatches the runner with the merged data override (dispatch view, books parity)', async () => {
     const storage = new MemoryStorage();
     await seedTask(storage, makeTask({ config: { data: { base: 1 } } }));
@@ -1751,6 +1801,49 @@ describe('engine — onRunFinal hook', () => {
     expect(finals).toEqual(['failed:boom']);
   });
 
+  it('does NOT re-read storage after finishRun — the final alert survives a post-finish read failure (task:1390)', async () => {
+    // The reported symptom: «run.failed в БД, алерт молчит». The alert must
+    // not depend on a SECOND storage read after the terminal write — a storage
+    // hiccup in that window (books/mongo incident class 2026-08-24) loses the
+    // alert while the run IS failed. recordFinish snapshots the record BEFORE
+    // finishRun and passes it to onRunFinal directly.
+    const inner = new MemoryStorage();
+    let finished = false;
+    let postFinishReads = 0;
+    const storage = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const v = (target as unknown as Record<string, unknown>)[prop as string];
+        if (prop === 'finishRun') {
+          return async (...args: unknown[]) => {
+            const r = await (v as (...x: unknown[]) => Promise<unknown>).apply(target, args);
+            finished = true;
+            return r;
+          };
+        }
+        if (prop === 'getRun') {
+          return async (...args: unknown[]) => {
+            if (finished) postFinishReads++;
+            return (v as (...x: unknown[]) => Promise<unknown>).apply(target, args);
+          };
+        }
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+    await seedTask(storage, makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const finals: string[] = [];
+    const engine = createEngine({
+      storage,
+      runner: { run: async () => { throw new Error('boom'); } },
+      now: () => NOON,
+      onRunFinal: async (run) => { finals.push(`${run.status}:${run.error}`); },
+    });
+
+    await engine.runOnce();
+
+    expect(finals).toEqual(['failed:boom']); // the alert still fired
+    expect(postFinishReads).toBe(0); // ...without re-reading storage
+  });
+
   it('fires on async terminal (accepted → poll succeeded)', async () => {
     const storage = new MemoryStorage();
     await seedTask(storage, makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z') }));
@@ -1765,6 +1858,22 @@ describe('engine — onRunFinal hook', () => {
     await engine.runPollOnce(new Date('2026-08-16T12:00:01Z'));
 
     expect(finals).toEqual(['succeeded']);
+  });
+
+  it('fires on async terminal (accepted → poll failed) — the http-runner alert path (task:1390)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const finals: string[] = [];
+    const engine = createEngine({
+      storage,
+      runner: makeRunner(async () => accepted, async () => ({ status: 'failed', error: 'worker reported failure' })).runner,
+      now: () => NOON,
+      onRunFinal: async (run) => { finals.push(`${run.status}:${run.error}`); },
+    });
+    await engine.runOnce();
+    await engine.runPollOnce(new Date('2026-08-16T12:00:01Z'));
+
+    expect(finals).toEqual(['failed:worker reported failure']);
   });
 
   it('fires on accepted-without-poll fail-fast', async () => {

@@ -33,8 +33,8 @@ ARG NPM_REGISTRY=""
 # node_modules and `schedd` resolves from .bin. CI=1 disables yarn's
 # interactive prompts. npmMinimalAgeGate: 0 — yarn 4.18 quarantines packages
 # whose publish-time metadata is missing (a mirror serves none); the gate is
-# a supply-chain nicety we can't satisfy against a private registry.
-# The optional token comes from the BuildKit secret (mount type=secret).
+# a supply-chain nicety we can't satisfy against the private registry.
+# NPM_TOKEN comes from the BuildKit secret (mount type=secret).
 # docker-cli: the docker runner spawns `docker run --rm` (books T2 finding
 # 2026-08-22) — the official image ships the CLI; the operator still mounts
 # the docker socket / DOCKER_HOST (docs 06.runners/02.docker).

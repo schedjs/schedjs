@@ -88,8 +88,16 @@ async function start(opts: {
     if (!task) return null;
     return makeRun('r-' + name, { taskName: name });
   };
+  const cancel = async (runId: string) => {
+    engineCalls.push(`cancel:${runId}`);
+    return makeRun(runId, { status: 'cancelled' });
+  };
+  const retry = async (runId: string) => {
+    engineCalls.push(`retry:${runId}`);
+    return makeRun('r-' + runId, { retryOf: runId });
+  };
   const api = createAdminApi({
-    engine: { triggerTask: trigger } as never,
+    engine: { triggerTask: trigger, cancelRun: cancel, retryRun: retry } as never,
     storage,
     ...(opts.apiKey ? { auth: { apiKey: opts.apiKey } } : {}),
   });
@@ -228,20 +236,29 @@ describe('mcp streamable http transport (peer-review: per-request transport on s
 });
 
 describe('product MCP over admin api', () => {
-  it('exposes the expected 9 tools', async () => {
+  it('exposes the expected full control-plane tool set (task:1364)', async () => {
     const { client } = await start();
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name).sort();
     expect(names).toEqual([
+      'cancel_run',
+      'create_schedule',
       'delete_run',
+      'delete_schedule',
+      'delete_task',
       'get_run',
+      'get_schedule',
       'get_task',
       'list_runs',
       'list_schedules',
       'list_tasks',
+      'pause_schedule',
       'pause_task',
+      'resume_schedule',
       'resume_task',
+      'retry_run',
       'trigger_task',
+      'update_schedule',
     ]);
   });
 
@@ -337,6 +354,163 @@ describe('product MCP over admin api', () => {
     const missing = await call(client, 'trigger_task', { name: 'nope' });
     expect(missing.isError).toBe(true);
     expect(missing.text).toMatch(/not found/i);
+  });
+
+  it('create_schedule creates a schedule that appears in list_schedules (task:1364)', async () => {
+    const { client } = await start({ tasks: [makeTask('backup')] });
+    const created = await call(client, 'create_schedule', {
+      taskName: 'backup',
+      schedule: { cron: '0 3 * * *', data: { idSeller: 2 } },
+    });
+    expect(created.isError).toBe(false);
+    expect((parse(created.text) as { taskName: string; schedule: unknown }).taskName).toBe('backup');
+
+    const list = await call(client, 'list_schedules');
+    const schedules = parse(list.text) as Array<{ id: string; schedule: { cron?: string } }>;
+    expect(schedules.find((s) => s.schedule.cron === '0 3 * * *')).toBeDefined();
+  });
+
+  it('create_schedule rejects a non-object schedule argument', async () => {
+    const { client } = await start({ tasks: [makeTask('backup')] });
+    const res = await call(client, 'create_schedule', { taskName: 'backup', schedule: 'nope' });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/schedule/);
+  });
+
+  it('get_schedule returns one schedule; unknown id errors (task:1364)', async () => {
+    const { client } = await start({
+      tasks: [makeTask('backup')],
+      schedules: [
+        {
+          id: 's1',
+          taskName: 'backup',
+          schedule: { kind: 'interval', ms: 300_000 },
+          tz: 'UTC',
+          data: null,
+          externalId: null,
+          dedupKey: null,
+          nextRunAt: new Date('2026-08-16T09:00:00Z'),
+          lastRunAt: null,
+          lockedAt: null,
+          failCount: 0,
+          priority: 0,
+          retry: null,
+          retryCount: 0,
+          lastRunId: null,
+          paused: false,
+          disabled: false,
+          fileManaged: false,
+        },
+      ],
+    });
+    const ok = await call(client, 'get_schedule', { scheduleId: 's1' });
+    expect(ok.isError).toBe(false);
+    expect((parse(ok.text) as { id: string }).id).toBe('s1');
+
+    const missing = await call(client, 'get_schedule', { scheduleId: 'nope' });
+    expect(missing.isError).toBe(true);
+  });
+
+  it('update_schedule patches the rule; pause/resume flip the flag (task:1364)', async () => {
+    const { client } = await start({
+      tasks: [makeTask('backup')],
+      schedules: [
+        {
+          id: 's1',
+          taskName: 'backup',
+          schedule: { kind: 'cron', cron: '0 9 * * *' },
+          tz: 'UTC',
+          data: null,
+          externalId: null,
+          dedupKey: null,
+          nextRunAt: new Date('2026-08-16T09:00:00Z'),
+          lastRunAt: null,
+          lockedAt: null,
+          failCount: 0,
+          priority: 0,
+          retry: null,
+          retryCount: 0,
+          lastRunId: null,
+          paused: false,
+          disabled: false,
+          fileManaged: false,
+        },
+      ],
+    });
+    const patched = await call(client, 'update_schedule', {
+      scheduleId: 's1',
+      schedule: { interval: 'every hour' },
+    });
+    expect(patched.isError).toBe(false);
+    expect((parse(patched.text) as { schedule: { kind: string } }).schedule.kind).toBe('interval');
+
+    const paused = await call(client, 'pause_schedule', { scheduleId: 's1' });
+    expect(paused.isError).toBe(false);
+    const afterPause = await call(client, 'get_schedule', { scheduleId: 's1' });
+    expect((parse(afterPause.text) as { paused: boolean }).paused).toBe(true);
+
+    await call(client, 'resume_schedule', { scheduleId: 's1' });
+    const afterResume = await call(client, 'get_schedule', { scheduleId: 's1' });
+    expect((parse(afterResume.text) as { paused: boolean }).paused).toBe(false);
+  });
+
+  it('delete_schedule and delete_task remove their rows (task:1364)', async () => {
+    const { client } = await start({
+      tasks: [makeTask('backup'), makeTask('doomed')],
+      schedules: [
+        {
+          id: 's1',
+          taskName: 'backup',
+          schedule: { kind: 'cron', cron: '0 9 * * *' },
+          tz: 'UTC',
+          data: null,
+          externalId: null,
+          dedupKey: null,
+          nextRunAt: new Date('2026-08-16T09:00:00Z'),
+          lastRunAt: null,
+          lockedAt: null,
+          failCount: 0,
+          priority: 0,
+          retry: null,
+          retryCount: 0,
+          lastRunId: null,
+          paused: false,
+          disabled: false,
+          fileManaged: false,
+        },
+      ],
+    });
+    const delSched = await call(client, 'delete_schedule', { scheduleId: 's1' });
+    expect(delSched.isError).toBe(false);
+    expect((await call(client, 'get_schedule', { scheduleId: 's1' })).isError).toBe(true);
+
+    const delTask = await call(client, 'delete_task', { name: 'doomed' });
+    expect(delTask.isError).toBe(false);
+    expect((await call(client, 'get_task', { name: 'doomed' })).isError).toBe(true);
+  });
+
+  it('cancel_run and retry_run drive the engine (task:1364)', async () => {
+    const { client, engineCalls } = await start({
+      tasks: [makeTask('backup')],
+      runs: [makeRun('r1', { status: 'running' }), makeRun('r2', { status: 'failed', finishedAt: new Date('2026-08-16T09:05:00Z') })],
+    });
+    const cancelled = await call(client, 'cancel_run', { runId: 'r1' });
+    expect(cancelled.isError).toBe(false);
+    expect((parse(cancelled.text) as RunRecord).status).toBe('cancelled');
+
+    const retried = await call(client, 'retry_run', { runId: 'r2' });
+    expect(retried.isError).toBe(false);
+    expect((parse(retried.text) as RunRecord).retryOf).toBe('r2');
+    expect(engineCalls).toEqual(['cancel:r1', 'retry:r2']);
+  });
+
+  it('cancel_run on a terminal run is a 409 tool error (admin-api contract)', async () => {
+    const { client } = await start({
+      runs: [makeRun('r-done', { status: 'succeeded', finishedAt: new Date('2026-08-16T09:05:00Z') })],
+    });
+    const res = await call(client, 'cancel_run', { runId: 'r-done' });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/already finished|409/i);
   });
 
   it('pause_task / resume_task flip the paused flag', async () => {

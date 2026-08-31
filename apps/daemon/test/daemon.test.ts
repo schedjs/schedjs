@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { createDaemon } from '../src/daemon.js';
-import { createDockerRunner, createSqliteStorage, type PollResult, type RunOutcome, type Runner, type RunnerRunHooks } from '@schedjs/core';
+import { createDockerRunner, createHttpRunner, createSqliteStorage, type PollResult, type RunOutcome, type Runner, type RunnerRunHooks } from '@schedjs/core';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/tasks.json', import.meta.url));
 const DOCKER_FIXTURE = fileURLToPath(new URL('./fixtures/tasks-docker.json', import.meta.url));
@@ -532,6 +532,56 @@ describe('daemon — alerts from tasks.json', () => {
       expect(payload.task).toEqual({ name: 'failer', runner: 'test' });
       expect((payload.run as Record<string, unknown>).error).toBe('boom');
     } finally {
+      s.server.close();
+    }
+  });
+
+  it('POSTs run.failed for an ASYNC http-runner run (accepted → poll failed) — the 0.12.1 alert path (task:1390)', async () => {
+    // fake worker: accepts the dispatch (202 + statusUrl), then reports failure on poll
+    let worker: ReturnType<typeof createServer> | null = null;
+    const port = await new Promise<number>((resolve) => {
+      worker = createServer((req, res) => {
+        req.resume();
+        if (req.method === 'POST') {
+          res.writeHead(202, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: 'accepted', statusUrl: `http://127.0.0.1:${(worker!.address() as AddressInfo).port}/status`, pollIntervalMs: 5 }));
+        } else {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: 'failed', error: 'worker exploded' }));
+        }
+      });
+      worker.listen(0, '127.0.0.1', () => resolve((worker!.address() as AddressInfo).port));
+    });
+    const s = await sink();
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'sched-alerts-http-'));
+      const tasksPath = join(dir, 'tasks.json');
+      writeFileSync(
+        tasksPath,
+        JSON.stringify({
+          tasks: [
+            {
+              name: 'http-failer',
+              runner: 'http',
+              config: { url: `http://127.0.0.1:${port}/run`, envelope: true },
+              schedules: [{ cron: '* * * * *' }],
+            },
+          ],
+          alerts: { webhook: { url: `http://127.0.0.1:${s.port}/hook` } },
+        }),
+      );
+      const daemon = createDaemon({ tasksPath, dbPath: ':memory:', now: () => new Date('2026-08-16T12:00:00Z') });
+      await daemon.start();
+      await daemon.engine.runOnce(new Date('2026-08-16T12:02:00Z'));
+      await daemon.engine.runPollOnce(new Date('2026-08-16T12:02:01Z'));
+      daemon.stop();
+
+      expect(s.bodies).toHaveLength(1);
+      const payload = JSON.parse(s.bodies[0]!) as Record<string, unknown>;
+      expect(payload.event).toBe('run.failed');
+      expect(payload.task).toEqual({ name: 'http-failer', runner: 'http' });
+    } finally {
+      worker!.close();
       s.server.close();
     }
   });

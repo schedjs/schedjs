@@ -210,6 +210,68 @@ describe('toTasks', () => {
     expect(t.retryCount).toBe(0);
   });
 
+  it('passes inputSchema through to TaskRecord and applies defaults to entry data (task:1658)', () => {
+    const t = toTasks(
+      [
+        {
+          name: 'a',
+          inputSchema: {
+            type: 'object',
+            properties: { idSeller: { type: 'integer', minimum: 1 }, mode: { type: 'string', default: 'auto' } },
+            required: ['idSeller'],
+          },
+          schedules: [{ cron: '0 9 * * *', data: { idSeller: 2 } }],
+          config: { url: 'http://x' },
+        },
+      ],
+      NOON,
+    )[0]!;
+    expect(t.inputSchema).toEqual({
+      type: 'object',
+      properties: { idSeller: { type: 'integer', minimum: 1 }, mode: { type: 'string', default: 'auto' } },
+      required: ['idSeller'],
+    });
+    // schedule data has defaults materialized (the effective data contract)
+    const s = toSchedules(
+      [
+        {
+          name: 'a',
+          inputSchema: {
+            type: 'object',
+            properties: { idSeller: { type: 'integer' }, mode: { type: 'string', default: 'auto' } },
+            required: ['idSeller'],
+          },
+          schedules: [{ cron: '0 9 * * *', data: { idSeller: 2 } }],
+          config: { url: 'http://x' },
+        },
+      ],
+      NOON,
+    )[0]!;
+    expect(s.data).toEqual({ idSeller: 2, mode: 'auto' });
+  });
+
+  it('rejects a malformed inputSchema with a descriptive error (fail-fast at load)', () => {
+    expect(() =>
+      toTasks([{ name: 'a', inputSchema: { type: 'objectish' }, schedules: [], config: { url: 'http://x' } }], NOON),
+    ).toThrow(/inputSchema.*type/);
+  });
+
+  it('rejects schedule data that violates the task inputSchema (fail-fast at load)', () => {
+    expect(() =>
+      toTasks(
+        [
+          {
+            name: 'a',
+            inputSchema: { type: 'object', properties: { idSeller: { type: 'integer' } }, required: ['idSeller'] },
+            schedules: [{ cron: '0 9 * * *', data: { idSeller: 'nope' } }],
+            config: { url: 'http://x' },
+          },
+        ],
+        NOON,
+      ),
+    ).toThrow(/inputSchema/);
+  });
+
   it('defaults priority to 0 and retry to null when omitted', () => {
     const t = toTasks([{ name: 'a', schedules: [{ cron: '0 9 * * *' }], config: { url: 'http://x' } }], NOON)[0]!;
     expect(t.priority).toBe(0);

@@ -15,7 +15,7 @@
 #   .\generate.ps1
 #
 # Input:  openapi.json — the published spec, pinned from
-#         @schedjs/admin-api@0.2.0 subpath export; identical to
+#         @schedjs/admin-api@0.2.0; identical to
 #         packages/admin-api/openapi.json at that version.
 # Output: sched_admin_client/ — refreshed python client (packageName=sched_admin_client).
 #   NOTE: the generator also drops its python scaffold (docs/, setup.py, test/,

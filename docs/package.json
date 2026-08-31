@@ -6,7 +6,8 @@
     "dev": "node sync-openapi.mjs && nuxi dev",
     "generate": "node sync-openapi.mjs && nuxi generate && node ../scripts/docs-dist.mjs",
     "build": "node sync-openapi.mjs && nuxi generate && node ../scripts/docs-dist.mjs",
-    "preview": "nuxi preview"
+    "preview": "nuxi preview",
+    "serve-dist": "node serve-dist.mjs"
   },
   "dependencies": {
     "docus": "^5.12.3",

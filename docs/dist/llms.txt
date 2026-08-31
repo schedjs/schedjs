@@ -8,6 +8,7 @@
 
 ## Docs
 
+- [What's new](https://schedjs.github.io/schedjs/raw/docs/whats-new.md): Version history — release notes for every sched wave, newest first
 - [Introduction](https://schedjs.github.io/schedjs/raw/docs/introduction.md): What sched is and how it works
 - [Quick start](https://schedjs.github.io/schedjs/raw/docs/quick-start.md): Three ways to run sched — pick your scale
 - [Tasks](https://schedjs.github.io/schedjs/raw/docs/tasks.md): The tasks.json format — schedules, runners, config

@@ -83,7 +83,7 @@ export default defineNuxtModule({
           ``,
           fenced('ini', [
             `registry=${registryUrl}`,
-            `//${registryUrl.replace(/^https?:\/\//, '')}/:_authToken=\${NPM_REGISTRY_TOKEN}`,
+            `//${registryUrl.replace(/^https?:\/\//, '')}/:_authToken=\${NPM_TOKEN}`,
           ].join('\n')),
           ``,
           `yarn — \`.yarnrc.yml\`:` ,
@@ -91,7 +91,7 @@ export default defineNuxtModule({
           fenced('yaml', [
             `npmRegistryServer: "${registryUrl}"`,
             `npmAlwaysAuth: true`,
-            `npmAuthToken: "\${NPM_REGISTRY_TOKEN:-}"`,
+            `npmAuthToken: "\${NPM_TOKEN:-}"`,
             `# fresh publishes are quarantined by default — allow ours`,
             `npmMinimalAgeGate: 0`,
           ].join('\n')),

@@ -17,6 +17,7 @@ interface TaskRow {
   schedule_json: string;
   tz: string;
   config_json: string;
+  input_schema: string | null;
   label: string | null;
   description: string | null;
   next_run_at: number | null;
@@ -100,6 +101,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     schedule: json(row.schedule_json) as Schedule | null,
     tz: row.tz,
     config: json(row.config_json) as Record<string, unknown>,
+    inputSchema: row.input_schema === null ? null : (json(row.input_schema) as unknown),
     label: row.label,
     description: row.description,
     nextRunAt: date(row.next_run_at),
@@ -237,6 +239,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       schedule_json TEXT NOT NULL,
       tz            TEXT NOT NULL DEFAULT 'UTC',
       config_json   TEXT NOT NULL DEFAULT '{}',
+      input_schema  TEXT,
       label         TEXT,
       description   TEXT,
       next_run_at   INTEGER,
@@ -346,6 +349,10 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
   // deadline. Backfill NULL: existing tasks keep legacy semantics.
   if (!have.has('timeout_ms')) db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN timeout_ms INTEGER`);
 
+  // v0.8 → v0.9 (inputSchema, task:1658): input_schema on tasks — NULL = no
+  // schema (any data). Backfill NULL: existing tasks keep legacy behavior.
+  if (!have.has('input_schema')) db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN input_schema TEXT`);
+
   // v0.6 → v0.7 one-shot synthesis: legacy task rows with a schedule become
   // schedule rows — id = task name, dedupKey = task name (deterministic, so a
   // re-synthesis is an idempotent upsert and runtime state transfers by name).
@@ -392,13 +399,14 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
 
   const upsertTask = db.prepare(`
     INSERT INTO scheduled_tasks
-      (name, runner, schedule_json, tz, config_json, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       runner        = excluded.runner,
       schedule_json = excluded.schedule_json,
       tz            = excluded.tz,
       config_json   = excluded.config_json,
+      input_schema  = excluded.input_schema,
       label         = excluded.label,
       description   = excluded.description,
       next_run_at   = excluded.next_run_at,
@@ -576,6 +584,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
         JSON.stringify(task.schedule),
         task.tz,
         JSON.stringify(task.config),
+        jsonString(task.inputSchema),
         task.label,
         task.description,
         epoch(task.nextRunAt),

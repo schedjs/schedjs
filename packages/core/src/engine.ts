@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { nextRun } from './cron.js';
+import { InputValidationError, validateInput } from './input-schema.js';
 import { resolveSchedulePolicy } from './policy.js';
 import type { Storage } from './storage.js';
 import type { ArtifactRef, RetryPolicy, RunRecord, ScheduleRecord, TaskRecord } from './types.js';
@@ -473,10 +474,30 @@ export function createEngine(config: EngineConfig): Engine {
     return { nextRunAt: new Date(now.getTime() + backoff), count: retryCount + 1 };
   }
 
-  async function notifyFinal(runId: string): Promise<void> {
-    if (!config.onRunFinal) return;
-    const run = await storage.getRun(runId);
-    if (run) await config.onRunFinal(run);
+  /**
+   * Snapshot the run BEFORE finishRun and notify the final hook from it — the
+   * alert must NOT depend on a second storage read after the terminal write
+   * (a storage hiccup in that window loses the alert while the run IS failed —
+   * books/mongo incident class 2026-08-24, task:1390). The pre-finish record
+   * carries id/runner/startedAt/attempt; the outcome supplies the terminal
+   * fields (status/error/result/progress/log/artifacts/finishedAt).
+   */
+  async function finalRunRecord(runId: string, outcome: SyncOutcome): Promise<RunRecord | null> {
+    const base = await storage.getRun(runId);
+    if (!base) return null;
+    return {
+      ...base,
+      status: outcome.status,
+      error: outcome.status === 'failed' || outcome.status === 'cancelled' ? outcome.error : null,
+      result: outcome.result ?? null,
+      progress: outcome.progress ?? null,
+      log: outcome.log ?? null,
+      artifacts: outcome.artifacts ?? null,
+      // engine clock — the same source the schedule advance uses; the persisted
+      // finishedAt lands a moment later (storage write), the alert is the
+      // engine's view of «when it finished»
+      finishedAt: clock(),
+    };
   }
 
   /** Persist live progress reported by the runner (sync path) while the run is in flight. */
@@ -508,16 +529,23 @@ export function createEngine(config: EngineConfig): Engine {
 
   function recordFinish(taskName: string, runId: string, outcome: SyncOutcome, attempt: number, notify = true): Promise<void> {
     fire(outcomeEvent(taskName, runId, outcome, attempt));
-    return storage.finishRun(runId, {
-      status: outcome.status,
-      error: outcome.status === 'failed' || outcome.status === 'cancelled' ? outcome.error : null,
-      result: outcome.result ?? null,
-      progress: outcome.progress ?? null,
-      log: outcome.log ?? null,
-      artifacts: outcome.artifacts ?? null,
-    }).then(async () => {
-      if (notify) await notifyFinal(runId);
-    });
+    return (async () => {
+      // Snapshot BEFORE finishRun — the final hook must not re-read storage
+      // after the terminal write (a read failure there silently loses the
+      // alert; task:1390). The snapshot carries the identity fields (attempt
+      // from the persisted record — the run's actual value); outcome supplies
+      // the terminal ones.
+      const finalRecord = notify && config.onRunFinal ? await finalRunRecord(runId, outcome) : null;
+      await storage.finishRun(runId, {
+        status: outcome.status,
+        error: outcome.status === 'failed' || outcome.status === 'cancelled' ? outcome.error : null,
+        result: outcome.result ?? null,
+        progress: outcome.progress ?? null,
+        log: outcome.log ?? null,
+        artifacts: outcome.artifacts ?? null,
+      });
+      if (finalRecord) await config.onRunFinal!(finalRecord);
+    })();
   }
 
   /** Per-attempt terminal event for a sync/async outcome (retry state excluded). */
@@ -935,7 +963,16 @@ export function createEngine(config: EngineConfig): Engine {
       if (!task) return null;
 
       const runId = randomUUID();
-      const merged = mergeRunData(task.config.data ?? task.config.body ?? null, opts?.data);
+      let merged = mergeRunData(task.config.data ?? task.config.body ?? null, opts?.data);
+      // task:1658 — run_once validation: the merged data must match the task's
+      // inputSchema (defaults applied; the run records the EFFECTIVE data, so
+      // the worker and the record always agree). A mismatch is a caller error —
+      // throw (the admin API maps it to 400 with details).
+      if (task.inputSchema !== null && task.inputSchema !== undefined) {
+        const res = validateInput(task.inputSchema as Record<string, unknown>, merged);
+        if (!res.ok) throw new InputValidationError(res.issues);
+        merged = res.data;
+      }
       await storage.createRun({
         id: runId,
         taskName: name,

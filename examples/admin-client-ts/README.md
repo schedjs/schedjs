@@ -13,7 +13,7 @@ tsc --noEmit  →  exit 0
 | | |
 |---|---|
 | Generator | `openapi-generator` 7.24.0, `typescript-axios` |
-| Input spec | `openapi.json` — pinned `@schedjs/admin-api/openapi.json`, **0.2.0** subpath export (byte-identical to the repo copy; guarded by `packages/admin-api/test/ts-client-guard.test.ts`) |
+| Input spec | `openapi.json` — pinned `@schedjs/admin-api/openapi.json`, npm **0.2.0** subpath export (byte-identical to the repo copy; guarded by `packages/admin-api/test/ts-client-guard.test.ts`) |
 | Output | `client/` — typed API classes + models (`api.ts` etc.) |
 | Nullable 3.1 | `type: ["string","null"]` → `string \| null` — verified |
 

@@ -4,6 +4,7 @@ import type { AlertsConfig } from './alerts.js';
 import { nextRun } from './cron.js';
 import { parseSchedule } from './human.js';
 import type { Schedule } from './human.js';
+import { assertValidInputSchema, validateInput } from './input-schema.js';
 import type { Storage } from './storage.js';
 import type { RetryPolicy, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
 
@@ -46,6 +47,14 @@ export interface TaskDefinition {
   tz?: string;
   /** Runner-specific config, validated per runner at load time (fail fast). */
   config: Record<string, unknown>;
+  /**
+   * JSON Schema for run `data` (tenant params) — task:1658 (Р10). The schema
+   * is shape-checked at load (fail-fast); every declared schedule's `data` is
+   * validated against it with defaults applied (a mismatch fails the file).
+   * The same schema is enforced by the admin API on imperative schedule
+   * create/update and run_once, and drives UI/MCP form rendering.
+   */
+  inputSchema?: unknown;
   /**
    * Task-level scheduling priority (default for entries that don't override;
    * slice 3 resolves entry ?? task). Higher runs first among due tasks.
@@ -311,6 +320,7 @@ interface ParsedTask {
   runner: string;
   tz: string;
   config: Record<string, unknown>;
+  inputSchema: unknown | null;
   priority: number;
   retry: RetryPolicy | null;
   timeoutMs: number | null;
@@ -338,11 +348,31 @@ function parseTask(def: TaskDefinition, now: Date): ParsedTask {
   validateConfig(def);
   validateEnginePolicy(def);
 
+  // inputSchema (task:1658): shape-check the schema itself, then eagerly
+  // validate every declared schedule's data against it — a typo'd param must
+  // fail the FILE, not the first run. Defaults are materialized into the
+  // stored data (the effective data contract: the worker always sees the
+  // complete parameter set).
+  let inputSchema: unknown | null = null;
+  if (def.inputSchema !== undefined) {
+    assertValidInputSchema(def.inputSchema, `task "${def.name}" inputSchema`);
+    inputSchema = def.inputSchema;
+    for (const e of entries) {
+      const res = validateInput(def.inputSchema as Record<string, unknown>, e.data);
+      if (!res.ok) {
+        const detail = res.issues.map((i) => `${i.path || '(root)'}: ${i.message}`).join('; ');
+        fail(def.name, `schedule data does not match inputSchema: ${detail}`);
+      }
+      e.data = res.data;
+    }
+  }
+
   return {
     name: def.name,
     runner: def.runner ?? 'http',
     tz: entries[0]?.tz ?? def.tz ?? 'UTC',
     config: def.config,
+    inputSchema,
     priority: def.priority ?? 0,
     retry: def.retry ?? null,
     timeoutMs: def.timeoutMs ?? -1,
@@ -381,6 +411,7 @@ export function toTasks(defs: TaskDefinition[], now: Date): TaskRecord[] {
       schedule: primary?.schedule ?? null,
       tz: p.tz,
       config: p.config,
+      inputSchema: p.inputSchema,
       label: p.label,
       description: p.description,
       nextRunAt: primary === null ? null : initialNextRun(primary.schedule, primary.tz, now),
@@ -583,6 +614,7 @@ async function applyTask(storage: Storage, task: TaskRecord): Promise<TaskRecord
     schedule: task.schedule,
     tz: task.tz,
     config: task.config,
+    inputSchema: task.inputSchema,
     priority: task.priority,
     retry: task.retry,
     timeoutMs: task.timeoutMs ?? null,

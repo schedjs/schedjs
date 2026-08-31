@@ -45,6 +45,7 @@ interface TaskRow {
   schedule_json: string;
   tz: string;
   config_json: string;
+  input_schema: string | null;
   label: string | null;
   description: string | null;
   next_run_at: number | null;
@@ -128,6 +129,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     schedule: json(row.schedule_json) as Schedule | null,
     tz: row.tz,
     config: json(row.config_json) as Record<string, unknown>,
+    inputSchema: row.input_schema === null ? null : (json(row.input_schema) as unknown),
     label: row.label,
     description: row.description,
     nextRunAt: date(row.next_run_at),
@@ -271,6 +273,7 @@ const MIGRATIONS: Array<{ version: number; up: MigrationStep[] }> = [
         schedule_json TEXT         NOT NULL,
         tz            VARCHAR(64)  NOT NULL DEFAULT 'UTC',
         config_json   TEXT         NOT NULL,
+        input_schema  TEXT,
         label         VARCHAR(255),
         description   TEXT,
         next_run_at   BIGINT,
@@ -409,6 +412,11 @@ const MIGRATIONS: Array<{ version: number; up: MigrationStep[] }> = [
     version: 6,
     up: [{ sql: `ALTER TABLE scheduled_tasks ADD COLUMN timeout_ms BIGINT`, guard: { table: 'scheduled_tasks', column: 'timeout_ms' } }],
   },
+  {
+    // v7 — inputSchema (task:1658): input_schema on tasks. NULL = no schema.
+    version: 7,
+    up: [{ sql: `ALTER TABLE scheduled_tasks ADD COLUMN input_schema TEXT`, guard: { table: 'scheduled_tasks', column: 'input_schema' } }],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -519,13 +527,14 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
     async upsertTask(task) {
       await pool.query(
         `INSERT INTO scheduled_tasks
-          (name, runner, schedule_json, tz, config_json, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
           runner        = VALUES(runner),
           schedule_json = VALUES(schedule_json),
           tz            = VALUES(tz),
           config_json   = VALUES(config_json),
+          input_schema  = VALUES(input_schema),
           label         = VALUES(label),
           description   = VALUES(description),
           next_run_at   = VALUES(next_run_at),
@@ -547,6 +556,7 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
           JSON.stringify(task.schedule),
           task.tz,
           JSON.stringify(task.config),
+          jsonString(task.inputSchema),
           task.label,
           task.description,
           epoch(task.nextRunAt),

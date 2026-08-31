@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createAdminApi } from '../src/admin-api.js';
-import { createSqliteStorage } from '@schedjs/core';
+import { createSqliteStorage, InputValidationError } from '@schedjs/core';
 import type { RunRecord, ScheduleRecord, TaskRecord } from '@schedjs/core';
 import { makeSchedule } from '@schedjs/core/storage-contract';
 
@@ -317,6 +317,53 @@ describe('admin api', () => {
       expect(sched.fileManaged).toBe(false); // runtime-owned — sync never disables it
       expect(sched.id).toMatch(/^[0-9a-f-]{36}$/); // UUID
       expect(await storage.getSchedule(sched.id)).not.toBeNull();
+    });
+
+    it('validates schedule data against the task inputSchema — 400 with details (task:1658)', async () => {
+      const storage = freshStorage();
+      await storage.upsertTask(
+        makeTask('nightly', {
+          inputSchema: {
+            type: 'object',
+            properties: { idSeller: { type: 'integer', minimum: 1 } },
+            required: ['idSeller'],
+          },
+        }),
+      );
+      const { base } = await startTracked({ storage, now: () => new Date(NOW) });
+      const res = await fetch(`${base}/schedules`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ taskName: 'nightly', schedule: { interval: 'every hour', data: { idSeller: 'two' } } }),
+      });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toMatch(/inputSchema/);
+      expect(body.error).toMatch(/idSeller/);
+      // nothing was written
+      expect(await storage.listSchedules()).toHaveLength(0);
+    });
+
+    it('applies inputSchema defaults to schedule data on create (task:1658)', async () => {
+      const storage = freshStorage();
+      await storage.upsertTask(
+        makeTask('nightly', {
+          inputSchema: {
+            type: 'object',
+            properties: { idSeller: { type: 'integer' }, mode: { type: 'string', default: 'auto' } },
+            required: ['idSeller'],
+          },
+        }),
+      );
+      const { base } = await startTracked({ storage, now: () => new Date(NOW) });
+      const res = await fetch(`${base}/schedules`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ taskName: 'nightly', schedule: { interval: 'every hour', data: { idSeller: 2 } } }),
+      });
+      expect(res.status).toBe(201);
+      const sched = ((await res.json()) as { schedule: ScheduleRecord }).schedule;
+      expect(sched.data).toEqual({ idSeller: 2, mode: 'auto' });
     });
 
     it('inherits the task priority when the entry does not override it (F1)', async () => {
@@ -890,6 +937,26 @@ describe('admin api', () => {
     // no body → no options (backward compatible)
     await fetch(`${base}/tasks/a/run`, { method: 'POST' });
     expect(engine.triggerCalls[1]!.opts).toBeUndefined();
+  });
+
+  it('POST /tasks/:name/run maps InputValidationError to 400 with details (task:1658)', async () => {
+    const storage = freshStorage();
+    await storage.upsertTask(makeTask('a'));
+    // the stub engine rejects with the real InputValidationError (as the real engine does)
+    const rejecting = stubEngine(async () => {
+      throw new InputValidationError([{ path: 'idSeller', message: 'must be >= 1 (got 0)' }]);
+    });
+    const { base } = await startTracked({ storage, engine: rejecting });
+
+    const res = await fetch(`${base}/tasks/a/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ data: { idSeller: 0 } }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/inputSchema/);
+    expect(body.error).toMatch(/idSeller/);
   });
 
   it('POST /tasks/:name/run forwards triggeredBy from the optional JSON body (caller-supplied audit identity)', async () => {

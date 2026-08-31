@@ -45,6 +45,7 @@ interface TaskRow {
   schedule_json: string;
   tz: string;
   config_json: string;
+  input_schema: string | null;
   label: string | null;
   description: string | null;
   next_run_at: string | null;
@@ -133,6 +134,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     schedule: json(row.schedule_json) as Schedule | null,
     tz: row.tz,
     config: json(row.config_json) as Record<string, unknown>,
+    inputSchema: row.input_schema === null ? null : (json(row.input_schema) as unknown),
     label: row.label,
     description: row.description,
     nextRunAt: date(num(row.next_run_at)),
@@ -266,6 +268,7 @@ const MIGRATIONS: Array<{ version: number; up: Array<string | ((pool: Pool) => P
         schedule_json TEXT         NOT NULL,
         tz            VARCHAR(64)  NOT NULL DEFAULT 'UTC',
         config_json   TEXT         NOT NULL,
+        input_schema  TEXT,
         label         VARCHAR(255),
         description   TEXT,
         next_run_at   BIGINT,
@@ -406,6 +409,11 @@ const MIGRATIONS: Array<{ version: number; up: Array<string | ((pool: Pool) => P
     version: 6,
     up: [`ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS timeout_ms BIGINT`],
   },
+  {
+    // v7 — inputSchema (task:1658): input_schema on tasks. NULL = no schema.
+    version: 7,
+    up: [`ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS input_schema TEXT`],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -504,13 +512,14 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
     async upsertTask(task) {
       await pool.query(
         `INSERT INTO scheduled_tasks
-          (name, runner, schedule_json, tz, config_json, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         ON CONFLICT (name) DO UPDATE SET
           runner        = EXCLUDED.runner,
           schedule_json = EXCLUDED.schedule_json,
           tz            = EXCLUDED.tz,
           config_json   = EXCLUDED.config_json,
+          input_schema  = EXCLUDED.input_schema,
           label         = EXCLUDED.label,
           description   = EXCLUDED.description,
           next_run_at   = EXCLUDED.next_run_at,
@@ -532,6 +541,7 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
           JSON.stringify(task.schedule),
           task.tz,
           JSON.stringify(task.config),
+          jsonString(task.inputSchema),
           task.label,
           task.description,
           epoch(task.nextRunAt),
