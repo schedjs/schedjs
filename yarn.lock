@@ -4107,6 +4107,17 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@schedjs/core@npm:0.53.0":
+  version: 0.53.0
+  resolution: "@schedjs/core@npm:0.53.0"
+  dependencies:
+    chrono-node: "npm:^2.10.1"
+    cron-parser: "npm:^5.10.0"
+    ssh2: "npm:^1.17.0"
+  checksum: 10c0/e53f2cf0d78afb0abf666253fc6ddff364178ccb87eb7e83fae406f6d915b2890a7f11d3a033ebd8a1849547554af20b9e51815f754452f08d1358eda52e876e
+  languageName: node
+  linkType: hard
+
 "@schedjs/core@workspace:*, @schedjs/core@workspace:packages/core":
   version: 0.0.0-use.local
   resolution: "@schedjs/core@workspace:packages/core"
@@ -4131,7 +4142,19 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@schedjs/mcp@npm:^0.4.0, @schedjs/mcp@workspace:packages/mcp":
+"@schedjs/mcp@npm:^0.4.0":
+  version: 0.4.1
+  resolution: "@schedjs/mcp@npm:0.4.1"
+  dependencies:
+    "@modelcontextprotocol/sdk": "npm:^1.30.0"
+    "@schedjs/core": "npm:0.53.0"
+  bin:
+    sched-mcp: ./dist/cli.js
+  checksum: 10c0/b277aeee85a8555fb101b6e44ffbeb7b09133d0f1e817ee0970c5313a0f60a6f3e62042b6309448727a9c346b41285f34c9d3079bdf2b73d417ef85cf69358cc
+  languageName: node
+  linkType: hard
+
+"@schedjs/mcp@workspace:packages/mcp":
   version: 0.0.0-use.local
   resolution: "@schedjs/mcp@workspace:packages/mcp"
   dependencies:
