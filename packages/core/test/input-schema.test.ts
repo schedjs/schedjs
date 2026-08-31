@@ -161,8 +161,8 @@ describe('validateInput', () => {
     const high = validateInput(schema, 11);
     expect(low.ok).toBe(false);
     expect(high.ok).toBe(false);
-    if (!low.ok) expect(low.issues[0].message).toMatch(/>= 1/);
-    if (!high.ok) expect(high.issues[0].message).toMatch(/<= 10/);
+    if (!low.ok) expect(low.issues![0]!.message).toMatch(/>= 1/);
+    if (!high.ok) expect(high.issues![0]!.message).toMatch(/<= 10/);
   });
 
   it('reports minLength/maxLength on strings', () => {
@@ -184,7 +184,7 @@ describe('validateInput', () => {
     expect(validateInput(schema, 'auto').ok).toBe(true);
     const res = validateInput(schema, 'teleport');
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.issues[0].message).toMatch(/must be one of: "auto", "manual"/);
+    if (!res.ok) expect(res.issues![0]!.message).toMatch(/must be one of: "auto", "manual"/);
   });
 
   it('rejects unknown properties when additionalProperties is false', () => {
