@@ -43,6 +43,10 @@ work on every path:
 
 See [Quick start](quick-start) to run your first task on any of them.
 
+sched is not the right tool for every scheduling problem. [Comparison](comparison) puts it
+next to BullMQ, Bull, Kue, Bee, pg-boss and Agenda and says where it wins, where it loses,
+and what to use instead.
+
 ## Architecture
 
 ```text
@@ -73,6 +77,7 @@ admin API and the web UI.
 
 ## Where to go next
 
+- [Comparison](comparison) — sched next to BullMQ, Agenda, pg-boss and friends
 - [Quick start](quick-start) — run your first scheduled task in 3 minutes
 - [Tasks](tasks) — the `tasks.json` format and scheduling
 - [Runs](runs) — the run lifecycle and `RunRecord`

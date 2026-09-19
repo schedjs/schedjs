@@ -19,7 +19,8 @@ retries, priority, and alerts.
   alerts via webhook.
 
 Full documentation: [sched docs](docs/content/docs/01.introduction.md) — quick
-start, task format, runner protocol, storage, self-hosting, security.
+start, task format, [comparison with BullMQ, Agenda, pg-boss and friends](docs/content/docs/02.comparison.md),
+runner protocol, storage, self-hosting, security.
 
 ## Quick start (5 minutes)
 

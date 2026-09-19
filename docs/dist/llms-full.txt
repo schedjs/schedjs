@@ -149,6 +149,10 @@ work on every path:
 
 See [Quick start](https://schedjs.github.io/schedjs/quick-start) to run your first task on any of them.
 
+sched is not the right tool for every scheduling problem. [Comparison](https://schedjs.github.io/schedjs/comparison) puts it
+next to BullMQ, Bull, Kue, Bee, pg-boss and Agenda and says where it wins, where it loses,
+and what to use instead.
+
 ## Architecture
 
 ```text
@@ -179,11 +183,124 @@ See [Quick start](https://schedjs.github.io/schedjs/quick-start) to run your fir
 
 ## Where to go next
 
+- [Comparison](https://schedjs.github.io/schedjs/comparison) — sched next to BullMQ, Agenda, pg-boss and friends
 - [Quick start](https://schedjs.github.io/schedjs/quick-start) — run your first scheduled task in 3 minutes
 - [Tasks](https://schedjs.github.io/schedjs/tasks) — the `tasks.json` format and scheduling
 - [Runs](https://schedjs.github.io/schedjs/runs) — the run lifecycle and `RunRecord`
 - [Runners](https://schedjs.github.io/schedjs/runners/http) — HTTP / Docker / custom runners
 - [Protocol](https://schedjs.github.io/schedjs/protocol) — the wire contract between sched and workers
+
+
+# Comparison
+
+This page puts sched next to the job schedulers and queues it is normally weighed
+against in the Node ecosystem: **BullMQ**, **Bull**, **Kue**, **Bee**, **pg-boss** and
+**Agenda**.
+
+A note on honesty before the table: our own column is written from sched's own code and
+docs. The columns for the other projects are taken from two published comparison charts —
+[Agenda's](https://github.com/agenda/agenda#feature-comparison){rel="&#x22;nofollow&#x22;"} (which credits the
+[Bull](https://www.npmjs.com/package/bull#feature-comparison){rel="&#x22;nofollow&#x22;"} maintainers for the original)
+and [BullMQ's](https://github.com/taskforcesh/bullmq#feature-comparison){rel="&#x22;nofollow&#x22;"} — plus package
+metadata from npm, all checked on **2026-09-19**. Where a chart was silent, the cell is
+left empty rather than guessed: an empty cell means *unknown / not claimed*, not *no*.
+
+## Backends, status and license
+
+|               | **sched**                              | BullMQ-Pro      | BullMQ          | Bull            | Kue        | Bee        | pg-boss              | Agenda                 |
+| ------------- | -------------------------------------- | --------------- | --------------- | --------------- | ---------- | ---------- | -------------------- | ---------------------- |
+| Backend       | SQLite, MySQL/MariaDB, Postgres, Mongo | redis           | redis           | redis           | redis      | redis      | postgres             | mongo, postgres, redis |
+| Last release  | active                                 | active          | 2026-09-18      | 2024-12-18      | 2024-11-04 | 2025-12-08 | 2026-09-18           | 2026-07-21             |
+| Optimized for | Jobs                                   | Jobs / Messages | Jobs / Messages | Jobs / Messages | Jobs       | Messages   | Jobs                 | Jobs                   |
+| License       | MIT                                    | commercial      | MIT             | MIT             | MIT        | MIT        | MIT (one maintainer) | MIT                    |
+
+Status read: **BullMQ**, **pg-boss** and **Agenda** are the living ones alongside sched.
+**Bull** and **Kue** have not shipped since 2024, **Bee** since late 2025 — treat those
+three as legacy.
+
+## Features
+
+Rows in the first block come from the two charts above; the second block holds the
+capabilities we could not fill from a published chart, so only sched's column is filled
+there.
+
+|                                                   | **sched** | BullMQ-Pro | BullMQ | Bull | Kue | Bee | pg-boss | Agenda |
+| ------------------------------------------------- | --------- | ---------- | ------ | ---- | --- | --- | ------- | ------ |
+| TypeScript                                        | ✓         | ✓          | ✓      |      |     |     | ✓       | ✓      |
+| Priorities                                        | ✓         | ✓          | ✓      | ✓    | ✓   |     | ✓       | ✓      |
+| Concurrency                                       | ✓         | ✓          | ✓      | ✓    | ✓   | ✓   | ✓       | ✓      |
+| Delayed jobs                                      | ✓¹        | ✓          | ✓      | ✓    | ✓   |     | ✓       | ✓      |
+| Global events                                     |           | ✓          | ✓      | ✓    | ✓   |     |         |        |
+| Rate limiter                                      |           | ✓          | ✓      | ✓    |     |     | ✓       |        |
+| Deduplication (debouncing)                        |           | ✓          | ✓      | ✓    |     |     | ✓       | ✓      |
+| Pause / resume                                    | ✓         | ✓          | ✓      | ✓    | ✓   |     |         | ✓      |
+| Sandboxed worker                                  |           | ✓          | ✓      | ✓    |     |     |         |        |
+| Repeatable jobs (cron)                            | ✓         | ✓          | ✓      | ✓    |     |     | ✓       | ✓      |
+| Auto-retry with backoff                           | ✓         | ✓          | ✓      | ✓    |     |     | ✓       | ✓      |
+| Dead letter queue                                 |           | ✓          | ✓      | ✓    |     |     | ✓       |        |
+| Parent/child dependencies                         |           | ✓          | ✓      |      |     |     |         |        |
+| Atomic ops                                        | ✓         | ✓          | ✓      | ✓    |     | ✓   | ✓       | \~     |
+| Persistence                                       | ✓         | ✓          | ✓      | ✓    | ✓   | ✓   | ✓       | ✓      |
+| UI                                                | ✓         | ✓          | ✓      | ✓    | ✓   |     |         | ✓      |
+| REST API                                          | ✓         |            |        |      |     |     |         | ✓      |
+| Central (scalable) queue                          | ✓         | ✓          | ✓      |      |     |     | ✓       | ✓      |
+| Optimized for long-running jobs                   | ✓         |            |        |      |     |     |         | ✓      |
+| Human-readable intervals                          | ✓         |            |        |      |     |     |         | ✓      |
+| Cron with a timezone, DST-safe                    | ✓         |            |        |      |     |     |         |        |
+| Run history: progress, log, artifacts             | ✓         |            |        |      |     |     |         |        |
+| Cancel a *running* job                            | ✓         |            |        |      |     |     |         |        |
+| Run deadline (`timeoutMs`)                        | ✓         |            |        |      |     |     |         |        |
+| Many schedules per task                           | ✓         |            |        |      |     |     |         |        |
+| Polyglot workers (HTTP / Docker / SSH / process)  | ✓         |            |        |      |     |     |         |        |
+| MCP: control plane **and** MCP server as a worker | ✓         |            |        |      |     |     |         |        |
+| Tool allowlist sandbox (`allowedTools`)           | ✓         |            |        |      |     |     |         |        |
+| Alerts on a missed slot / final run               | ✓         |            |        |      |     |     |         |        |
+
+¹ &#x2A;*Delayed jobs, sched's flavour.** A delay is expressed as a **one-shot schedule**, not as
+a property of an enqueued job: `{ "once": "tomorrow at noon" }` in `tasks.json`, or
+`POST /schedules` at runtime — a real schedule entity carrying `data`, `tz` and `dedupKey`,
+which fires once and then unschedules. What sched does *not* have is BullMQ's per-job
+`delay(ms)` on an immediate trigger: `POST /tasks/:name/run` starts the run now.
+
+² &#x2A;*"Sandboxed worker" means something else here, so sched's cell is empty.** In BullMQ
+and Bull it is process isolation — the job runs in a separate child process. sched has no
+such isolation; its sandbox is a *policy*: each run is checked against
+[`allowedTools`](https://schedjs.github.io/schedjs/security) (an allowlist of commands, images or MCP `server:tool` specs)
+before it is allowed to spawn. That is why the allowlist appears as its own row.
+
+## What the table does not say
+
+- **Schedulers versus queues.** sched and Agenda are cron schedulers with a job queue
+  attached. BullMQ, Bull and Bee are queues that also happen to support repeatable jobs.
+  If your unit of work is "a message that must be consumed fast and exactly once", that is
+  their home ground, not ours.
+- **The paid line.** BullMQ-Pro's ticks are commercial features of that package. The UI
+  rows are also not always in the box: Agenda's UI is the separate
+  [Agendash](https://github.com/agenda/agenda/tree/main/packages/agendash){rel="&#x22;nofollow&#x22;"} package, and
+  BullMQ's open-source dashboard is the separate Bull Board project.
+- **Blanks are blanks.** An empty cell above means the source chart did not claim the
+  feature and we did not test it — not that the feature is missing.
+- **No benchmarks.** Nothing on this page is a throughput or latency claim. Compare those
+  on your own workload.
+
+## When to pick something else
+
+- **High-throughput queue with rate limiting, retries and a worker fleet in Redis** →
+  **BullMQ**.
+- **Already on Postgres and you want queues in the same database** → **pg-boss**.
+- **On MongoDB, want minimal overhead, and the chart above fits you** → **Agenda**.
+- **On Bull, Kue or Bee** → they have not shipped since 2024/2025; plan a migration to
+  whichever of the living options fits.
+- **You need durable multi-step workflows** (steps, long sleeps, signals) → that is a
+  different class of tool entirely.
+
+## Sources
+
+- Agenda's feature comparison chart — <https://github.com/agenda/agenda#feature-comparison>{rel="&#x22;nofollow&#x22;"}
+- BullMQ's feature comparison chart — <https://github.com/taskforcesh/bullmq#feature-comparison>{rel="&#x22;nofollow&#x22;"}
+- pg-boss README (cron/RRULE, maintenance model) — <https://github.com/timgit/pg-boss>{rel="&#x22;nofollow&#x22;"}
+- Release dates and licenses — npm registry metadata for `bullmq`, `bull`, `kue`,
+  `bee-queue`, `pg-boss`, `agenda`, checked 2026-09-19.
 
 
 # Quick start
