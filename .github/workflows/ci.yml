@@ -50,6 +50,8 @@ jobs:
         run: corepack enable
       - name: Install
         run: yarn install --immutable
+      - name: Check docs routes (no two files on one URL)
+        run: yarn workspace docs check:routes
       - name: Build docs
         run: yarn workspace docs build
       - uses: actions/upload-pages-artifact@v3
