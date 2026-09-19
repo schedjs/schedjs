@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/admin-api",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Cron scheduler admin REST API for Node.js — control plane over engine+storage (daemon, UI, CLI, MCP consumers)",
   "type": "module",
   "main": "./dist/index.js",

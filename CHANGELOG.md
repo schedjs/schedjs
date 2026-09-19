@@ -7,6 +7,15 @@ history is summarized below and fully preserved in the git log.
 
 ## [Unreleased]
 
+- **Публичный npm-релиз (2026-09-19)** — core 0.54.0, ui 0.3.1, cli 0.1.2,
+  storage-mongo 0.5.1, daemon 0.13.1, mcp 0.5.1, admin-api 0.3.2,
+  storage-mysql 0.4.2, storage-postgres 0.4.2. Внимание: tarball'ы
+  `daemon@0.13.0` / `mcp@0.5.0` / `admin-api@0.3.1` / `storage-mysql@0.4.1` /
+  `storage-postgres@0.4.1` на npm нерабочие (в манифест утёк протокол
+  `workspace:*`) — свежий `npm i` на них падает; используйте версии выше.
+  Версии публичного npm для этих пяти пакетов на один патч выше версий
+  внутреннего реестра (волна 2026-08-30).
+
 - **Волна 0.54.0/0.13.0 опубликована на npm** (2026-08-30): core 0.54.0,
   daemon 0.13.0, mcp 0.5.0, admin-api 0.3.1, ui 0.3.1, storage-mysql/pg 0.4.1;
   publish:check npm-часть зелёная, install-smoke OK. Docker-образ — отдельный
