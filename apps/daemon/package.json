@@ -1,6 +1,7 @@
 {
   "name": "@schedjs/daemon",
   "version": "0.13.0",
+  "license": "MIT",
   "description": "Self-hosted cron scheduler daemon for Node.js — SQLite + HTTP runner + tasks.json in one process (binary schedd)",
   "type": "module",
   "main": "./dist/daemon.js",
@@ -42,7 +43,7 @@
     "@aws-sdk/client-s3": "^3.1111.0",
     "@schedjs/admin-api": "workspace:*",
     "@schedjs/core": "workspace:*",
-    "@schedjs/mcp": "^0.4.0"
+    "@schedjs/mcp": "^0.5.0"
   },
   "publishConfig": {
     "access": "public"
