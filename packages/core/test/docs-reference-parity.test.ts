@@ -24,13 +24,13 @@ function extractFence(mdPath: string, marker: string): string {
 const sourceOf = (name: string) => readFileSync(`${HELPERS}${name}`, 'utf8').replace(/\n$/, '');
 
 describe('docs reference examples stay in sync with test/helpers sources', () => {
-  it('MemoryStorage (07.storage/custom/01.memory-storage.md) is byte-identical to helpers/memory-storage.ts', () => {
-    const embedded = extractFence(`${DOCS}07.storage/custom/01.memory-storage.md`, 'export class MemoryStorage');
+  it('MemoryStorage (08.storage/custom/01.memory-storage.md) is byte-identical to helpers/memory-storage.ts', () => {
+    const embedded = extractFence(`${DOCS}08.storage/custom/01.memory-storage.md`, 'export class MemoryStorage');
     expect(embedded).toBe(sourceOf('memory-storage.ts'));
   });
 
-  it('createFileRunner (06.runners/custom/01.file-runner.md) is byte-identical to helpers/file-runner.ts', () => {
-    const embedded = extractFence(`${DOCS}06.runners/custom/01.file-runner.md`, 'export function createFileRunner');
+  it('createFileRunner (07.runners/custom/01.file-runner.md) is byte-identical to helpers/file-runner.ts', () => {
+    const embedded = extractFence(`${DOCS}07.runners/custom/01.file-runner.md`, 'export function createFileRunner');
     expect(embedded).toBe(sourceOf('file-runner.ts'));
   });
 });
