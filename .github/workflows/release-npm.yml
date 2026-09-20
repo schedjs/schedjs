@@ -1,0 +1,95 @@
+# release-npm — публикация волны @schedjs/* в npm БЕЗ токена (trusted publishing / OIDC, task:3130).
+#
+# Зачем: с августа 2026 granular-токен с bypass-2FA только стейджит версию —
+# публикует человек с 2FA (approve). Волна R1 (task:3089) встала ровно на этом.
+# Здесь публикует CI по OIDC: токена в env нет вовсе, approve не нужен.
+#
+# Как настроено (нужно ОДИН раз, делает оператор с 2FA):
+#   1. у каждого пакета scope — trusted publisher:
+#        npm trust github @schedjs/<pkg> --repo schedjs/schedjs \
+#          --file release-npm.yml --env npm-release --allow-publish
+#   2. на GitHub — environment `npm-release` с branch policy «только main»
+#      (Settings → Environments) — чтобы публиковать мог лишь код из main.
+#
+# Порядок прогона: пак-гейт (build + tsc + unit) → pack + пак-чек (`workspace:` = 0)
+# → `npm publish <tgz>` депс-фёрст → install-smoke из тарболов. Скрипт идемпотентен:
+# уже опубликованные версии пропускаются, повторный прогон продолжает волну с места падения.
+
+name: release-npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'true — реальная публикация в npm; false — репетиция (pack + пак-чек + инсталл-смоук)'
+        type: boolean
+        default: false
+      only:
+        description: 'Подмножество волны через запятую (core,cli,…); пусто — вся волна'
+        required: false
+        default: ''
+      skip_smoke:
+        description: 'true — без инсталл-смоука (аварийный путь; штатно не использовать)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC-обмен с npm: без этого trusted publishing не авторизуется
+
+concurrency:
+  group: release-npm
+  cancel-in-progress: false # волну не обрываем на середине: версии неперезаписываемы
+
+jobs:
+  release:
+    name: release @schedjs/* (OIDC)
+    runs-on: ubuntu-latest
+    environment: npm-release # ветка выполнения ограничена main (branch policy на GitHub)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          # registry-url НЕ задаём: он подставляет пустой NODE_AUTH_TOKEN, а пустой
+          # токен перебивает OIDC-обмен и публикация падает на правах.
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install
+        run: yarn install --immutable
+      - name: Build packages (dist для cross-package types и для тарболов)
+        run: yarn workspaces foreach --all -pt --exclude docs run build
+      - name: Typecheck
+        run: yarn tsc --noEmit
+      - name: Unit tests
+        run: yarn vitest run --config vitest.ci.config.ts
+      - name: Publish wave (deps-first, pack-check + install-smoke)
+        env:
+          # Публикация только из main: dispatch с ветки не должен уезжать в npm.
+          RELEASE_PUBLISH: ${{ github.event.inputs.publish }}
+        run: |
+          set -eu
+          ARGS=""
+          if [ "${RELEASE_PUBLISH}" = "true" ]; then
+            if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+              echo "::error::publish разрешён только из main (сейчас ${GITHUB_REF})"
+              exit 1
+            fi
+            ARGS="--publish"
+          fi
+          if [ -n "${{ github.event.inputs.only }}" ]; then
+            ARGS="$ARGS --only=${{ github.event.inputs.only }}"
+          fi
+          if [ "${{ github.event.inputs.skip_smoke }}" = "true" ]; then
+            ARGS="$ARGS --skip-smoke"
+          fi
+          node scripts/release-npm.mjs $ARGS
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### release-npm"
+            echo ""
+            echo "- режим: ${{ github.event.inputs.publish == 'true' && 'ПУБЛИКАЦИЯ' || 'репетиция' }}"
+            echo "- прогон: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
