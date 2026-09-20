@@ -51,6 +51,10 @@ logs/
 .agents/.lock
 daemon.pid
 
+# Mappa client marker + offline cache (dev-only; НЕ в паблик-сет — см. инцидент утечки
+# `.mappa/config.yaml` в синке 2026-09-19: tenant/url/git_host чуть не ушли в pub)
+.mappa/
+
 # docs site build output
 docs/.output/
 docs/.nuxt/

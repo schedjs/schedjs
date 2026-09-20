@@ -28,14 +28,16 @@ for (const r of runs) console.log(r.log, r.status, r.attempt);
 ## 2. Terminal events — `onRunFinal`
 
 The `onRunFinal` hook fires once per run reaching a **terminal** state
-(`succeeded` / `failed` / `cancelled`) — with the finished `RunRecord`. Wire it to your
-logger, metrics, or the built-in status alerts (`createAlerts` — webhook):
+(`succeeded` / `failed` / `cancelled`) — with the finished `RunRecord` and the
+run's **streak context**: `previousFailures`, the number of terminal failures
+that preceded it (0 = a fresh incident). Wire it to your logger, metrics, or the
+built-in status alerts (`createAlerts` — webhook):
 
 ```ts
 const engine = createEngine({
   // ...
-  onRunFinal: (run) => {
-    console.log(`[sched] ${run.taskName} ${run.status} attempt=${run.attempt} ${run.error ?? ''}`);
+  onRunFinal: (run, { previousFailures }) => {
+    console.log(`[sched] ${run.taskName} ${run.status} attempt=${run.attempt} after ${previousFailures} failure(s) ${run.error ?? ''}`);
   },
 });
 ```
@@ -47,6 +49,147 @@ lands only on the **final, exhausted** failure (that's what "persistent failure"
 means; see [Tasks → retry](tasks#retry)).
 - **Manual triggers always fire** — `triggerTask` is a one-shot, its result alerts
 immediately, and it never auto-retries.
+
+### Streak context — why alerts fire once per incident
+
+`previousFailures` is the engine's snapshot of a task's **consecutive terminal
+failures before this run**, taken before the terminal write. Only alert-eligible
+runs move it: a failure with a retry still scheduled is not an incident yet, and
+a `cancelled` run neither counts nor breaks a streak (a human acted, not the
+pipeline). A `succeeded` run resets it.
+
+`createAlerts` (`onStreak`, see [Self-hosting → Status alerts](self-hosting#status-alerts))
+uses it to send **one** message per incident instead of one per run:
+
+<table>
+<thead>
+  <tr>
+    <th>
+      run
+    </th>
+    
+    <th>
+      <code>
+        previousFailures
+      </code>
+    </th>
+    
+    <th>
+      <code>
+        onStreak: 3
+      </code>
+      
+       → alert
+    </th>
+  </tr>
+</thead>
+
+<tbody>
+  <tr>
+    <td>
+      1st failure
+    </td>
+    
+    <td>
+      0
+    </td>
+    
+    <td>
+      silent (1 ≠ 3)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      2nd failure
+    </td>
+    
+    <td>
+      1
+    </td>
+    
+    <td>
+      silent
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      3rd failure
+    </td>
+    
+    <td>
+      2
+    </td>
+    
+    <td>
+      <code>
+        run.failed
+      </code>
+      
+       + <code>
+        consecutiveFailures: 3
+      </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      4th failure
+    </td>
+    
+    <td>
+      3
+    </td>
+    
+    <td>
+      silent — one alert per streak, no reminders
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      success
+    </td>
+    
+    <td>
+      3
+    </td>
+    
+    <td>
+      <code>
+        run.succeeded
+      </code>
+      
+       + <code>
+        previousFailures: 3
+      </code>
+      
+       («отпустило»)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      next failure
+    </td>
+    
+    <td>
+      0
+    </td>
+    
+    <td>
+      a fresh incident alerts again
+    </td>
+  </tr>
+</tbody>
+</table>
+
+The counter lives in the engine process, not in storage: the storage
+`failCount` is *cumulative* (never reset by a success), and a persisted
+consecutive-counter would be a `Storage`-contract change. A daemon restart
+forgets an in-flight streak — the next failure alerts once more rather than
+staying silent (no alert is ever lost).
 
 `createAlerts` (webhook) is a ready-made `onRunFinal` consumer — wire it as
 `onRunFinal: createAlerts(config).handleFinal` and

@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import type { EngineEvent } from './engine.js';
+import type { EngineEvent, RunFinalContext } from './engine.js';
 import type { RunRecord, RunStatus } from './types.js';
 
 /**
@@ -50,6 +50,35 @@ export interface AlertsConfig {
    * Default: true.
    */
   onSyncFailed?: boolean;
+  /**
+   * Consecutive terminal failures that turn a flapping task into an *incident*
+   * worth one notification. A failure with a retry still scheduled is not
+   * counted: the whole retry ladder is one incident (its depth is in
+   * `run.attempt`), so the threshold counts *persistent failures*.
+   * Default: 1 (= today's behaviour: alert on every terminal failure, nothing
+   * goes silent by surprise).
+   *
+   * With `onStreak: N > 1` the failure alert fires **exactly once per streak** —
+   * when the crossing run lands (`consecutiveFailures === N`) — and further
+   * failures of the same streak stay silent (a task red for a week is one
+   * message, not 168; reminders are deliberately not a thing — the streak
+   * context is in every payload, and the CLI/UI show the running state). A
+   * `succeeded` run breaks the streak: the next incident alerts again.
+   *
+   * **`onStreak: 1` is the no-gate mode** — every terminal failure is its own
+   * incident and alerts (byte-for-byte the pre-`onStreak` behaviour, so an
+   * existing deployment that configures nothing changes nothing).
+   *
+   * **«Отпустило» (recovery).** A `succeeded` run that broke a streak which had
+   * reached the threshold carries `previousFailures` (how many failures it
+   * ended). It is a `run.succeeded` alert like any other, so it is gated by
+   * `on` — with the default `on: ['failed']` no success notification is sent
+   * (add `'succeeded'` to receive the release signal; a plain success below the
+   * threshold stays a plain `run.succeeded`). A `cancelled` run neither counts
+   * nor breaks a streak (a human acted, not the pipeline) and never carries
+   * `previousFailures`.
+   */
+  onStreak?: number;
   webhook?: WebhookChannelConfig;
   /**
    * Per-task routing overrides (multi-tenant: critical vs cosmetic tasks have
@@ -68,13 +97,19 @@ export interface AlertDeps {
 }
 
 export interface Alerts {
-  /** Terminal run statuses (engine `onRunFinal` seam). Never throws. */
-  handleFinal(run: RunRecord): Promise<void>;
+  /**
+   * Terminal run statuses (engine `onRunFinal` seam). Never throws.
+   * `context` is the engine's streak snapshot (failures before this run); when
+   * omitted the run counts as the first failure of a streak — external callers
+   * that wire this by hand keep the `onStreak: 1` behaviour.
+   */
+  handleFinal(run: RunRecord, context?: RunFinalContext): Promise<void>;
   /** Engine event stream (engine `onEvent` seam); filters missed-slot internally. Never throws. */
   handleEvent(event: EngineEvent): Promise<void>;
 }
 
 const DEFAULT_ON: RunStatus[] = ['failed'];
+const DEFAULT_ON_STREAK = 1;
 const DEFAULT_TIMEOUT_MS = 10_000;
 /** Backoff between attempts; attempts total = delays + 1 (3). */
 const RETRY_DELAYS_MS = [5_000, 30_000];
@@ -87,7 +122,7 @@ function eventName(status: RunStatus): string {
   return `run.${status}`;
 }
 
-function runPayload(run: RunRecord): Record<string, unknown> {
+function runPayload(run: RunRecord, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     version: 1,
     event: eventName(run.status),
@@ -100,6 +135,10 @@ function runPayload(run: RunRecord): Record<string, unknown> {
       startedAt: run.startedAt.toISOString(),
       finishedAt: run.finishedAt ? run.finishedAt.toISOString() : null,
     },
+    // Streak fields ride at the TOP level, next to `event` (same shape as
+    // `sync.failed`'s `consecutiveFailures`) — not buried in `run`, so a
+    // consumer routes on the incident without walking the run record.
+    ...extra,
   };
 }
 
@@ -129,11 +168,12 @@ export function createAlerts(config: AlertsConfig = {}, deps: AlertDeps = {}): A
    * Field-wise per-task resolution: task override ?? root ?? default.
    * Arrays REPLACE (a task `on: []` silences it regardless of the root).
    */
-  function resolveFor(taskName: string): { on: RunStatus[]; onMissed: boolean; webhook: WebhookChannelConfig | undefined } {
+  function resolveFor(taskName: string): { on: RunStatus[]; onMissed: boolean; onStreak: number; webhook: WebhookChannelConfig | undefined } {
     const t = config.tasks?.[taskName];
     return {
       on: t?.on ?? config.on ?? DEFAULT_ON,
       onMissed: t?.onMissed ?? config.onMissed ?? true,
+      onStreak: t?.onStreak ?? config.onStreak ?? DEFAULT_ON_STREAK,
       webhook: t?.webhook ?? config.webhook,
     };
   }
@@ -176,9 +216,40 @@ export function createAlerts(config: AlertsConfig = {}, deps: AlertDeps = {}): A
   }
 
   return {
-    async handleFinal(run) {
+    async handleFinal(run, context) {
       const r = resolveFor(run.taskName);
       if (!r.webhook || !r.on.includes(run.status)) return;
+      // The engine snapshots the streak before the terminal write (the run in
+      // flight is not counted). No context → treat it as the first failure.
+      const previousFailures = context?.previousFailures ?? 0;
+
+      // Failure = the incident opening.
+      //   onStreak > 1 → exactly one alert per streak, on the crossing run
+      //     (`consecutiveFailures === onStreak`); failures inside stay silent.
+      //   onStreak === 1 → no gate at all: every terminal failure is its own
+      //     incident (the pre-onStreak behaviour, kept byte-for-byte so a
+      //     production deployment that configures nothing stays unchanged).
+      if (run.status === 'failed') {
+        const consecutiveFailures = previousFailures + 1;
+        if (r.onStreak > 1 && consecutiveFailures !== r.onStreak) return;
+        await post(r.webhook, runPayload(run, { consecutiveFailures })).catch((e) =>
+          console.error(`[alerts] webhook failed for run ${run.id}:`, e),
+        );
+        return;
+      }
+
+      // «Отпустило» — the incident closing: a success that ended a streak which
+      // reached the threshold reports how long it lasted. Below the threshold a
+      // success is the plain run.succeeded it always was.
+      if (run.status === 'succeeded' && previousFailures >= r.onStreak) {
+        await post(r.webhook, runPayload(run, { previousFailures })).catch((e) =>
+          console.error(`[alerts] webhook failed for run ${run.id}:`, e),
+        );
+        return;
+      }
+
+      // cancelled (and any other configured status): no streak fields — a
+      // cancel is a human action, never a recovery signal.
       await post(r.webhook, runPayload(run)).catch((e) =>
         console.error(`[alerts] webhook failed for run ${run.id}:`, e),
       );

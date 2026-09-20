@@ -4,6 +4,27 @@ Version history for sched, newest first. Versioning is **per-package** (monorepo
 so each wave lists the version matrix it shipped. The full, commit-level history
 lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob/main/CHANGELOG.md){rel="&#x22;nofollow&#x22;"}.
 
+## In development — streak alerts (core / cli)
+
+- **`alerts.onStreak` — one alert per incident, not one per run.** A task that
+  keeps failing sends a single `run.failed` when the streak reaches
+  `onStreak` consecutive failures (payload carries `consecutiveFailures`); the
+  failures inside the streak stay silent, a success breaks the streak, and the
+  next incident alerts again. The recovery signal («отпустило») is a
+  `run.succeeded` payload carrying `previousFailures` — how many failures the
+  success ended (send it by adding `'succeeded'` to `on`). Default
+  `onStreak: 1` = every terminal failure alerts, i.e. exactly the behaviour
+  before this option, so an existing deployment is not silently re-tuned.
+- **`FAILS` column in `sched tasks`.** How long a task has been red, without a
+  single reminder: `onStreak` suppresses the repeats, the CLI keeps the running
+  count visible (zero prints as `—`). `--json` is unchanged (`failCount` was
+  already in the task record).
+- **`tasks.json` alert validation, root block included.** The top-level `alerts`
+  block is now validated by the same rules as the per-task blocks (it used to be
+  cast through unchecked): `onStreak` must be an integer ≥ 1, `onSyncFailed` a
+  boolean, `on`/`onMissed`/`webhook` as before — a typo fails at load instead of
+  silently changing what alerts.
+
 ## In development — inputSchema (core)
 
 - **`inputSchema` in `TaskDefinition`** — declare the shape of run `data`
@@ -662,6 +683,7 @@ tasks are disabled.
   "alerts": {
     "on": ["failed"],
     "onMissed": true,
+    "onStreak": 1,
     "webhook": {
       "url": "https://hooks.example.com/ops",
       "secret": "whsec_…"
@@ -708,10 +730,14 @@ The root `alerts` block is the **channel + defaults** for the whole daemon. A ta
   while `publish-video` (no override) keeps the root default `on: ["failed"]`.
 - `alerts.onMissed: false` opts a task out of [missed-slot](https://schedjs.github.io/schedjs/self-hosting#status-alerts)
   alerts; `alerts.webhook` routes that task to a **different channel** (e.g. a critical
-  task pages PagerDuty while the rest go to Slack).
+  task pages PagerDuty while the rest go to Slack). `alerts.onStreak: N` alerts once per
+  N-failure streak instead of once per failure (default `1` = every terminal failure) —
+  see [Self-hosting → Status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts) for the recovery
+  («отпустило») signal.
 - A task without an `alerts` block uses the root defaults — no behavior change.
-- Malformed task `alerts` (bad status, non-boolean `onMissed`, webhook without a
-  string `url`) fails at load, not on runs.
+- Malformed `alerts` (bad status, non-boolean `onMissed`/`onSyncFailed`, `onStreak`
+  that is not an integer ≥ 1, webhook without a string `url`) fails at load, not on
+  runs — in the root block and in a per-task block alike.
 
 ## Priority, retry and the run deadline
 
@@ -2973,14 +2999,16 @@ for (const r of runs) console.log(r.log, r.status, r.attempt);
 ## 2. Terminal events — `onRunFinal`
 
 The `onRunFinal` hook fires once per run reaching a **terminal** state
-(`succeeded` / `failed` / `cancelled`) — with the finished `RunRecord`. Wire it to your
-logger, metrics, or the built-in status alerts (`createAlerts` — webhook):
+(`succeeded` / `failed` / `cancelled`) — with the finished `RunRecord` and the
+run's **streak context**: `previousFailures`, the number of terminal failures
+that preceded it (0 = a fresh incident). Wire it to your logger, metrics, or the
+built-in status alerts (`createAlerts` — webhook):
 
 ```ts
 const engine = createEngine({
   // ...
-  onRunFinal: (run) => {
-    console.log(`[sched] ${run.taskName} ${run.status} attempt=${run.attempt} ${run.error ?? ''}`);
+  onRunFinal: (run, { previousFailures }) => {
+    console.log(`[sched] ${run.taskName} ${run.status} attempt=${run.attempt} after ${previousFailures} failure(s) ${run.error ?? ''}`);
   },
 });
 ```
@@ -2992,6 +3020,32 @@ Two semantics worth knowing:
   means; see [Tasks → retry](https://schedjs.github.io/schedjs/tasks#retry)).
 - **Manual triggers always fire** — `triggerTask` is a one-shot, its result alerts
   immediately, and it never auto-retries.
+
+### Streak context — why alerts fire once per incident
+
+`previousFailures` is the engine's snapshot of a task's **consecutive terminal
+failures before this run**, taken before the terminal write. Only alert-eligible
+runs move it: a failure with a retry still scheduled is not an incident yet, and
+a `cancelled` run neither counts nor breaks a streak (a human acted, not the
+pipeline). A `succeeded` run resets it.
+
+`createAlerts` (`onStreak`, see [Self-hosting → Status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts))
+uses it to send **one** message per incident instead of one per run:
+
+| run          | `previousFailures` | `onStreak: 3` → alert                                 |
+| ------------ | ------------------ | ----------------------------------------------------- |
+| 1st failure  | 0                  | silent (1 ≠ 3)                                        |
+| 2nd failure  | 1                  | silent                                                |
+| 3rd failure  | 2                  | `run.failed` + `consecutiveFailures: 3`               |
+| 4th failure  | 3                  | silent — one alert per streak, no reminders           |
+| success      | 3                  | `run.succeeded` + `previousFailures: 3` («отпустило») |
+| next failure | 0                  | a fresh incident alerts again                         |
+
+The counter lives in the engine process, not in storage: the storage
+`failCount` is *cumulative* (never reset by a success), and a persisted
+consecutive-counter would be a `Storage`-contract change. A daemon restart
+forgets an in-flight streak — the next failure alerts once more rather than
+staying silent (no alert is ever lost).
 
 `createAlerts` (webhook) is a ready-made `onRunFinal` consumer — wire it as
 `onRunFinal: createAlerts(config).handleFinal` and
@@ -4084,6 +4138,7 @@ createDaemon({
     on: ['failed'],   // default — alert on failures only (also: 'succeeded', 'cancelled')
     onMissed: true,   // default — alert on late schedule slots too; set false to silence
     onSyncFailed: true, // default — alert when the tasks.json sync fails (see below); set false to silence
+    onStreak: 3,      // optional — alert once per 3-failure streak instead of every failure (default 1 = today's behaviour)
     webhook: {
       url: 'https://hooks.example.com/sched',
       secret: 'whsec_…',              // optional — enables HMAC signature (see below)
@@ -4112,6 +4167,34 @@ Only the **first failure of a streak** fires (dedupe) — a storage that stays
 down for a day does not spam one alert per 60s sync tick. When a sync succeeds,
 the streak resets and the next incident alerts again.
 
+**Streak — one alert per incident.** `onStreak` (default `1`) is the number of
+*consecutive persistent failures* that makes a task an incident worth a message
+(a failure with a retry still scheduled is not counted on its own — the whole
+retry ladder is one incident; its depth shows up as `run.attempt`):
+
+- `onStreak: 1` → **no gate**: every terminal failure alerts — the behaviour
+  every deployment had before this option existed, so an upgrade that changes
+  nothing in config changes nothing in the inbox.
+- `onStreak: N > 1` → the failure alert fires **exactly once per streak**, when
+  the N-th consecutive failure lands. Failures 2..N stay silent, and so does the
+  rest of the streak (no reminders — `consecutiveFailures` is in the payload, and
+  the `FAILS` column in `sched tasks` shows the running state). A success breaks
+  the streak: the next incident alerts again.
+- **«Отпустило» (recovery)** — the success that broke a streak which had reached
+  the threshold carries `previousFailures` (how many failures it ended). It is a
+  `run.succeeded` alert like any other, so it is gated by `on`: with the default
+  `on: ['failed']` no success notification is sent — add `'succeeded'` to receive
+  the release signal. A success below the threshold stays a plain `run.succeeded`,
+  and a `cancelled` run neither counts nor breaks a streak.
+
+The streak is counted in the daemon process (the storage `failCount` is
+*cumulative* — it never resets on success — and a persisted consecutive-counter
+would be a `Storage`-contract change): a restart forgets an in-flight streak, so
+the next failure alerts once more instead of staying silent. Per-task override:
+one `alerts` block per task, same field (`onStreak` merges field-wise, task
+wins). `onSyncFailed` is root-only — sync health is daemon-global, not a per-task
+property.
+
 **Per-task routing.** The root `alerts` block is the channel + defaults; a task can
 override its own routing with a task-level `alerts` block in `tasks.json` (or the
 `tasks` map above for the programmatic path) — field-wise merge, **task wins,
@@ -4135,7 +4218,10 @@ arrays replace**:
   apply to it. A task **without** an `alerts` block keeps the root defaults.
 - `sync-payments` keeps the root `on`/`onMissed` but routes to **its own webhook** —
   the multi-channel escape hatch for criticality ≠ channel.
-- Malformed task `alerts` fails at load (see [Tasks → Per-task alert routing](https://schedjs.github.io/schedjs/tasks#per-task-alert-routing)).
+- Malformed task `alerts` fails at load (see [Tasks → Per-task alert routing](https://schedjs.github.io/schedjs/tasks#per-task-alert-routing));
+  the root `alerts` block is validated by the same rules (`on`/`onMissed`/`onSyncFailed`/`onStreak`/`webhook`,
+  plus the per-task `tasks` map it may carry) — a typo like `onStreak: 0` or `onSyncFailed: "yes"` stops the daemon
+  at startup instead of silently disabling alerting.
 
 Instead of SQLite you can hand the daemon any storage adapter (see
 [Storage](https://schedjs.github.io/schedjs/storage)) — pass `storage` and omit `dbPath`:
@@ -4166,6 +4252,7 @@ Terminal run states — event is `run.<status>` (`run.failed` / `run.succeeded` 
 {
   "version": 1,
   "event": "run.failed",
+  "consecutiveFailures": 3,
   "task": { "name": "publish-video", "runner": "http" },
   "run": {
     "id": "9f1c…",
@@ -4175,6 +4262,20 @@ Terminal run states — event is `run.<status>` (`run.failed` / `run.succeeded` 
     "startedAt": "2026-08-19T09:00:00.000Z",
     "finishedAt": "2026-08-19T09:00:01.000Z"
   }
+}
+```
+
+`consecutiveFailures` rides at the top level (next to `event`, like
+`sync.failed`) and is present on failure alerts only. The success that ends a
+streak which reached `onStreak` carries `previousFailures` instead:
+
+```json
+{
+  "version": 1,
+  "event": "run.succeeded",
+  "previousFailures": 3,
+  "task": { "name": "publish-video", "runner": "http" },
+  "run": { "id": "a41e…", "status": "succeeded", "attempt": 1, "error": null, "startedAt": "2026-08-20T09:00:00.000Z", "finishedAt": "2026-08-20T09:00:02.000Z" }
 }
 ```
 
@@ -4223,7 +4324,8 @@ No `secret` → the POST is unsigned (plain webhook, e.g. into a chat gateway).
 - **Persistent failure = the alert point.** A failed run that still has retries
   scheduled does *not* alert — the notification lands only on the final,
   exhausted failure ([Tasks → retry](https://schedjs.github.io/schedjs/tasks#retry)). Manual `triggerTask` alerts
-  immediately and never auto-retries.
+  immediately and never auto-retries. With `onStreak: N > 1` that point is the
+  N-th consecutive failure (see above); the alert fires once, not once per run.
 - **Missed-slot semantics.** A schedule with run history dispatched more than
   `missedSlotGraceMs` (default 2 min) after its slot fires `missed-slot` —
   engine down at the slot / wedged lock / long queue. The signal is

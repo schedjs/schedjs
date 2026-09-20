@@ -853,3 +853,75 @@ describe('syncTasks — tz-only change (peer-review regression)', () => {
     expect(after!.nextRunAt).toEqual(newNext);
   });
 });
+
+describe('tasks.json — alerts block validation (R1 streak)', () => {
+  const dir = fileURLToPath(new URL('./fixtures', import.meta.url));
+  const tmpPath = () => join(dir, 'tmp-alerts-streak.json');
+
+  const withFile = <T,>(doc: unknown, fn: (path: string) => T): T => {
+    const tmp = tmpPath();
+    writeFileSync(tmp, JSON.stringify(doc));
+    try {
+      return fn(tmp);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+  };
+
+  it('accepts a valid root onStreak and passes it through', () => {
+    const alerts = withFile({ tasks: [], alerts: { onStreak: 3, onSyncFailed: false } }, (p) => readTasksJsonAlertsSync(p));
+    expect(alerts).toEqual({ onStreak: 3, onSyncFailed: false });
+  });
+
+  it('accepts a valid per-task onStreak (1 = the default, explicitly allowed)', () => {
+    const map = withFile(
+      { tasks: [{ name: 'a', config: { url: 'http://a' }, alerts: { onStreak: 2 } }, { name: 'b', config: { url: 'http://b' }, alerts: { onStreak: 1 } }] },
+      (p) => readTasksJsonTaskAlertsSync(p),
+    );
+    expect(map).toEqual({ a: { onStreak: 2 }, b: { onStreak: 1 } });
+  });
+
+  it('rejects a malformed per-task onStreak (string / 0 / negative / fractional)', () => {
+    for (const onStreak of ['3', 0, -1, 2.5]) {
+      const tmp = tmpPath();
+      writeFileSync(tmp, JSON.stringify({ tasks: [{ name: 'a', config: { url: 'http://a' }, alerts: { onStreak } }] }));
+      try {
+        expect(() => readTasksJsonTaskAlertsSync(tmp)).toThrow(/onStreak/);
+      } finally {
+        rmSync(tmp, { force: true });
+      }
+    }
+  });
+
+  it('rejects a malformed per-task onSyncFailed (previously not validated at all)', () => {
+    expect(() =>
+      withFile({ tasks: [{ name: 'a', config: { url: 'http://a' }, alerts: { onSyncFailed: 'yes' } }] }, (p) =>
+        readTasksJsonTaskAlertsSync(p),
+      ),
+    ).toThrow(/onSyncFailed/);
+  });
+
+  it('rejects a malformed root alerts block (the hole that let anything through)', () => {
+    const cases: Array<[unknown, RegExp]> = [
+      [{ onStreak: '3' }, /onStreak/],
+      [{ onStreak: 0 }, /onStreak/],
+      [{ onSyncFailed: 'yes' }, /onSyncFailed/],
+      [{ on: 'failed' }, /alerts"\.on/],
+      [{ on: ['boom'] }, /boom/],
+      [{ onMissed: 1 }, /onMissed/],
+      [{ webhook: { url: 42 } }, /webhook/],
+      [{ webhook: 'http://x' }, /webhook/],
+    ];
+    for (const [alerts, re] of cases) {
+      expect(() => withFile({ tasks: [], alerts }, (p) => readTasksJsonAlertsSync(p))).toThrow(re);
+    }
+  });
+
+  it('validates the per-task map nested in the root alerts block too', () => {
+    expect(() =>
+      withFile({ tasks: [], alerts: { webhook: { url: 'http://x' }, tasks: { a: { onStreak: -2 } } } }, (p) =>
+        readTasksJsonAlertsSync(p),
+      ),
+    ).toThrow(/onStreak/);
+  });
+});

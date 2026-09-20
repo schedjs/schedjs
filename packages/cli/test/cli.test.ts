@@ -298,6 +298,21 @@ describe('@schedjs/cli contract (spawn bin → fixture admin api)', () => {
     expect(parsed.error).toContain('admin');
   });
 
+  it('tasks (human): FAILS column sits after PAUSED — the count, and an em dash for zero', async () => {
+    fixture.seed({ tasks: [task('red', { failCount: 3 }), task('clean', { failCount: 0 })] });
+    const res = await runCli(['tasks', '--admin-url', base]);
+    expect(res.code).toBe(0);
+
+    const lines = res.stdout.trimEnd().split('\n');
+    // FAILS is the streak-visibility column (R1): after PAUSED, before NEXT RUN.
+    expect(lines[0]).toMatch(/^NAME\s+RUNNER\s+PRIORITY\s+PAUSED\s+FAILS\s+NEXT RUN$/);
+
+    const red = lines.find((l) => l.startsWith('red'))!;
+    const clean = lines.find((l) => l.startsWith('clean'))!;
+    expect(red.split(/\s{2,}/)).toEqual(['red', 'http', '0', 'no', '3', '2026-08-19 09:00:00Z']);
+    expect(clean.split(/\s{2,}/)[4]).toBe('—');
+  });
+
   it('EPIPE: stdout closed early (| head) → exit 0, no crash', async () => {
     fixture.seed({ tasks: [task('a')] });
     const res = await new Promise<CliResult>((resolve, reject) => {

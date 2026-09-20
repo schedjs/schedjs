@@ -172,6 +172,32 @@ export interface Runner {
   cancel?(runId: string, statusUrl: string, task?: TaskRecord, cancelUrl?: string | null): Promise<number | void>;
 }
 
+/**
+ * Streak context handed to {@link EngineConfig.onRunFinal} alongside the
+ * finished run — what the alert contract (`onStreak` / `consecutiveFailures` /
+ * «отпустило») is computed from.
+ *
+ * Source: the engine's in-memory consecutive-terminal-failure tracker, keyed by
+ * task name, snapshotted BEFORE the terminal write (the run being finished is
+ * not counted). "Terminal" = the run reached a persistent verdict: a failure
+ * with a retry still scheduled is *not* counted (the whole ladder is one
+ * incident — `run.attempt` carries its depth), and a `cancelled` run counts for
+ * neither side (a human acted, not the pipeline).
+ *
+ * Why not `failCount`: the storage field is *cumulative* — every adapter does
+ * `fail_count += failed ? 1 : 0` and a success never resets it (pinned by the
+ * shared contract suite), so it cannot express «consecutive». A reset-on-success
+ * column would be a Storage-contract change (5 adapters), out of scope for the
+ * streak alert. Accepted cost (design wiki:3700): a daemon restart forgets an
+ * in-flight streak — the next failure re-alerts once instead of staying silent.
+ * No alert is ever *lost*, which is the direction that matters (a red task must
+ * not go quiet).
+ */
+export interface RunFinalContext {
+  /** Terminal (persistent) failures of the current streak BEFORE this run (0 = fresh incident). */
+  previousFailures: number;
+}
+
 export interface EngineConfig {
   storage: Storage;
   runner: Runner;
@@ -179,11 +205,12 @@ export interface EngineConfig {
   now?: () => Date;
   /**
    * Fired after a run reaches a terminal state (succeeded / failed / cancelled),
-   * with the finished RunRecord. Platform-level consumers: status alerts, metrics.
+   * with the finished RunRecord and its streak context. Platform-level
+   * consumers: status alerts, metrics.
    * A failed run that still has retries scheduled does NOT fire the hook — the
    * alert lands only on the final, exhausted failure (persistent fail).
    */
-  onRunFinal?: (run: RunRecord) => void | Promise<void>;
+  onRunFinal?: (run: RunRecord, context: RunFinalContext) => void | Promise<void>;
   /**
    * A schedule dispatched more than `missedSlotGraceMs` after its slot fires a
    * `missed-slot` event (downtime catch-up, wedged lock). Signal is
@@ -375,6 +402,17 @@ export function createEngine(config: EngineConfig): Engine {
   let retentionTimer: NodeJS.Timeout | null = null;
   let ticking = false;
 
+  /**
+   * Consecutive terminal failures per task — the streak behind
+   * {@link RunFinalContext.previousFailures}. In-memory by design: the storage
+   * `failCount` is cumulative (see the interface docs) and a persisted
+   * consecutive-counter would be a Storage-contract change. Only *terminal*
+   * (alert-eligible) runs count: a retry-pending failure is not an incident yet,
+   * and `cancelled` neither counts nor breaks a streak (a human acted, not the
+   * pipeline). Keyed by task name — the same key alerts route on.
+   */
+  const failureStreaks = new Map<string, number>();
+
   /** Emit an engine-lifecycle event; observer errors never break the engine. */
   function fire(event: EngineEvent): void {
     if (!config.onEvent) return;
@@ -529,6 +567,13 @@ export function createEngine(config: EngineConfig): Engine {
 
   function recordFinish(taskName: string, runId: string, outcome: SyncOutcome, attempt: number, notify = true): Promise<void> {
     fire(outcomeEvent(taskName, runId, outcome, attempt));
+    // Streak snapshot BEFORE the terminal write (the run in flight is not
+    // counted yet). The counter itself is advanced only AFTER the write lands
+    // (below) — a failed write must not move a streak for a run that never went
+    // terminal — and only for terminal, alert-eligible runs: a retry-pending
+    // failure (`notify: false`) leaves the incident open, and `cancelled` is
+    // neither a failure nor a recovery.
+    const previousFailures = failureStreaks.get(taskName) ?? 0;
     return (async () => {
       // Snapshot BEFORE finishRun — the final hook must not re-read storage
       // after the terminal write (a read failure there silently loses the
@@ -544,7 +589,11 @@ export function createEngine(config: EngineConfig): Engine {
         log: outcome.log ?? null,
         artifacts: outcome.artifacts ?? null,
       });
-      if (finalRecord) await config.onRunFinal!(finalRecord);
+      if (notify) {
+        if (outcome.status === 'failed') failureStreaks.set(taskName, previousFailures + 1);
+        else if (outcome.status === 'succeeded') failureStreaks.delete(taskName);
+      }
+      if (finalRecord) await config.onRunFinal!(finalRecord, { previousFailures });
     })();
   }
 

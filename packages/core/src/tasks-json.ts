@@ -134,14 +134,19 @@ export interface RunnerCeilings {
 const SCHEDULE_KEYS = ['cron', 'interval', 'once'] as const;
 
 class TasksJsonError extends Error {
-  constructor(taskName: string, detail: string) {
-    super(`tasks.json: task "${taskName}": ${detail}`);
+  constructor(taskName: string | null, detail: string) {
+    super(taskName === null ? `tasks.json: ${detail}` : `tasks.json: task "${taskName}": ${detail}`);
     this.name = 'TasksJsonError';
   }
 }
 
 function fail(name: string, detail: string): never {
   throw new TasksJsonError(name, detail);
+}
+
+/** Root-block failure — `tasks.json: "alerts".…` (no task context to name). */
+function failRoot(detail: string): never {
+  throw new TasksJsonError(null, detail);
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -535,35 +540,76 @@ export function readTasksJsonAlertsSync(path: string): AlertsConfig | undefined 
   }
   const alerts = doc.alerts;
   if (alerts === undefined) return undefined;
-  if (typeof alerts !== 'object' || alerts === null || Array.isArray(alerts)) {
-    throw new Error('tasks.json: "alerts" must be an object');
-  }
-  return alerts as AlertsConfig;
+  return validateRootAlertsBlock(alerts);
 }
 
 const TERMINAL_STATUSES: RunStatus[] = ['succeeded', 'failed', 'cancelled'];
 
+/**
+ * The one validator for an `alerts` block — root and per-task accept exactly
+ * the same keys (the daemon merges them field-wise, task wins), so they must
+ * be checked by the same rules. Returns the failure message, or null when the
+ * block is well-formed; `label` is the location in that message (`"alerts"`
+ * for the root block). A key we don't know is left alone (forward compatible).
+ */
+function alertsFieldError(block: Record<string, unknown>, label: string): string | null {
+  if (block.on !== undefined) {
+    if (!Array.isArray(block.on) || block.on.some((s) => !TERMINAL_STATUSES.includes(s as RunStatus))) {
+      return `${label}.on must be an array of terminal statuses (${TERMINAL_STATUSES.join(', ')}), got ${JSON.stringify(block.on)}`;
+    }
+  }
+  if (block.onMissed !== undefined && typeof block.onMissed !== 'boolean') {
+    return `${label}.onMissed must be a boolean, got ${JSON.stringify(block.onMissed)}`;
+  }
+  if (block.onSyncFailed !== undefined && typeof block.onSyncFailed !== 'boolean') {
+    return `${label}.onSyncFailed must be a boolean, got ${JSON.stringify(block.onSyncFailed)}`;
+  }
+  if (block.onStreak !== undefined && (!Number.isInteger(block.onStreak as number) || (block.onStreak as number) < 1)) {
+    return `${label}.onStreak must be an integer >= 1, got ${JSON.stringify(block.onStreak)}`;
+  }
+  if (block.webhook !== undefined) {
+    if (!isPlainObject(block.webhook) || typeof (block.webhook as Record<string, unknown>).url !== 'string') {
+      return `${label}.webhook must be an object with a string "url", got ${JSON.stringify(block.webhook)}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Validate one per-task `alerts` override (fail-fast: a typo like
+ * `onStreak: 0` or `onSyncFailed: "yes"` must not silently change alerting).
+ */
 function validateTaskAlertsBlock(taskName: string, alerts: unknown): void {
   if (!isPlainObject(alerts)) {
     fail(taskName, 'alerts must be an object');
   }
+  const detail = alertsFieldError(alerts as Record<string, unknown>, 'alerts');
+  if (detail !== null) fail(taskName, detail);
+}
+
+/**
+ * Validate the top-level `alerts` block. It used to be cast straight to
+ * `AlertsConfig` — anything at all was accepted (a typo disabled alerting in
+ * silence), so the root block ran through no validation while the per-task
+ * blocks did. Same rules as a per-task block, plus the `tasks` routing map it
+ * may carry: every entry is a per-task block by shape.
+ */
+function validateRootAlertsBlock(alerts: unknown): AlertsConfig {
+  if (!isPlainObject(alerts)) {
+    failRoot('"alerts" must be an object');
+  }
   const block = alerts as Record<string, unknown>;
-  if (block.on !== undefined) {
-    if (!Array.isArray(block.on) || block.on.some((s) => !TERMINAL_STATUSES.includes(s as RunStatus))) {
-      fail(
-        taskName,
-        `alerts.on must be an array of terminal statuses (${TERMINAL_STATUSES.join(', ')}), got ${JSON.stringify(block.on)}`,
-      );
+  const detail = alertsFieldError(block, '"alerts"');
+  if (detail !== null) failRoot(detail);
+  if (block.tasks !== undefined) {
+    if (!isPlainObject(block.tasks)) {
+      failRoot('"alerts".tasks must be an object keyed by task name');
+    }
+    for (const [name, entry] of Object.entries(block.tasks as Record<string, unknown>)) {
+      validateTaskAlertsBlock(name, entry);
     }
   }
-  if (block.onMissed !== undefined && typeof block.onMissed !== 'boolean') {
-    fail(taskName, `alerts.onMissed must be a boolean, got ${JSON.stringify(block.onMissed)}`);
-  }
-  if (block.webhook !== undefined) {
-    if (!isPlainObject(block.webhook) || typeof (block.webhook as Record<string, unknown>).url !== 'string') {
-      fail(taskName, `alerts.webhook must be an object with a string "url", got ${JSON.stringify(block.webhook)}`);
-    }
-  }
+  return alerts as AlertsConfig;
 }
 
 /**

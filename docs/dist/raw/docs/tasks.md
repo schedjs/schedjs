@@ -27,6 +27,7 @@ tasks are disabled.
   "alerts": {
     "on": ["failed"],
     "onMissed": true,
+    "onStreak": 1,
     "webhook": {
       "url": "https://hooks.example.com/ops",
       "secret": "whsec_…"
@@ -73,10 +74,14 @@ The root `alerts` block is the **channel + defaults** for the whole daemon. A ta
 while `publish-video` (no override) keeps the root default `on: ["failed"]`.
 - `alerts.onMissed: false` opts a task out of [missed-slot](self-hosting#status-alerts)
 alerts; `alerts.webhook` routes that task to a **different channel** (e.g. a critical
-task pages PagerDuty while the rest go to Slack).
+task pages PagerDuty while the rest go to Slack). `alerts.onStreak: N` alerts once per
+N-failure streak instead of once per failure (default `1` = every terminal failure) —
+see [Self-hosting → Status alerts](self-hosting#status-alerts) for the recovery
+(«отпустило») signal.
 - A task without an `alerts` block uses the root defaults — no behavior change.
-- Malformed task `alerts` (bad status, non-boolean `onMissed`, webhook without a
-string `url`) fails at load, not on runs.
+- Malformed `alerts` (bad status, non-boolean `onMissed`/`onSyncFailed`, `onStreak`
+that is not an integer ≥ 1, webhook without a string `url`) fails at load, not on
+runs — in the root block and in a per-task block alike.
 
 ## Priority, retry and the run deadline
 

@@ -374,3 +374,121 @@ describe('alerts — per-task routing', () => {
     });
   });
 });
+
+describe('alerts — streak threshold (onStreak)', () => {
+  const webhook = { url: 'https://hooks.example.com/ops' };
+  /** A failing terminal run with `n` failures already recorded before it. */
+  const failAt = (previousFailures: number) => [makeRun(), { previousFailures }] as const;
+  const ctx = (previousFailures: number) => ({ previousFailures });
+
+  it('onStreak=1 (default) is today’s behaviour: every terminal failure alerts', async () => {
+    const { alerts, fetchMock } = makeAlerts({ webhook }, async () => ok());
+
+    await alerts.handleFinal(makeRun(), ctx(0));
+    await alerts.handleFinal(makeRun(), ctx(1));
+    await alerts.handleFinal(makeRun({ status: 'succeeded', error: null }), ctx(0));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // two failures; 'succeeded' is not in `on`
+    expect(bodyOf(fetchMock.mock.calls[0]!).consecutiveFailures).toBe(1);
+    expect(bodyOf(fetchMock.mock.calls[1]!).consecutiveFailures).toBe(2);
+  });
+
+  it('fires exactly at onStreak and stays silent inside the streak', async () => {
+    const { alerts, fetchMock } = makeAlerts({ onStreak: 3, webhook }, async () => ok());
+
+    await alerts.handleFinal(...failAt(0)); // 1st of the streak — below the threshold
+    await alerts.handleFinal(...failAt(1)); // 2nd
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await alerts.handleFinal(...failAt(2)); // 3rd — the crossing run
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const payload = bodyOf(fetchMock.mock.calls[0]!);
+    expect(payload.event).toBe('run.failed');
+    expect(payload.consecutiveFailures).toBe(3);
+
+    await alerts.handleFinal(...failAt(3)); // 4th — one alert per streak, no reminders
+    await alerts.handleFinal(...failAt(9));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-arms after the streak is broken by a success', async () => {
+    const { alerts, fetchMock } = makeAlerts({ on: ['failed', 'succeeded'], onStreak: 2, webhook }, async () => ok());
+
+    await alerts.handleFinal(...failAt(0)); // 1st
+    await alerts.handleFinal(...failAt(1)); // 2nd → fires
+    await alerts.handleFinal(makeRun({ status: 'succeeded', error: null }), ctx(2)); // breaks the streak
+    await alerts.handleFinal(...failAt(0)); // new incident, 1st — silent
+    expect(fetchMock).toHaveBeenCalledTimes(2); // the 2nd failure + the success
+
+    await alerts.handleFinal(...failAt(1)); // new incident, 2nd → fires again
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(bodyOf(fetchMock.mock.calls[2]!).consecutiveFailures).toBe(2);
+  });
+
+  it('sends «отпустило» as run.succeeded + previousFailures after a streak ≥ onStreak', async () => {
+    const { alerts, fetchMock } = makeAlerts({ on: ['failed', 'succeeded'], onStreak: 3, webhook }, async () => ok());
+
+    await alerts.handleFinal(makeRun({ status: 'succeeded', error: null }), ctx(3));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const payload = bodyOf(fetchMock.mock.calls[0]!);
+    expect(payload.event).toBe('run.succeeded');
+    expect(payload.previousFailures).toBe(3);
+    expect(payload).not.toHaveProperty('consecutiveFailures');
+  });
+
+  it('a success below the threshold is a plain run.succeeded (no previousFailures)', async () => {
+    const { alerts, fetchMock } = makeAlerts({ on: ['failed', 'succeeded'], onStreak: 3, webhook }, async () => ok());
+
+    await alerts.handleFinal(makeRun({ status: 'succeeded', error: null }), ctx(0));
+    await alerts.handleFinal(makeRun({ status: 'succeeded', error: null }), ctx(2));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(bodyOf(fetchMock.mock.calls[0]!)).not.toHaveProperty('previousFailures');
+    expect(bodyOf(fetchMock.mock.calls[1]!)).not.toHaveProperty('previousFailures');
+  });
+
+  it('never sends previousFailures on cancelled (a cancel is not a recovery)', async () => {
+    const { alerts, fetchMock } = makeAlerts({ on: ['failed', 'cancelled'], onStreak: 2, webhook }, async () => ok());
+
+    await alerts.handleFinal(makeRun({ status: 'cancelled', error: 'user' }), ctx(5));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // today’s cancelled alert, unchanged
+    const payload = bodyOf(fetchMock.mock.calls[0]!);
+    expect(payload.event).toBe('run.cancelled');
+    expect(payload).not.toHaveProperty('previousFailures');
+    expect(payload).not.toHaveProperty('consecutiveFailures');
+  });
+
+  it('respects `on`: «отпустило» is a run.succeeded alert, so a failed-only channel stays silent on success', async () => {
+    const { alerts, fetchMock } = makeAlerts({ onStreak: 2, webhook }, async () => ok()); // on: ['failed'] by default
+
+    await alerts.handleFinal(makeRun({ status: 'succeeded', error: null }), ctx(7));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('resolves onStreak per task (field-wise override, root is the fallback)', async () => {
+    const { alerts, fetchMock } = makeAlerts(
+      { onStreak: 3, webhook, tasks: { 'task-b': { onStreak: 1 } } },
+      async () => ok(),
+    );
+
+    await alerts.handleFinal(makeRun({ taskName: 'task-a' }), ctx(0)); // root: 3 → silent
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await alerts.handleFinal(makeRun({ taskName: 'task-b' }), ctx(0)); // override: 1 → fires
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bodyOf(fetchMock.mock.calls[0]!).consecutiveFailures).toBe(1);
+  });
+
+  it('treats a run without streak context as the first failure of a streak', async () => {
+    // External callers that wire handleFinal by hand get a deterministic default:
+    // no context → the run counts as failure #1 (below an onStreak of 2).
+    const { alerts, fetchMock } = makeAlerts({ onStreak: 2, webhook }, async () => ok());
+
+    await alerts.handleFinal(makeRun());
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

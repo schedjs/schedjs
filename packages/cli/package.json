@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/cli",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Cron scheduler CLI for Node.js — status, runs, tasks, schedules, trigger/pause/resume via the admin API + worker conformance checker",
   "type": "module",
   "main": "./dist/index.js",

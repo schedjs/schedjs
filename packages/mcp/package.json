@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/mcp",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Cron scheduler MCP server (Model Context Protocol) for Node.js — AI control plane: list/get tasks & runs, trigger/pause/resume, delete",
   "type": "module",
   "main": "./dist/index.js",

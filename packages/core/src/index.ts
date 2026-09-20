@@ -7,7 +7,7 @@ export type { Storage, CompleteResult, RunUpdate, RunFinish, RunFilter, PruneRun
 export { assertValidInputSchema, applyInputDefaults, validateInput, InputValidationError } from './input-schema.js';
 export type { InputValidationIssue, InputValidationResult } from './input-schema.js';
 export { createEngine } from './engine.js';
-export type { Engine, EngineConfig, Runner, RunnerRunHooks, RunOutcome, PollResult, EngineEvent, TriggerTaskOptions } from './engine.js';
+export type { Engine, EngineConfig, Runner, RunnerRunHooks, RunOutcome, PollResult, EngineEvent, RunFinalContext, TriggerTaskOptions } from './engine.js';
 export { createEventLogger } from './event-logger.js';
 export type { EventLoggerOptions } from './event-logger.js';
 export { createTaskOps } from './task-ops.js';

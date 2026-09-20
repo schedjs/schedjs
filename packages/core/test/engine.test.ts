@@ -2441,3 +2441,126 @@ describe('engine — missed-slot detection', () => {
     expect(missed).toHaveLength(1);
   });
 });
+
+describe('engine — onRunFinal streak context (R1 alerts)', () => {
+  it('reports consecutive terminal failures and re-arms after a success', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask());
+    let mode: 'fail' | 'ok' | 'cancelled' = 'fail';
+    const { runner } = makeRunner(async () =>
+      mode === 'fail' ? { status: 'failed', error: 'boom' } : mode === 'ok' ? { status: 'succeeded' } : { status: 'cancelled', error: 'user' },
+    );
+    const contexts: number[] = [];
+    const engine = createEngine({
+      storage,
+      runner,
+      now: () => NOON,
+      onRunFinal: (_run, context) => { contexts.push(context.previousFailures); },
+    });
+
+    await engine.triggerTask('task-a'); // failure 1 — nothing before it
+    await engine.triggerTask('task-a'); // failure 2 — one before it
+    await engine.triggerTask('task-a'); // failure 3 — two before it
+    mode = 'cancelled';
+    await engine.triggerTask('task-a'); // a cancel neither counts nor resets
+    mode = 'ok';
+    await engine.triggerTask('task-a'); // success breaks the streak of three
+    mode = 'fail';
+    await engine.triggerTask('task-a'); // a fresh incident starts from zero
+
+    // 0,1,2 → the three failures; 3 → the cancel reports the open streak and
+    // leaves it open; 3 → the success reports the streak it broke; 0 → re-armed.
+    expect(contexts).toEqual([0, 1, 2, 3, 3, 0]);
+  });
+
+  it('counts only the terminal failure of a retry chain (a retry-pending failure is not an incident)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ retry: { maxAttempts: 2, backoffMs: 60_000 }, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner } = makeRunner(async () => ({ status: 'failed', error: 'boom' }));
+    const contexts: number[] = [];
+    const engine = createEngine({
+      storage,
+      runner,
+      now: () => NOON,
+      onRunFinal: (_run, context) => { contexts.push(context.previousFailures); },
+    });
+
+    await engine.runOnce(); // attempt 1 — retry pending, no terminal hook, streak untouched
+    await engine.runOnce(new Date('2026-08-16T12:01:00Z')); // attempt 2 — exhausted, the incident
+
+    expect(contexts).toEqual([0]);
+  });
+
+  it('hands the snapshot taken BEFORE the terminal write (the run in flight is not counted)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner } = makeRunner(async () => ({ status: 'failed', error: 'boom' }));
+    const contexts: number[] = [];
+    const engine = createEngine({
+      storage,
+      runner,
+      now: () => NOON,
+      onRunFinal: (_run, context) => { contexts.push(context.previousFailures); },
+    });
+
+    await engine.runOnce();
+    expect(contexts).toEqual([0]); // not 1 — the counter is read before the finish write
+
+    await engine.runOnce(new Date('2026-08-17T09:00:00Z'));
+    expect(contexts).toEqual([0, 1]);
+  });
+
+  it('keeps the streak separate per task', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ name: 'task-a' }));
+    await seedTask(storage, makeTask({ name: 'task-b' }));
+    const { runner } = makeRunner(async () => ({ status: 'failed', error: 'boom' }));
+    const seen: string[] = [];
+    const engine = createEngine({
+      storage,
+      runner,
+      now: () => NOON,
+      onRunFinal: (run, context) => { seen.push(`${run.taskName}:${context.previousFailures}`); },
+    });
+
+    await engine.triggerTask('task-a');
+    await engine.triggerTask('task-b');
+    await engine.triggerTask('task-a');
+
+    expect(seen).toEqual(['task-a:0', 'task-b:0', 'task-a:1']);
+  });
+});
+
+describe('engine — streak bookkeeping follows the terminal write', () => {
+  it('does not advance the streak when the finish write fails (no double-count)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask());
+    let failWrites = true;
+    const flaky = new Proxy(storage, {
+      get(target, prop, receiver) {
+        if (prop === 'finishRun' && failWrites) {
+          return async () => {
+            throw new Error('storage down');
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as Storage;
+    const { runner } = makeRunner(async () => ({ status: 'failed', error: 'boom' }));
+    const contexts: number[] = [];
+    const engine = createEngine({
+      storage: flaky,
+      runner,
+      now: () => NOON,
+      onRunFinal: (_run, context) => { contexts.push(context.previousFailures); },
+    });
+
+    await expect(engine.triggerTask('task-a')).rejects.toThrow('storage down');
+    expect(contexts).toEqual([]); // no terminal record, no hook
+
+    failWrites = false;
+    await engine.triggerTask('task-a');
+    // The failed write left the counter where it was: this is still failure #1.
+    expect(contexts).toEqual([0]);
+  });
+});

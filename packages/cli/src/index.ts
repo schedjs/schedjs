@@ -264,8 +264,18 @@ async function cmdTasks(client: AdminApiClient, json: boolean): Promise<void> {
   }
   process.stdout.write(
     formatTable(
-      ['NAME', 'RUNNER', 'PRIORITY', 'PAUSED', 'NEXT RUN'],
-      tasks.map((t) => [field(t, 'name'), field(t, 'runner'), field(t, 'priority'), t.paused ? 'yes' : 'no', shortTime(t.nextRunAt as string)]),
+      ['NAME', 'RUNNER', 'PRIORITY', 'PAUSED', 'FAILS', 'NEXT RUN'],
+      tasks.map((t) => [
+        field(t, 'name'),
+        field(t, 'runner'),
+        field(t, 'priority'),
+        t.paused ? 'yes' : 'no',
+        // FAILS — how long a task has been red, without waiting for a reminder
+        // (R1: no timer-based "still failing" notes). Zero prints as an em
+        // dash: a column of dashes reads as "nothing is red" at a glance.
+        typeof t.failCount === 'number' && t.failCount > 0 ? String(t.failCount) : '—',
+        shortTime(t.nextRunAt as string),
+      ]),
     ) + '\n',
   );
 }
