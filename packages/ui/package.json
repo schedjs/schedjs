@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/ui",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Cron scheduler admin web UI — framework-agnostic Lit components + standalone dashboard (`sched-ui serve`)",
   "type": "module",
   "main": "./dist/index.js",

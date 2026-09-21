@@ -10,7 +10,7 @@ history is summarized below and fully preserved in the git log.
 - **R2+R3+R4 — пауза очереди, окно ранов, массовые операции** (волна core
   **0.56.0** → storage-mongo **0.6.0** / storage-mysql **0.5.0** /
   storage-postgres **0.5.0** → admin-api **0.4.0** → mcp **0.6.0** →
-  daemon **0.13.3** → cli **0.3.0**).
+  ui **0.4.0** → daemon **0.13.3** → cli **0.3.0**).
   - **Очередь на паузе, демон на ходу.** `engine.pause()` / `resume()`
     (`isPaused()` / `getPauseInfo()`) замораживают только клейм: синк
     `tasks.json`, retention/prune, poll-loop и алерты по уже идущим ранам
@@ -48,8 +48,16 @@ history is summarized below and fully preserved in the git log.
     (`^0.6.0`). Ради адаптеров волна и идёт: у `storage-mongo 0.5.1` под
     патчем лежала вложенная копия core 0.53.0 — после 0.6.0/0.5.0 дерево
     потребителя резолвит один core.
-  - **UI-часть** (фильтры ранов, массовые операции, индикатор паузы) выходит
-    отдельной волной `@schedjs/ui` со своим ручным смоуком дашборда.
+  - **Дашборд (`@schedjs/ui 0.4.0`).** Фильтры ранов в строке над списком
+    (`task` / `since` / `until` / `runner`, окно по `started_at`, включительные
+    границы): живут в состоянии компонента — **переживают пагинацию**, а `clear`
+    сбрасывает все четыре. Массовые **cancel/retry** по чекбоксам строк:
+    результат **частичный и честный** — ок-счётчик плюс каждый проваленный id с
+    причиной (`not-found` / `already-terminal` / `not-cancellable`, `no-answer`
+    достраивается на клиенте, поэтому id не пропадает молча); проваленные
+    остаются отмеченными — это ровно та работа, которая не сделалась. В шапке —
+    виджет очереди `queue: active` / `queue: paused (since …)` с одной кнопкой
+    pause/resume поверх идемпотентных роутов. Доки — `11.ui.md`.
   - Доки: `00.whats-new.md`, `05.runs.md`, `10.admin-api.md`, `12.mcp.md`,
     `13.cli.md`, `14.self-hosting.md`, `08.storage/*`.
 
