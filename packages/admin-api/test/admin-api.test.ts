@@ -77,15 +77,50 @@ const stubEngine = (
   cancelResult,
 });
 
+/**
+ * Engine-semantics queue stub for R2 route tests: `pause` is idempotent (keeps
+ * the original `pausedAt`), `resume` on an active queue is a no-op — exactly
+ * like `Engine.pause/resume`. The API must not invent timestamps itself.
+ */
+const stubQueue = (initial: { paused: boolean; pausedAt: Date | null; startPaused: boolean }) => {
+  const state = { ...initial };
+  const calls = { pause: 0, resume: 0 };
+  return {
+    state,
+    calls,
+    pause(): void {
+      calls.pause += 1;
+      if (state.paused) return; // idempotent: keep the original pausedAt
+      state.paused = true;
+      state.pausedAt = new Date('2026-09-20T10:00:00Z');
+    },
+    async resume(): Promise<{ pausedMs: number; skippedSchedules: number; deferredRuns: number }> {
+      calls.resume += 1;
+      if (!state.paused) return { pausedMs: 0, skippedSchedules: 0, deferredRuns: 0 };
+      state.paused = false;
+      state.pausedAt = null;
+      state.startPaused = false;
+      return { pausedMs: 1000, skippedSchedules: 0, deferredRuns: 0 };
+    },
+    getPauseInfo() {
+      return { paused: state.paused, pausedAt: state.pausedAt, startPaused: state.startPaused };
+    },
+  };
+};
+
+type StubQueue = ReturnType<typeof stubQueue>;
+
 async function start(opts: {
   storage: ReturnType<typeof createSqliteStorage>;
   engine?: StubEngine;
   apiKey?: string;
   version?: string;
   now?: () => Date;
+  queue?: StubQueue;
 }) {
   const engine = opts.engine ?? stubEngine(async () => makeRun('r-trigger'));
   const api = createAdminApi({
+    ...(opts.queue ? { queue: opts.queue } : {}),
     engine: {
       triggerTask: async (name: string, o?: unknown) => {
         engine.triggerCalls.push({ name, opts: o });
@@ -114,6 +149,7 @@ async function start(opts: {
     close: () => api.close(),
   };
 }
+
 
 describe('admin api', () => {
   const servers: Array<{ close: () => Promise<void> }> = [];
@@ -505,6 +541,46 @@ describe('admin api', () => {
     expect(((await tzRes.json()) as { schedule: ScheduleRecord }).schedule.tz).toBe('Asia/Tokyo');
     expect((await fetch(`${base}/schedules/nope`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tz: 'UTC' }) })).status).toBe(404);
     expect(sched).not.toBeNull();
+  });
+
+  it('PATCH recomputes nextRunAt when the RULE-inner timezone changes (stale nextRunAt regression)', async () => {
+    const storage = freshStorage();
+    await storage.upsertTask(makeTask('a'));
+    await storage.createSchedule(
+      makeSchedule({ id: 'a', taskName: 'a', schedule: { kind: 'cron', cron: '0 9 * * *' }, tz: 'UTC', nextRunAt: new Date('2026-08-17T09:00:00Z') }),
+    );
+    // mutable clock: the negative case below advances it PAST the stored
+    // nextRunAt, so a spurious recompute would roll the pointer a full day
+    // forward while a true no-op leaves the stored value untouched.
+    let nowMs = Date.parse('2026-08-16T12:00:00Z');
+    const { base } = await startTracked({ storage, now: () => new Date(nowMs) });
+    // rule unchanged, only the entry's inner timezone flips → effective tz changed
+    const res = await fetch(`${base}/schedules/a`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ schedule: { cron: '0 9 * * *', timezone: 'Asia/Tokyo' } }),
+    });
+    expect(res.status).toBe(200);
+    const updated = ((await res.json()) as { schedule: ScheduleRecord }).schedule;
+    expect(updated.tz).toBe('Asia/Tokyo');
+    // 09:00 Tokyo = 00:00 UTC; the next occurrence after 2026-08-16T12:00Z is 2026-08-17T00:00Z
+    expect(Date.parse(updated.nextRunAt as unknown as string)).toBe(Date.parse('2026-08-17T00:00:00Z'));
+
+    // negative case: a patch that changes neither the rule nor the effective tz
+    // must NOT move nextRunAt (no spurious recompute). Jump the clock past
+    // nextRunAt first — otherwise a same-value recompute would be invisible.
+    nowMs = Date.parse('2026-08-17T01:00:00Z');
+    const noopRes = await fetch(`${base}/schedules/a`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ schedule: { cron: '0 9 * * *', data: { note: 'no-op' } } }),
+    });
+    expect(noopRes.status).toBe(200);
+    const noop = ((await noopRes.json()) as { schedule: ScheduleRecord }).schedule;
+    expect(noop.tz).toBe('Asia/Tokyo');
+    expect(noop.data).toEqual({ note: 'no-op' });
+    // stored pointer survives: 2026-08-17T00:00Z, NOT 2026-08-18T00:00Z
+    expect(Date.parse(noop.nextRunAt as unknown as string)).toBe(Date.parse('2026-08-17T00:00:00Z'));
   });
 
   it('hoists an inner cron timezone over the task tz when no explicit tz is given (r8 #4 F1)', async () => {
@@ -1156,6 +1232,226 @@ describe('admin api', () => {
     expect((await fetch(`${base}/tasks`, { headers: { Authorization: 'Bearer wrong' } })).status).toBe(401);
     const ok = await fetch(`${base}/tasks`, { headers: { Authorization: 'Bearer secret-1' } });
     expect(ok.status).toBe(200);
+  });
+
+  describe('R2 — queue pause routes', () => {
+    const FROZEN = '2026-09-20T10:00:00.000Z';
+
+    it('GET /queue reports engine state; pause/resume are idempotent (200 + same state)', async () => {
+      const storage = freshStorage();
+      const queue = stubQueue({ paused: false, pausedAt: null, startPaused: false });
+      const { base } = await startTracked({ storage, queue });
+
+      const active = await fetch(`${base}/queue`);
+      expect(active.status).toBe(200);
+      expect(await active.json()).toEqual({ paused: false, pausedAt: null, startPaused: false });
+
+      const paused = await fetch(`${base}/queue/pause`, { method: 'POST' });
+      expect(paused.status).toBe(200);
+      expect(await paused.json()).toEqual({ ok: true, paused: true, pausedAt: FROZEN });
+      expect(await (await fetch(`${base}/queue`)).json()).toEqual({
+        paused: true,
+        pausedAt: FROZEN,
+        startPaused: false,
+      });
+
+      // repeat pause → 200 and the SAME pausedAt (idempotent, never 409)
+      const again = await fetch(`${base}/queue/pause`, { method: 'POST' });
+      expect(again.status).toBe(200);
+      expect(((await again.json()) as { pausedAt: string | null }).pausedAt).toBe(FROZEN);
+
+      const resumed = await fetch(`${base}/queue/resume`, { method: 'POST' });
+      expect(resumed.status).toBe(200);
+      expect(await resumed.json()).toEqual({ ok: true, paused: false, pausedAt: null });
+      // repeat resume → 200, still active
+      const resumedAgain = await fetch(`${base}/queue/resume`, { method: 'POST' });
+      expect(resumedAgain.status).toBe(200);
+      expect(await resumedAgain.json()).toEqual({ ok: true, paused: false, pausedAt: null });
+      expect(queue.calls).toEqual({ pause: 2, resume: 2 });
+    });
+
+    it('GET /queue surfaces a start-paused freeze (pausedAt at process start)', async () => {
+      const queue = stubQueue({ paused: true, pausedAt: new Date('2026-09-20T09:30:00Z'), startPaused: true });
+      const { base } = await startTracked({ storage: freshStorage(), queue });
+      expect(await (await fetch(`${base}/queue`)).json()).toEqual({
+        paused: true,
+        pausedAt: '2026-09-20T09:30:00.000Z',
+        startPaused: true,
+      });
+    });
+
+    it('queue routes sit behind the api key; /health stays open AND queue-free', async () => {
+      const queue = stubQueue({ paused: true, pausedAt: new Date('2026-09-20T09:30:00Z'), startPaused: true });
+      const { base } = await startTracked({ storage: freshStorage(), apiKey: 'secret-1', queue });
+
+      expect((await fetch(`${base}/queue`)).status).toBe(401);
+      expect((await fetch(`${base}/queue/pause`, { method: 'POST' })).status).toBe(401);
+      expect((await fetch(`${base}/queue/resume`, { method: 'POST' })).status).toBe(401);
+
+      const health = await fetch(`${base}/health`);
+      expect(health.status).toBe(200);
+      expect(await health.json()).not.toHaveProperty('paused');
+    });
+
+    it('without a queue accessor the routes answer 501 (no fake state, no generic 404)', async () => {
+      const { base } = await startTracked({ storage: freshStorage() });
+      expect((await fetch(`${base}/queue`)).status).toBe(501);
+      expect((await fetch(`${base}/queue/pause`, { method: 'POST' })).status).toBe(501);
+      expect((await fetch(`${base}/queue/resume`, { method: 'POST' })).status).toBe(501);
+    });
+  });
+
+  describe('R3 — bulk cancel/retry', () => {
+    const post = (base: string, path: string, body: unknown) =>
+      fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    it('cancel: mixed batch → partial ok/failed (not-found, already-terminal)', async () => {
+      const storage = freshStorage();
+      await storage.createRun(makeRun('r-live', { status: 'running' }));
+      await storage.createRun(makeRun('r-done', { status: 'succeeded', finishedAt: new Date() }));
+      const engine = stubEngine(async () => null, async () => null, async (id) => {
+        await storage.finishRun(id, { status: 'cancelled' });
+        return storage.getRun(id);
+      });
+      const { base } = await startTracked({ storage, engine });
+
+      const res = await post(base, '/runs/bulk/cancel', { ids: ['r-live', 'r-done', 'r-nope'] });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: ['r-live'],
+        failed: [
+          { id: 'r-done', reason: 'already-terminal' },
+          { id: 'r-nope', reason: 'not-found' },
+        ],
+      });
+      expect(engine.cancelCalls).toEqual(['r-live']);
+      expect((await storage.getRun('r-live'))!.status).toBe('cancelled');
+
+      // second batch with the SAME id → already-terminal, never 500
+      const repeat = await post(base, '/runs/bulk/cancel', { ids: ['r-live'] });
+      expect(repeat.status).toBe(200);
+      expect(await repeat.json()).toEqual({
+        ok: [],
+        failed: [{ id: 'r-live', reason: 'already-terminal' }],
+      });
+    });
+
+    it('cancel: a present run the engine declines → not-cancellable', async () => {
+      const storage = freshStorage();
+      await storage.createRun(makeRun('r-stuck', { status: 'running' }));
+      const engine = stubEngine(async () => null, async () => null, async () => null);
+      const { base } = await startTracked({ storage, engine });
+
+      expect(await (await post(base, '/runs/bulk/cancel', { ids: ['r-stuck'] })).json()).toEqual({
+        ok: [],
+        failed: [{ id: 'r-stuck', reason: 'not-cancellable' }],
+      });
+    });
+
+    it('retry: partial — valid id retried, unknown id → not-found', async () => {
+      const storage = freshStorage();
+      await storage.createRun(makeRun('r-old', { status: 'failed', finishedAt: new Date() }));
+      const engine = stubEngine(
+        async () => null,
+        async (id) => (id === 'r-old' ? makeRun('r-new', { retryOf: id, trigger: 'manual' }) : null),
+      );
+      const { base } = await startTracked({ storage, engine });
+
+      const res = await post(base, '/runs/bulk/retry', { ids: ['r-old', 'r-nope'] });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: ['r-old'],
+        failed: [{ id: 'r-nope', reason: 'not-found' }],
+      });
+      expect(engine.retryCalls).toEqual(['r-old']);
+    });
+
+    it('body validation: empty ids → 400, >100 ids → 422, bad shapes → 400', async () => {
+      const storage = freshStorage();
+      const { base } = await startTracked({ storage });
+
+      for (const path of ['/runs/bulk/cancel', '/runs/bulk/retry']) {
+        const empty = await post(base, path, { ids: [] });
+        expect(empty.status).toBe(400);
+        expect(((await empty.json()) as { error: string }).error).toContain('ids');
+
+        const tooMany = await post(base, path, { ids: Array.from({ length: 101 }, (_, i) => `r-${i}`) });
+        expect(tooMany.status).toBe(422);
+        expect(((await tooMany.json()) as { error: string }).error).toContain('100');
+
+        expect((await post(base, path, {})).status).toBe(400);
+        expect((await post(base, path, { ids: 'r-1' })).status).toBe(400);
+        expect((await post(base, path, { ids: [1] })).status).toBe(400);
+        expect((await post(base, path, { ids: ['r-1', ''] })).status).toBe(400);
+      }
+      // exactly 100 is allowed (not 422)
+      const hundred = await post(base, '/runs/bulk/cancel', {
+        ids: Array.from({ length: 100 }, (_, i) => `r-${i}`),
+      });
+      expect(hundred.status).toBe(200);
+      expect(((await hundred.json()) as { failed: unknown[] }).failed).toHaveLength(100); // all not-found
+    });
+
+    it('bulk must not be swallowed by /runs/:id/cancel (route order)', async () => {
+      const storage = freshStorage();
+      await storage.createRun(makeRun('r-1', { status: 'running' }));
+      const { base } = await startTracked({ storage });
+      // the id literally named "bulk" is NOT what /runs/bulk/cancel means
+      const res = await post(base, '/runs/bulk/cancel', { ids: [] });
+      expect(res.status).toBe(400); // body validation, not `run bulk not found`
+    });
+  });
+
+  describe('R4 — GET /runs filters', () => {
+    it('?since/&until window by started_at and ?runner exact match (ISO-8601)', async () => {
+      const storage = freshStorage();
+      const { base } = await startTracked({ storage });
+      await storage.createRun(makeRun('r1', { startedAt: new Date('2026-08-16T08:00:00Z'), runner: 'http', status: 'succeeded' }));
+      await storage.createRun(makeRun('r2', { startedAt: new Date('2026-08-16T09:00:00Z'), runner: 'docker', status: 'failed' }));
+      await storage.createRun(makeRun('r3', { startedAt: new Date('2026-08-16T10:00:00Z'), runner: 'http', status: 'succeeded' }));
+
+      // both bounds inclusive → r2 only (r1 is before since, r3 after until)
+      const window = (await (await fetch(`${base}/runs?since=2026-08-16T08:30:00Z&until=2026-08-16T09:30:00Z`)).json()) as { runs: RunRecord[] };
+      expect(window.runs.map((r: RunRecord) => r.id)).toEqual(['r2']);
+
+      const byRunner = (await (await fetch(`${base}/runs?runner=docker`)).json()) as { runs: RunRecord[] };
+      expect(byRunner.runs.map((r: RunRecord) => r.id)).toEqual(['r2']);
+
+      // window combines with runner (AND, not OR)
+      const combined = (await (await fetch(`${base}/runs?since=2026-08-16T00:00:00Z&runner=http`)).json()) as { runs: RunRecord[] };
+      expect(combined.runs.map((r: RunRecord) => r.id)).toEqual(['r3', 'r1']);
+    });
+
+    it('?since=bogus → 400 (ISO-8601 expected, not a silent full list)', async () => {
+      const storage = freshStorage();
+      const { base } = await startTracked({ storage });
+      await storage.createRun(makeRun('r1'));
+
+      for (const param of ['since', 'until']) {
+        const bad = await fetch(`${base}/runs?${param}=yesterday`);
+        expect(bad.status).toBe(400);
+        expect(((await bad.json()) as { error: string }).error).toContain(param);
+      }
+      // a valid ISO timestamp is accepted
+      expect((await fetch(`${base}/runs?since=2026-08-16T00:00:00.000Z`)).status).toBe(200);
+    });
+
+    it('?status=bogus → 400 (not a silent empty list)', async () => {
+      const storage = freshStorage();
+      const { base } = await startTracked({ storage });
+
+      const bad = await fetch(`${base}/runs?status=bogus`);
+      expect(bad.status).toBe(400);
+      expect(((await bad.json()) as { error: string }).error).toContain('bogus');
+
+      for (const status of ['queued', 'running', 'succeeded', 'failed', 'cancelled']) {
+        expect((await fetch(`${base}/runs?status=${status}`)).status).toBe(200);
+      }
+    });
   });
 });
 

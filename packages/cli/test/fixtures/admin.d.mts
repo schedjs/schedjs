@@ -10,10 +10,17 @@ export interface FixtureRequestLogEntry {
   auth: boolean;
 }
 
+export interface SeedState {
+  tasks?: unknown[];
+  runs?: unknown[];
+  schedules?: unknown[];
+  queue?: { paused: boolean; pausedAt: string | null; startPaused: boolean };
+}
+
 export interface AdminFixture {
   server: Server;
   listen(): Promise<number>;
-  seed(s: { tasks?: unknown[]; runs?: unknown[]; schedules?: unknown[] }): void;
+  seed(s: SeedState): void;
   clearLog(): void;
   requests(): FixtureRequestLogEntry[];
   close(): Promise<void>;

@@ -125,7 +125,8 @@ export const TOOL_DEFS: McpToolDef[] = [
   {
     name: 'list_runs',
     description:
-      'List runs, newest first. Optional filters: task (name), status (queued|running|succeeded|failed|cancelled), limit, offset.',
+      'List runs, newest first. Optional filters: task (name), status (queued|running|succeeded|failed|cancelled), ' +
+      'since/until (ISO-8601 start-time window, inclusive), runner (exact runner name), limit, offset.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -135,6 +136,9 @@ export const TOOL_DEFS: McpToolDef[] = [
           enum: ['queued', 'running', 'succeeded', 'failed', 'cancelled'],
           description: 'Filter by run status',
         },
+        since: { type: 'string', description: 'Start of the started_at window, ISO-8601 (inclusive)' },
+        until: { type: 'string', description: 'End of the started_at window, ISO-8601 (inclusive)' },
+        runner: { type: 'string', description: "Exact runner match — 'docker', 'http', 'process'…" },
         limit: { type: 'integer', minimum: 1, description: 'Max runs to return (default: all)' },
         offset: { type: 'integer', minimum: 0, description: 'Pagination offset' },
       },
@@ -191,6 +195,18 @@ export const TOOL_DEFS: McpToolDef[] = [
     },
   },
   {
+    name: 'pause_queue',
+    description:
+      'Pause the whole queue (mutation) — stop claiming work until resumed: recurring schedules are skipped ' +
+      '(not caught up), once/retry work is deferred and played out on resume. Idempotent.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'resume_queue',
+    description: 'Resume a paused queue (mutation) — deferred once/retry runs play out once. Idempotent.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
     name: 'delete_run',
     description: 'Delete a run record from history (mutation). No-op for unknown run.',
     inputSchema: {
@@ -230,6 +246,8 @@ export const MUTATIONS = new Set([
   'trigger_task',
   'pause_task',
   'resume_task',
+  'pause_queue',
+  'resume_queue',
   'delete_run',
   'create_schedule',
   'update_schedule',
@@ -330,6 +348,9 @@ export async function runTool(
       const filter: RunListFilter = {};
       if (args.task !== undefined) filter.task = requireStr(args, 'task');
       if (args.status !== undefined) filter.status = requireStr(args, 'status') as RunStatus;
+      if (args.since !== undefined) filter.since = requireStr(args, 'since');
+      if (args.until !== undefined) filter.until = requireStr(args, 'until');
+      if (args.runner !== undefined) filter.runner = requireStr(args, 'runner');
       const limit = requireNum(args, 'limit', { min: 1 }); // schema promises minimum:1 — enforce it
       if (limit !== undefined) filter.limit = limit;
       const offset = requireNum(args, 'offset');
@@ -346,6 +367,10 @@ export async function runTool(
     case 'resume_task':
       await client.resumeTask(requireStr(args, 'name'));
       return JSON.stringify({ ok: true });
+    case 'pause_queue':
+      return JSON.stringify(await client.setQueuePaused('pause'));
+    case 'resume_queue':
+      return JSON.stringify(await client.setQueuePaused('resume'));
     case 'delete_run':
       await client.deleteRun(requireStr(args, 'runId'));
       return JSON.stringify({ ok: true });

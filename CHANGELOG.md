@@ -7,6 +7,52 @@ history is summarized below and fully preserved in the git log.
 
 ## [Unreleased]
 
+- **R2+R3+R4 — пауза очереди, окно ранов, массовые операции** (волна core
+  **0.56.0** → storage-mongo **0.6.0** / storage-mysql **0.5.0** /
+  storage-postgres **0.5.0** → admin-api **0.4.0** → mcp **0.6.0** →
+  daemon **0.13.3** → cli **0.3.0**).
+  - **Очередь на паузе, демон на ходу.** `engine.pause()` / `resume()`
+    (`isPaused()` / `getPauseInfo()`) замораживают только клейм: синк
+    `tasks.json`, retention/prune, poll-loop и алерты по уже идущим ранам
+    продолжают работать. Старт замороженным — `createDaemon({ startPaused: true })`
+    или `SCHED_START_PAUSED=1` (флага CLI намеренно нет). Снятие — **skip, не
+    catch-up**: слот, наступивший внутри паузы, уезжает в следующий будущий без
+    `missed-slot`, а просроченные `once`/delayed-раны и pending-ретраи играют
+    ровно один раз. События `queue-paused` (`{ pausedAt, startPaused }`) и
+    `queue-resumed` (`{ pausedMs, skippedSchedules, deferredRuns }`).
+  - **Контур управления очередью.** `GET /queue` → `{ paused, pausedAt, startPaused }`,
+    `POST /queue/pause|resume` → `200` и идемпотентно (никогда не `409`);
+    `sched status` печатает строку `queue:` (`active` / `paused (since …, start-paused)`);
+    MCP — `pause_queue` / `resume_queue` (мутации, под `--readonly` выключены).
+    Состояние очереди намеренно не уехало в `GET /health`: liveness отвечает за liveness.
+  - **Окно ранов: `RunFilter += since / until / runner`.** `GET /runs?since=&until=&runner=`
+    (ISO-8601 на проводе; `sched runs --since 24h --until 2h --runner docker`
+    разворачивает относительную форму на клиенте), плюс fail-fast **400** на
+    неразбираемый timestamp и на неизвестный `status` (`?status=bogus` раньше
+    отдавал пустой список, что читается как «фейлов нет»). Окно — по `startedAt`,
+    обе границы включительные; цена прямо оговорена: долгий ран, стартовавший
+    ДО `since`, в список не попадёт, даже если упал внутри окна. Во всех
+    адаптерах — `idx_runs_started` (идемпотентный DDL на открытии в sqlite,
+    v8-миграция в mysql/postgres, в mongo переиспользован существующий
+    `{ startedAt: -1 }` — обходится в обратную сторону).
+  - **Массовые cancel/retry.** `POST /runs/bulk/cancel|retry` с `{ ids: [...] }`
+    отвечает **частичным** результатом `{ ok, failed: [{ id, reason }] }` —
+    никогда не атомарно, чтобы один гоняющийся cancel не блокировал остальные 99;
+    причины `not-found | already-terminal | not-cancellable`, `400` на пустое/чужое
+    тело и **422** сверх 100 id. CLI принимает ту же пачку: `sched cancel <id...>` /
+    `retry <id...>`, код выхода **1**, если хоть один id не прошёл. В MCP массовых
+    тулов намеренно нет — агент крутит `cancel_run` / `retry_run`.
+  - **Почему в волне даемон.** `@schedjs/mcp` — единственная не-`workspace`
+    зависимость в дереве (`apps/daemon`: `^0.5.1`), а caret на 0.x не покрывает
+    `0.6.0`, поэтому daemon **0.13.3** — патч без нового кода, только перепин
+    (`^0.6.0`). Ради адаптеров волна и идёт: у `storage-mongo 0.5.1` под
+    патчем лежала вложенная копия core 0.53.0 — после 0.6.0/0.5.0 дерево
+    потребителя резолвит один core.
+  - **UI-часть** (фильтры ранов, массовые операции, индикатор паузы) выходит
+    отдельной волной `@schedjs/ui` со своим ручным смоуком дашборда.
+  - Доки: `00.whats-new.md`, `05.runs.md`, `10.admin-api.md`, `12.mcp.md`,
+    `13.cli.md`, `14.self-hosting.md`, `08.storage/*`.
+
 - **R1 — стрик-алерты: один сигнал на серию фейлов + «отпустило»** (волна
   core **0.55.0** → admin-api **0.3.3** → mcp **0.5.2** → daemon **0.13.2** →
   cli **0.2.0**). `AlertsConfig.onStreak`

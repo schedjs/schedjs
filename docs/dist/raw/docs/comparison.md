@@ -1,10 +1,10 @@
 # Comparison
 
-> sched next to the Node.js job schedulers and queues it is usually weighed against — BullMQ, Bull, Kue, Bee, pg-boss and Agenda
+> sched next to the Node.js job schedulers and queues it is usually weighed against — BullMQ (and its commercial BullMQ-Pro), Bull, Kue, Bee, pg-boss and Agenda
 
 This page puts sched next to the job schedulers and queues it is normally weighed
-against in the Node ecosystem: **BullMQ**, **Bull**, **Kue**, **Bee**, **pg-boss** and
-**Agenda**.
+against in the Node ecosystem: **BullMQ** — plus its commercial tier **BullMQ-Pro** —
+**Bull**, **Kue**, **Bee**, **pg-boss** and **Agenda**.
 
 A note on honesty before the table: our own column is written from sched's own code and
 docs. The columns for the other projects are taken from two published comparison charts —
@@ -1106,11 +1106,99 @@ there.
   
   <tr>
     <td>
+      Run history window (<code>
+        since
+      </code>
+      
+       / <code>
+        until
+      </code>
+      
+       / <code>
+        runner
+      </code>
+      
+      )
+    </td>
+    
+    <td>
+      ✓
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
       Cancel a <em>
         running
       </em>
       
        job
+    </td>
+    
+    <td>
+      ✓
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+    
+    <td>
+      
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      Bulk cancel / retry (many runs in one call)
     </td>
     
     <td>

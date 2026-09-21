@@ -1,0 +1,31 @@
+# Docker build context is the monorepo working tree; nothing below is needed by
+# any image (published daemon pulls from the registry, ui/contour build from
+# sources). Keeps `docker build` from shipping node_modules/.git/docs to the
+# daemon — and keeps prebuilt JS out of the contour image, so the phase gate
+# exercises sources, not a stale dist.
+.git
+.github
+.gitignore
+node_modules
+**/node_modules
+**/dist
+docs
+examples
+.venv
+.mappa
+.wiki
+.tasks
+.brainstorm
+.agents
+.idea
+.vscode
+*.db
+*.db-journal
+*.log
+daemon.pid
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.avif
+*.ai

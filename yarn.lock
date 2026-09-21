@@ -4102,6 +4102,9 @@ __metadata:
 "@schedjs/cli@workspace:packages/cli":
   version: 0.0.0-use.local
   resolution: "@schedjs/cli@workspace:packages/cli"
+  dependencies:
+    "@schedjs/admin-api": "workspace:*"
+    "@schedjs/core": "workspace:*"
   bin:
     sched: dist/index.js
   languageName: unknown
@@ -4125,13 +4128,13 @@ __metadata:
     "@aws-sdk/client-s3": "npm:^3.1111.0"
     "@schedjs/admin-api": "workspace:*"
     "@schedjs/core": "workspace:*"
-    "@schedjs/mcp": "npm:^0.5.1"
+    "@schedjs/mcp": "npm:^0.6.0"
   bin:
     schedd: dist/entry.js
   languageName: unknown
   linkType: soft
 
-"@schedjs/mcp@npm:^0.5.1, @schedjs/mcp@workspace:packages/mcp":
+"@schedjs/mcp@npm:^0.6.0, @schedjs/mcp@workspace:packages/mcp":
   version: 0.0.0-use.local
   resolution: "@schedjs/mcp@workspace:packages/mcp"
   dependencies:

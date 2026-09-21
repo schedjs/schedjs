@@ -63,15 +63,22 @@ export function runPostgresContractSuite(name: string, url: string): void {
         const idx = await pool.query(`SELECT indexname AS name FROM pg_indexes WHERE tablename = 'scheduled_tasks'`);
         expect(idx.rows.map((r) => r.name as string)).toContain('idx_due');
 
+        // R4: the started_at index the since/until window rides on
+        const runIdx = await pool.query(`SELECT indexname AS name FROM pg_indexes WHERE tablename = 'task_runs'`);
+        expect(runIdx.rows.map((r) => r.name as string)).toContain('idx_runs_started');
+
         // exactly one version row — never one INSERT per migration (peer-review fix)
         const v = await pool.query(`SELECT COUNT(*) AS c FROM sched_schema_version`);
         expect(Number(v.rows[0]!.c)).toBe(1);
       }, 120_000);
 
       it('re-open is idempotent and keeps the schema version', async () => {
+        const before = await pool.query('SELECT version FROM sched_schema_version LIMIT 1');
         await createPostgresStorage(pool); // second open on migrated schema
         const res = await pool.query('SELECT version FROM sched_schema_version LIMIT 1');
-        expect(Number(res.rows[0]!.version)).toBe(6);
+        // self-relative, not a hardcoded latest: the invariant is "re-open does not
+        // bump/rewrite the version row", and the next migration must not break it.
+        expect(Number(res.rows[0]!.version)).toBe(Number(before.rows[0]!.version));
       });
 
       it('v3 -> v5 upgrade synthesizes legacy task schedules (F2)', async () => {

@@ -14,6 +14,7 @@
   ],
   "tags": [
     { "name": "health" },
+    { "name": "queue" },
     { "name": "tasks" },
     { "name": "schedules" },
     { "name": "runs" }
@@ -45,6 +46,39 @@
         }
       }
     },
+    "/queue": {
+      "get": {
+        "tags": ["queue"],
+        "summary": "Queue pause state (engine-owned runtime flag; not part of the open /health payload)",
+        "operationId": "getQueue",
+        "responses": {
+          "200": { "$ref": "#/components/responses/QueueState" },
+          "501": { "$ref": "#/components/responses/NotConfigured" }
+        }
+      }
+    },
+    "/queue/pause": {
+      "post": {
+        "tags": ["queue"],
+        "summary": "Pause the queue — idempotent (repeat → 200 with the same pausedAt, never 409)",
+        "operationId": "pauseQueue",
+        "responses": {
+          "200": { "$ref": "#/components/responses/QueueMutation" },
+          "501": { "$ref": "#/components/responses/NotConfigured" }
+        }
+      }
+    },
+    "/queue/resume": {
+      "post": {
+        "tags": ["queue"],
+        "summary": "Resume the queue — idempotent; recurring schedules skip the missed window, once/retries still run",
+        "operationId": "resumeQueue",
+        "responses": {
+          "200": { "$ref": "#/components/responses/QueueMutation" },
+          "501": { "$ref": "#/components/responses/NotConfigured" }
+        }
+      }
+    },
     "/runs": {
       "get": {
         "tags": ["runs"],
@@ -52,9 +86,12 @@
         "operationId": "listRuns",
         "parameters": [
           { "name": "task", "in": "query", "description": "Filter by task name", "schema": { "type": "string" } },
-          { "name": "status", "in": "query", "description": "Filter by run status", "schema": { "$ref": "#/components/schemas/RunStatus" } },
+          { "name": "status", "in": "query", "description": "Filter by run status (unknown value → 400, not an empty list)", "schema": { "$ref": "#/components/schemas/RunStatus" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
-          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+          { "name": "since", "in": "query", "description": "Window start on startedAt, ISO-8601 (inclusive; unparseable → 400)", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "until", "in": "query", "description": "Window end on startedAt, ISO-8601 (inclusive; unparseable → 400)", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "runner", "in": "query", "description": "Exact runner match ('docker', 'http', …)", "schema": { "type": "string" } }
         ],
         "responses": {
           "200": {
@@ -68,7 +105,34 @@
                 }
               }
             }
-          }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest", "description": "invalid status/since/until value" }
+        }
+      }
+    },
+    "/runs/bulk/cancel": {
+      "post": {
+        "tags": ["runs"],
+        "summary": "Cancel a batch of runs — partial result, never atomic (max 100 ids → 422)",
+        "operationId": "bulkCancelRuns",
+        "requestBody": { "$ref": "#/components/requestBodies/BulkIds" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/BulkResult" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "$ref": "#/components/responses/BadRequest", "description": "more than 100 ids" }
+        }
+      }
+    },
+    "/runs/bulk/retry": {
+      "post": {
+        "tags": ["runs"],
+        "summary": "Retry a batch of runs — partial result, never atomic (max 100 ids → 422)",
+        "operationId": "bulkRetryRuns",
+        "requestBody": { "$ref": "#/components/requestBodies/BulkIds" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/BulkResult" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "$ref": "#/components/responses/BadRequest", "description": "more than 100 ids" }
         }
       }
     },
@@ -423,6 +487,28 @@
       "Conflict": {
         "description": "conflict (e.g. deleting an active run)",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "QueueState": {
+        "description": "queue pause state; pausedAt is ISO-8601 (null when active), startPaused marks a process-start freeze — not part of the open /health payload",
+        "content": { "application/json": { "schema": { "type": "object", "required": ["paused", "pausedAt", "startPaused"], "properties": { "paused": { "type": "boolean" }, "pausedAt": { "type": ["string", "null"] }, "startPaused": { "type": "boolean" } } } } }
+      },
+      "QueueMutation": {
+        "description": "queue pause mutation result — idempotent (a repeat returns 200 with the same state, never 409)",
+        "content": { "application/json": { "schema": { "type": "object", "required": ["ok", "paused", "pausedAt"], "properties": { "ok": { "type": "boolean" }, "paused": { "type": "boolean" }, "pausedAt": { "type": ["string", "null"] } } } } }
+      },
+      "BulkResult": {
+        "description": "partial bulk result: ok = ids applied, failed = ids with a reason (no atomicity — one raced id never blocks the batch)",
+        "content": { "application/json": { "schema": { "type": "object", "required": ["ok", "failed"], "properties": { "ok": { "type": "array", "items": { "type": "string" } }, "failed": { "type": "array", "items": { "$ref": "#/components/schemas/BulkFailure" } } } } } }
+      },
+      "NotConfigured": {
+        "description": "queue accessor not configured (embedded host without an engine queue)",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "requestBodies": {
+      "BulkIds": {
+        "required": true,
+        "content": { "application/json": { "schema": { "type": "object", "required": ["ids"], "properties": { "ids": { "type": "array", "minItems": 1, "maxItems": 100, "items": { "type": "string" }, "description": "explicit run ids (no selectors in v1); empty → 400, more than 100 → 422" } } } } }
       }
     },
     "securitySchemes": {
@@ -439,6 +525,14 @@
         "properties": { "error": { "type": "string" } }
       },
       "RunStatus": { "type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled"] },
+      "BulkFailure": {
+        "type": "object",
+        "required": ["id", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "reason": { "type": "string", "enum": ["not-found", "already-terminal", "not-cancellable"] }
+        }
+      },
       "RunTrigger": { "type": "string", "enum": ["schedule", "manual"] },
       "ArtifactRef": {
         "type": "object",

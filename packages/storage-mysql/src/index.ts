@@ -417,6 +417,26 @@ const MIGRATIONS: Array<{ version: number; up: MigrationStep[] }> = [
     version: 7,
     up: [{ sql: `ALTER TABLE scheduled_tasks ADD COLUMN input_schema TEXT`, guard: { table: 'scheduled_tasks', column: 'input_schema' } }],
   },
+  {
+    // v8 — run filtering (R4, 2026-09-20): idx_runs_started (started_at) backs the
+    // `since`/`until` window and `status + since` queries (idx_runs_task leads
+    // with task_name, so it cannot serve them). Guarded by INFORMATION_SCHEMA.
+    // STATISTICS instead of a plain CREATE INDEX — MySQL has no
+    // `CREATE INDEX IF NOT EXISTS`, and a migration that crashed halfway
+    // (index created, version row not bumped) must re-run cleanly.
+    version: 8,
+    up: [
+      async (pool) => {
+        const rows = (await pool.query(
+          `SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'task_runs' AND INDEX_NAME = 'idx_runs_started'`,
+        ))[0] as RowDataPacket[];
+        if (Number((rows[0] as { c: number | string }).c) === 0) {
+          await pool.query(`CREATE INDEX idx_runs_started ON task_runs (started_at)`);
+        }
+      },
+    ],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -802,6 +822,19 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
       if (filter.status !== undefined) {
         where.push('status = ?');
         params.push(filter.status);
+      }
+      if (filter.runner !== undefined) {
+        where.push('runner = ?');
+        params.push(filter.runner);
+      }
+      // Start-time window, both bounds inclusive (epoch ms) — served by idx_runs_started.
+      if (filter.since !== undefined) {
+        where.push('started_at >= ?');
+        params.push(filter.since.getTime());
+      }
+      if (filter.until !== undefined) {
+        where.push('started_at <= ?');
+        params.push(filter.until.getTime());
       }
       const sql =
         `SELECT * FROM task_runs ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ` +

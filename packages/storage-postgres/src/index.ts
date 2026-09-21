@@ -414,6 +414,14 @@ const MIGRATIONS: Array<{ version: number; up: Array<string | ((pool: Pool) => P
     version: 7,
     up: [`ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS input_schema TEXT`],
   },
+  {
+    // v8 — run filtering (R4, 2026-09-20): idx_runs_started (started_at) backs the
+    // `since`/`until` window and `status + since` queries (idx_runs_task leads
+    // with task_name, so it cannot serve them). IF NOT EXISTS keeps the step
+    // idempotent — a migration that crashed halfway re-runs cleanly.
+    version: 8,
+    up: [`CREATE INDEX IF NOT EXISTS idx_runs_started ON task_runs (started_at)`],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -788,6 +796,19 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
       if (filter.status !== undefined) {
         where.push('status = $' + (params.length + 1));
         params.push(filter.status);
+      }
+      if (filter.runner !== undefined) {
+        where.push('runner = $' + (params.length + 1));
+        params.push(filter.runner);
+      }
+      // Start-time window, both bounds inclusive (epoch ms) — served by idx_runs_started.
+      if (filter.since !== undefined) {
+        where.push('started_at >= $' + (params.length + 1));
+        params.push(filter.since.getTime());
+      }
+      if (filter.until !== undefined) {
+        where.push('started_at <= $' + (params.length + 1));
+        params.push(filter.until.getTime());
       }
       const limitIdx = params.length + 1;
       const offsetIdx = params.length + 2;

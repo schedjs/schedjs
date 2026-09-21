@@ -236,10 +236,18 @@ export class MemoryStorage implements Storage {
     return count;
   }
 
-  async listRuns(filter: { taskName?: string; status?: string; limit?: number; offset?: number } = {}): Promise<RunRecord[]> {
+  async listRuns(
+    filter: { taskName?: string; status?: string; since?: Date; until?: Date; runner?: string; limit?: number; offset?: number } = {},
+  ): Promise<RunRecord[]> {
     let list = [...this.runs.values()];
     if (filter.taskName !== undefined) list = list.filter((r) => r.taskName === filter.taskName);
     if (filter.status !== undefined) list = list.filter((r) => r.status === filter.status);
+    if (filter.runner !== undefined) list = list.filter((r) => r.runner === filter.runner);
+    // Start-time window, both bounds inclusive — anchored on startedAt, like the sort.
+    const since = filter.since?.getTime();
+    const until = filter.until?.getTime();
+    if (since !== undefined) list = list.filter((r) => r.startedAt.getTime() >= since);
+    if (until !== undefined) list = list.filter((r) => r.startedAt.getTime() <= until);
     list.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
     return list.slice(filter.offset ?? 0, (filter.offset ?? 0) + (filter.limit ?? 100));
   }

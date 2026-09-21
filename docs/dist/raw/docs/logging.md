@@ -179,7 +179,7 @@ uses it to send **one** message per incident instead of one per run:
     </td>
     
     <td>
-      a fresh incident alerts again
+      a fresh incident — silent until the streak reaches 3 again
     </td>
   </tr>
 </tbody>
@@ -188,8 +188,11 @@ uses it to send **one** message per incident instead of one per run:
 The counter lives in the engine process, not in storage: the storage
 `failCount` is *cumulative* (never reset by a success), and a persisted
 consecutive-counter would be a `Storage`-contract change. A daemon restart
-forgets an in-flight streak — the next failure alerts once more rather than
-staying silent (no alert is ever lost).
+**forgets an in-flight streak**: the count restarts from 1, so with
+`onStreak: N > 1` the next failure is silent again and the alert only lands
+after a further N−1 terminal failures — carrying `consecutiveFailures: N`, the
+post-restart count, not the incident's true depth. The cost is lateness (up to
+N−1 runs), never silence: no alert is ever lost for good.
 
 `createAlerts` (webhook) is a ready-made `onRunFinal` consumer — wire it as
 `onRunFinal: createAlerts(config).handleFinal` and

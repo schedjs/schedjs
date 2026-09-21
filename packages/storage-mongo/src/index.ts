@@ -103,11 +103,14 @@ export async function createMongoStorage(db: Db, options: MongoStorageOptions = 
   const runs = db.collection<RunRecord>(options.collections?.runs ?? 'sched_runs');
   const schedules = db.collection<ScheduleRecord>(options.collections?.schedules ?? 'sched_schedules');
 
-  // Retention/query indexes — matches the SQLite adapter's (idx_due, idx_runs_task)
-  // plus the admin-API sort indexes (prod defect 2, books post-cutover 2026-08-22):
-  // listTasks sorts by {name:1} and listRuns by {startedAt:-1} — without dedicated
-  // indexes Mongo falls back to an in-memory sort, which at 55k+ runs exceeds the
-  // 32MB sort cap (MongoDB 4.2) and makes /api/tasks + /api/runs error out.
+  // Retention/query indexes — matches the SQLite adapter's (idx_due, idx_runs_task,
+  // idx_runs_started) plus the admin-API sort indexes (prod defect 2, books
+  // post-cutover 2026-08-22): listTasks sorts by {name:1} and listRuns by
+  // {startedAt:-1} — without dedicated indexes Mongo falls back to an in-memory
+  // sort, which at 55k+ runs exceeds the 32MB sort cap (MongoDB 4.2) and makes
+  // /api/tasks + /api/runs error out. {startedAt:-1} doubles as the SQL adapters'
+  // idx_runs_started for the RunFilter since/until window (R4) — MongoDB walks a
+  // descending index in reverse, so no second index is needed.
   await tasks.createIndex({ nextRunAt: 1 });
   await tasks.createIndex({ name: 1 });
   await runs.createIndex({ taskName: 1, startedAt: 1 });
@@ -379,6 +382,17 @@ export async function createMongoStorage(db: Db, options: MongoStorageOptions = 
       const q: Record<string, unknown> = {};
       if (filter.taskName !== undefined) q.taskName = filter.taskName;
       if (filter.status !== undefined) q.status = filter.status;
+      if (filter.runner !== undefined) q.runner = filter.runner;
+      // Start-time window, both bounds inclusive — served by the {startedAt:-1} index.
+      // Raw Dates (not epoch ms like the SQL adapters): RunRecord.startedAt is a
+      // Date and documents are stored verbatim, so startedAt is a BSON Date and
+      // the same {startedAt:-1} index serves the range scan.
+      if (filter.since !== undefined || filter.until !== undefined) {
+        q.startedAt = {
+          ...(filter.since !== undefined ? { $gte: filter.since } : {}),
+          ...(filter.until !== undefined ? { $lte: filter.until } : {}),
+        };
+      }
       return runs
         .find(q, NO_ID)
         .sort({ startedAt: -1 })

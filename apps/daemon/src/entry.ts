@@ -341,8 +341,10 @@ async function main(): Promise<void> {
     : '';
   const lockHeartbeatMs = opts.lockHeartbeatMs ?? Math.floor(opts.lockTtlMs / 3);
   const storageBanner = loaded ? loaded.banner : `storage=sqlite db=${opts.db}`;
+  // A silent freeze would read as a hang — the startup line must say it.
+  const pausedNote = daemon.engine.isPaused() ? ', queue=paused (start-paused)' : '';
   process.stdout.write(
-    `schedd: daemon started (tasks=${opts.tasks}, ${storageBanner}, lockTtl=${opts.lockTtlMs}ms, lockHeartbeat=${lockHeartbeatMs}ms${adminNote})\n`,
+    `schedd: daemon started (tasks=${opts.tasks}, ${storageBanner}, lockTtl=${opts.lockTtlMs}ms, lockHeartbeat=${lockHeartbeatMs}ms${adminNote}${pausedNote})\n`,
   );
 }
 

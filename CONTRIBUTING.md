@@ -32,6 +32,25 @@ yarn test           # vitest suite
 yarn typecheck      # tsc --noEmit
 ```
 
+### Live contour smoke (phase gates)
+
+Some behavior is only provable against a running daemon — queue pause surviving
+a container restart, run-time windows, bulk operations. That contour is built
+from **this working tree** (`deploy/Dockerfile.contour` compiles the daemon from
+sources instead of installing the published `@schedjs/daemon`) and driven by the
+local CLI:
+
+```bash
+yarn smoke:contour                # daemon + admin-api + sqlite, 3 live scenarios (~3 min)
+yarn smoke:contour --fast         # short pause window (iteration); the missed-slot
+                                  # check is then reported as NOT CHECKED
+yarn smoke:contour --keep         # leave the contour running for debugging
+yarn smoke:contour --skip-build   # reuse the image (still verified against HEAD)
+```
+
+It needs Docker. The image is stamped with the git sha it was built from and the
+harness refuses to certify a stale artifact.
+
 The monorepo layout:
 
 - `packages/*` — published libraries (`@schedjs/core`, `@schedjs/daemon`, `@schedjs/admin-api`, `@schedjs/cli`, `@schedjs/mcp`, `@schedjs/ui`, `@schedjs/storage-*`)

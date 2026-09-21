@@ -429,6 +429,9 @@ export function storageContractTests(api: ContractTestApi, name: string, make: (
     });
 
     describe('run history', () => {
+      /** 2026-08-16 at `h` o'clock UTC — distinct, deterministic start times. */
+      const at = (h: number): Date => new Date(`2026-08-16T${String(h).padStart(2, '0')}:00:00Z`);
+
       const baseRun: RunRecord = {
         id: 'r1',
         taskName: 'task-a',
@@ -530,12 +533,59 @@ export function storageContractTests(api: ContractTestApi, name: string, make: (
         expect(both.map((r) => r.id)).toEqual(['r2']);
       });
 
+      it('listRuns filters by the startedAt window, bounds inclusive', async () => {
+        for (let h = 6; h <= 10; h++) {
+          await s.createRun({ ...baseRun, id: `r${h}`, startedAt: at(h) });
+        }
+        expect((await s.listRuns({ since: at(7) })).map((r) => r.id)).toEqual(['r10', 'r9', 'r8', 'r7']);
+        expect((await s.listRuns({ until: at(8) })).map((r) => r.id)).toEqual(['r8', 'r7', 'r6']);
+        // both bounds inclusive: 07:00 and 09:00 rows must stay in
+        expect((await s.listRuns({ since: at(7), until: at(9) })).map((r) => r.id)).toEqual(['r9', 'r8', 'r7']);
+      });
+
+      it('listRuns filters by runner and combines with taskName/status/window', async () => {
+        await s.createRun({ ...baseRun, id: 'r1', taskName: 'task-a', runner: 'http', status: 'succeeded', startedAt: at(9) });
+        await s.createRun({ ...baseRun, id: 'r2', taskName: 'task-a', runner: 'docker', status: 'succeeded', startedAt: at(10) });
+        await s.createRun({ ...baseRun, id: 'r3', taskName: 'task-b', runner: 'docker', status: 'failed', startedAt: at(11) });
+
+        expect((await s.listRuns({ runner: 'docker' })).map((r) => r.id)).toEqual(['r3', 'r2']);
+        expect((await s.listRuns({ runner: 'http' })).map((r) => r.id)).toEqual(['r1']);
+        const combined = await s.listRuns({ runner: 'docker', taskName: 'task-a', status: 'succeeded', since: at(9), until: at(10) });
+        expect(combined.map((r) => r.id)).toEqual(['r2']);
+      });
+
+      it('listRuns keeps an unfinished run inside the window (finishedAt stays out of it)', async () => {
+        // The window is anchored on startedAt, so a queued/running run is never
+        // dropped the way a finishedAt window would drop it (docs/05.runs.md).
+        await s.createRun({ ...baseRun, id: 'running', status: 'running', finishedAt: null, startedAt: at(8) });
+        await s.createRun({ ...baseRun, id: 'done', status: 'succeeded', finishedAt: at(9), startedAt: at(8) });
+        expect((await s.listRuns({ since: at(8), until: at(8) })).map((r) => r.id).sort()).toEqual(['done', 'running']);
+        expect((await s.listRuns({ status: 'running', since: at(8), until: at(8) })).map((r) => r.id)).toEqual(['running']);
+      });
+
+      it('listRuns returns empty when no run matches the filter', async () => {
+        await s.createRun({ ...baseRun, id: 'r1', runner: 'http', startedAt: at(9) });
+        expect(await s.listRuns({ since: at(20) })).toEqual([]);
+        expect(await s.listRuns({ until: at(1) })).toEqual([]);
+        expect(await s.listRuns({ runner: 'docker' })).toEqual([]);
+        expect(await s.listRuns({ taskName: 'task-a', status: 'failed' })).toEqual([]);
+      });
+
       it('listRuns applies limit and offset', async () => {
         for (let i = 1; i <= 5; i++) {
           await s.createRun({ ...baseRun, id: `r${i}`, startedAt: new Date(`2026-08-16T0${i}:00:00Z`) });
         }
         const page = await s.listRuns({ limit: 2, offset: 1 });
         expect(page.map((r) => r.id)).toEqual(['r4', 'r3']); // newest-first: r5,r4,r3,r2,r1 → skip 1, take 2
+      });
+
+      it('listRuns applies limit and offset inside a window', async () => {
+        for (let h = 6; h <= 10; h++) {
+          await s.createRun({ ...baseRun, id: `r${h}`, startedAt: at(h) });
+        }
+        // window [07:00, 09:00] → r9,r8,r7 newest-first; skip 1, take 1
+        expect((await s.listRuns({ since: at(7), until: at(9), limit: 1, offset: 1 })).map((r) => r.id)).toEqual(['r8']);
+        expect((await s.listRuns({ since: at(7), until: at(9), limit: 2 })).map((r) => r.id)).toEqual(['r9', 'r8']);
       });
 
       it('finishRun sets terminal status + finishedAt and carries result/log/progress/artifacts', async () => {

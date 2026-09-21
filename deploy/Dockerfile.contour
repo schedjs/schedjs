@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1.7
+# Gate contour — the sched daemon built from THIS working tree (not from the
+# published @schedjs/daemon package that apps/daemon/Dockerfile installs).
+#
+# Why it exists: the phase gates test unreleased source (R2 queue pause,
+# R4 run-filter window, R3 bulk cancel/retry). A registry image cannot carry
+# that code, so the gate builds the artifact under test from the checkout.
+#
+#   docker build -f deploy/Dockerfile.contour -t sched-contour:local .
+#
+# Driven end-to-end by scripts/contour-smoke.mjs (3 live scenarios on
+# daemon + admin-api + sqlite). Only the workspaces the daemon imports are
+# materialised: core, admin-api, mcp, daemon.
+#
+# This is a GATE image, not a release artifact: it keeps the TypeScript
+# toolchain and sources so the running daemon is provably the tree that was
+# built (no registry copy of @schedjs/daemon can carry unreleased code).
+#
+# Registry note: the checkout's .yarnrc.yml points at a private registry;
+# a throwaway gate image must not need that token, so the build stage installs
+# from the public registry (the same packages either way).
+
+FROM node:24-alpine AS build
+WORKDIR /build
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable
+COPY package.json yarn.lock tsconfig.json ./
+COPY packages/core/package.json packages/core/
+COPY packages/admin-api/package.json packages/admin-api/
+COPY packages/mcp/package.json packages/mcp/
+COPY apps/daemon/package.json apps/daemon/
+# npmMinimalAgeGate: 0 — yarn 4.18 quarantines packages with missing
+# publish-time metadata; irrelevant for a local gate build.
+RUN printf 'nodeLinker: node-modules\nenableTelemetry: false\nnpmRegistryServer: "https://registry.npmjs.org"\nnpmMinimalAgeGate: 0\n' > .yarnrc.yml \
+ && yarn install --mode=skip-build
+COPY packages/core packages/core
+COPY packages/admin-api packages/admin-api
+COPY packages/mcp packages/mcp
+COPY apps/daemon apps/daemon
+# `.dockerignore` already filters `**/dist`; the rm is belt-and-braces so a
+# prebuilt artifact can never be mistaken for the tree under test.
+RUN rm -rf packages/*/dist apps/*/dist \
+ && node node_modules/typescript/bin/tsc -p packages/core/tsconfig.build.json \
+ && node node_modules/typescript/bin/tsc -p packages/mcp/tsconfig.build.json \
+ && node node_modules/typescript/bin/tsc -p packages/admin-api/tsconfig.build.json \
+ && node node_modules/typescript/bin/tsc -p apps/daemon/tsconfig.build.json
+
+FROM node:24-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+# Whole build tree (node_modules + workspace symlinks must stay relative).
+COPY --from=build /build /app
+# Provenance: the smoke harness refuses to certify an image whose label does
+# not match HEAD (`--skip-build` used to be able to grade a stale artifact).
+ARG GIT_SHA=unknown
+LABEL org.sched.contour.sha=$GIT_SHA
+EXPOSE 8080
+VOLUME ["/data"]
+ENTRYPOINT ["node", "/app/apps/daemon/dist/entry.js"]

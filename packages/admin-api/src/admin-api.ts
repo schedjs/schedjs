@@ -15,7 +15,27 @@ import {
   type TaskDefinition,
   type ParsedEntry,
 } from '@schedjs/core';
-import type { RunRecord, RunStatus, ScheduleRecord, TaskRecord } from '@schedjs/core';
+import type { PauseInfo, RunRecord, RunStatus, ScheduleRecord, TaskRecord } from '@schedjs/core';
+
+/** Run statuses accepted on the wire (`GET /runs?status=`). */
+const RUN_STATUSES: readonly RunStatus[] = ['queued', 'running', 'succeeded', 'failed', 'cancelled'];
+
+/** Terminal statuses — a finished run is neither cancellable nor re-finishable. */
+const isTerminal = (status: RunStatus): boolean =>
+  status === 'succeeded' || status === 'failed' || status === 'cancelled';
+
+/** Max ids accepted by one bulk batch (R3). More is `prune`, not a bulk op. */
+const BULK_MAX_IDS = 100;
+
+/** Why one id of a bulk batch was not applied (partial result — never atomic). */
+type BulkFailureReason = 'not-found' | 'already-terminal' | 'not-cancellable';
+
+/** Wire shape of the queue pause state: `pausedAt` is an ISO string (null when active). */
+const pausePayload = (info: PauseInfo): { paused: boolean; pausedAt: string | null; startPaused: boolean } => ({
+  paused: info.paused,
+  pausedAt: info.pausedAt === null ? null : info.pausedAt.toISOString(),
+  startPaused: info.startPaused,
+});
 
 /** @schedjs/admin-api version, read from the package manifest at runtime (dist/../package.json). */
 const PACKAGE_VERSION = (() => {
@@ -53,6 +73,13 @@ export interface AdminApiOptions {
    * direct links.
    */
   artifactsReader?: ArtifactReader;
+  /**
+   * Queue pause control (R2) — the daemon passes the engine itself. The pause
+   * flag is runtime state owned by the engine (not `Storage`): this accessor
+   * exists so embedded hosts can opt out — unset → `GET /queue` and
+   * `POST /queue/pause|resume` answer 501 (no fake "active").
+   */
+  queue?: Pick<Engine, 'pause' | 'resume' | 'getPauseInfo'>;
   /**
    * Auth config. When `apiKey` is set, every request must carry
    * `Authorization: Bearer <apiKey>` — otherwise 401. Unset → open (dev mode).
@@ -172,7 +199,10 @@ async function readJsonObject(req: import('node:http').IncomingMessage): Promise
  * dispatching, so an operator reaches these at `/api/…` (e.g. the health probe
  * is `GET /api/health`, not `/health` — books T2 finding 2026-08-22):
  *   GET    /health                      → { ok, uptimeMs, version }
- *   GET    /runs?task=&status=&limit=&offset= → { runs } (newest first)
+ *   GET    /queue                       → { paused, pausedAt, startPaused } | 501 (no queue accessor)
+ *   POST   /queue/pause|resume          → { ok, paused, pausedAt } | 501  (idempotent, never 409)
+ *   GET    /runs?task=&status=&limit=&offset=&since=&until=&runner= → { runs } (newest first; bad status/since/until → 400)
+ *   POST   /runs/bulk/cancel|retry      → { ok, failed:[{id,reason}] } | 400/422 (partial, ≤100 ids)
  *   GET    /runs/:id                    → RunRecord | 404
  *   DELETE /runs/:id                    → 204 | 404 | 409 (active — cancel first)
  *   POST   /runs/:id/retry              → { run } | 404/409  (manual retry)
@@ -234,20 +264,124 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
         return;
       }
 
+        // --- queue pause (R2) ---
+        // State lives in the engine (runtime kill-switch, not Storage); the
+        // daemon hands us the engine through `options.queue`. Idempotent by
+        // design: "bring the queue to this state", not a conditional write —
+        // so a repeat pause/resume is 200, never 409.
+        if (path === '/queue' && method === 'GET') {
+          const queue = options.queue;
+          if (!queue) return json(res, 501, { error: 'queue control not configured (no queue accessor)' });
+          json(res, 200, pausePayload(queue.getPauseInfo()));
+          return;
+        }
+        const queueActionMatch = path.match(/^\/queue\/(pause|resume)$/);
+        if (queueActionMatch) {
+          if (method !== 'POST') return json(res, 405, { error: 'method not allowed' });
+          const queue = options.queue;
+          if (!queue) return json(res, 501, { error: 'queue control not configured (no queue accessor)' });
+          if (queueActionMatch[1] === 'pause') queue.pause();
+          else await queue.resume();
+          // read back the EFFECTIVE state (a repeat pause keeps the original
+          // pausedAt — the engine owns idempotency, the API only reports it)
+          const info = pausePayload(queue.getPauseInfo());
+          json(res, 200, { ok: true, paused: info.paused, pausedAt: info.pausedAt });
+          return;
+        }
+
         // --- runs ---
         if (path === '/runs' && method === 'GET') {
           const filter: RunFilter = {};
           const task = url.searchParams.get('task');
           if (task !== null) filter.taskName = task;
           const status = url.searchParams.get('status');
-          if (status !== null) filter.status = status as RunStatus;
+          if (status !== null) {
+            // r4: fail-fast — `status as RunStatus` silently returned an EMPTY
+            // list for `?status=bogus` (invisible for curl/MCP/3rd-party clients).
+            if (!RUN_STATUSES.includes(status as RunStatus)) {
+              throw new HttpError(400, `invalid status '${status}' (expected ${RUN_STATUSES.join('|')})`);
+            }
+            filter.status = status as RunStatus;
+          }
           const limit = num(url.searchParams.get('limit'));
           if (limit !== undefined) filter.limit = limit;
           const offset = num(url.searchParams.get('offset'));
           if (offset !== undefined) filter.offset = offset;
+          // r4: start-time window (inclusive) + exact runner match. A bad
+          // timestamp is a 400 — a typo must not silently widen to "all".
+          const since = url.searchParams.get('since');
+          if (since !== null) filter.since = isoDate(since, 'since');
+          const until = url.searchParams.get('until');
+          if (until !== null) filter.until = isoDate(until, 'until');
+          const runner = url.searchParams.get('runner');
+          if (runner !== null) filter.runner = runner;
           json(res, 200, { runs: await storage.listRuns(filter) });
           return;
         }
+        // --- bulk cancel/retry (R3) — MUST precede /runs/:id/(cancel|retry),
+        // whose `[^/]+` would otherwise capture the literal id "bulk" ---
+        const bulkMatch = path.match(/^\/runs\/bulk\/(cancel|retry)$/);
+        if (bulkMatch) {
+          if (method !== 'POST') return json(res, 405, { error: 'method not allowed' });
+          const action = bulkMatch[1]!;
+          const body = await readJsonObject(req);
+          const unknown = Object.keys(body).filter((k) => k !== 'ids');
+          if (unknown.length > 0) {
+            throw new HttpError(
+              400,
+              `unknown field(s) on bulk body: ${unknown.join(', ')} (only 'ids' is accepted — no selectors in v1)`,
+            );
+          }
+          const ids = body.ids;
+          if (!Array.isArray(ids)) throw new HttpError(400, 'ids must be an array of run ids');
+          if (ids.length === 0) throw new HttpError(400, 'ids must not be empty');
+          if (ids.length > BULK_MAX_IDS) {
+            throw new HttpError(
+              422,
+              `too many ids: ${ids.length} (max ${BULK_MAX_IDS}) — split the batch (a mass operation is prune, not bulk)`,
+            );
+          }
+          if (ids.some((id) => typeof id !== 'string' || id.length === 0)) {
+            throw new HttpError(400, 'ids must be an array of non-empty strings');
+          }
+          // Partial result by design: no transaction, no atomicity — one id
+          // racing another cancel must not block the rest of the batch. The
+          // loop reuses the single-run pre-checks, not a second code path.
+          const ok: string[] = [];
+          const failed: Array<{ id: string; reason: BulkFailureReason }> = [];
+          for (const id of ids as string[]) {
+            const run = await storage.getRun(id);
+            if (!run) {
+              failed.push({ id, reason: 'not-found' });
+              continue;
+            }
+            if (action === 'cancel') {
+              if (isTerminal(run.status)) {
+                failed.push({ id, reason: 'already-terminal' });
+                continue;
+              }
+              const cancelled = await options.engine.cancelRun(id);
+              // the engine declines (null) or the run is still active after the
+              // signal (nothing was actually in flight) — say so, don't claim ok
+              if (!cancelled || !isTerminal(cancelled.status)) {
+                failed.push({ id, reason: 'not-cancellable' });
+                continue;
+              }
+              ok.push(id);
+              continue;
+            }
+            const retried = await options.engine.retryRun(id);
+            if (!retried) {
+              // retry target cannot be resolved (its task is gone)
+              failed.push({ id, reason: 'not-found' });
+              continue;
+            }
+            ok.push(id);
+          }
+          json(res, 200, { ok, failed });
+          return;
+        }
+
         const artifactMatch = path.match(/^\/runs\/([^/]+)\/artifacts\/(\d+)$/);
         if (artifactMatch) {
           if (method !== 'GET') return json(res, 405, { error: 'method not allowed' });
@@ -662,12 +796,15 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
             } else if (tz !== undefined) {
               patch.tz = tz;
             }
-            // recompute nextRunAt only when the rule or tz actually changed
+            // recompute nextRunAt when the rule OR the effective tz changed —
+            // the latter includes an entry-inner `timezone` (which hoists into
+            // patch.tz, not the top-level `tz`), so the stale nextRunAt must not
+            // survive a pointer move (task admin-patch-inner-tz-stale-nextrunat).
             const effectiveTz = (patch.tz as string | undefined) ?? schedule.tz;
-            if (entry !== null && JSON.stringify(entry.schedule) !== JSON.stringify(schedule.schedule)) {
-              patch.nextRunAt = initialNextRun(entry.schedule, effectiveTz, clock());
-            } else if (tz !== undefined && tz !== schedule.tz) {
-              patch.nextRunAt = initialNextRun(schedule.schedule, effectiveTz, clock());
+            const ruleChanged =
+              entry !== null && JSON.stringify(entry.schedule) !== JSON.stringify(schedule.schedule);
+            if (ruleChanged || effectiveTz !== schedule.tz) {
+              patch.nextRunAt = initialNextRun(entry?.schedule ?? schedule.schedule, effectiveTz, clock());
             }
             await storage.updateSchedule(id, patch);
             json(res, 200, { schedule: await storage.getSchedule(id) });
@@ -722,4 +859,11 @@ function num(v: string | null): number | undefined {
   if (v === null) return undefined;
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/** Parse an ISO-8601 query timestamp; anything unparseable → 400 (not an empty window). */
+function isoDate(v: string, name: string): Date {
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) throw new HttpError(400, `invalid ${name} '${v}' (expected ISO-8601)`);
+  return d;
 }

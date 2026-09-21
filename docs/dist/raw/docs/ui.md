@@ -9,6 +9,10 @@ mounts at `/api/*` and embedded apps can mount at any path. The shell page
 footer shows the `@schedjs/ui` version, the daemon version (fetched from
 `/health`), the admin-api mount and a GitHub link.
 
+Run operations from the browser: filter the run history, cancel or retry a
+batch of runs, and stop/start the queue from the header — see
+[Runs: filters](#runs-filters) and [Queue pause](#queue-pause-header).
+
 Four consumption modes:
 
 <table>
@@ -146,6 +150,7 @@ folder) and point it at your admin api mount:
 <sched-runs base="/api" token="…" limit="50"></sched-runs>
 <sched-tasks base="/api"></sched-tasks>
 <sched-schedules base="/api"></sched-schedules>
+<sched-queue base="/api"></sched-queue>
 ```
 
 Components are Lit custom elements — they work in any framework. Theming is via CSS
@@ -157,17 +162,29 @@ Run deletion in `<sched-runs>` is two-step: the row's **del** button arms to **s
 and only a second click within 3s deletes (auto-disarms on timeout or refresh) — a
 stray click can't wipe a run.
 
-**Auto-refresh** — every list (`<sched-runs>`, `<sched-tasks>`, `<sched-schedules>`)
-polls the admin api on the `refreshMs` interval (property, or the `refresh-ms`
-attribute; default 5000 ms) so live fields — run status/progress, next-run and
-last-run times, fail counts — stay current; set `refreshMs=0` to disable polling.
-The shell sets this from the `?refresh=…` query override.
+**Auto-refresh** — every list (`<sched-runs>`, `<sched-tasks>`, `<sched-schedules>`) and
+`<sched-queue>` polls the admin api on the `refreshMs` interval (property, or the
+`refresh-ms` attribute; default 5000 ms) so live fields — run status/progress,
+next-run and last-run times, fail counts — stay current; set `refreshMs=0` to
+disable polling. The shell sets this from the `?refresh=…` query override.
 
 **Last status** — `<sched-schedules>` and `<sched-tasks>` show a `last status`
 column (✔ succeeded / ✘ failed / ⊘ cancelled) so you can see how the most recent
 run ended at a glance. The value comes from the server (`lastRunStatus` in
 `GET /schedules` / `GET /tasks`), resolved in one pass — the browser does not
 fetch the run per row.
+
+**Fails** — the `<sched-tasks>` `fails` column is the task's **cumulative**
+failed completions (zero prints as `—`): the task row (manual `trigger` /
+`retry`) **plus its schedule rows**, because a schedule-fired run advances the
+schedule, not the task — a cron task's own `failCount` stays 0 forever. The
+component sweeps `GET /schedules` (paged, like `sched tasks`) and sums per task,
+so the browser and the CLI show the same number — the price is ⌈N/1000⌉ extra
+requests per refresh, and the total is a near-snapshot (a board mutating
+mid-sweep can shift the offset window, exactly as in the CLI). It is **not** the
+failure streak — that lives in the daemon process (see
+[Logging → alerts](logging)). The REST payloads stay raw: `GET /tasks` and
+`sched tasks --json` are untouched.
 
 **Schedules are first-class** (schedule-as-entity) — `<sched-schedules>` lists each
 schedule row: `task`, rule, `tz`, **data** (the per-tenant parameters), next run,
@@ -195,10 +212,69 @@ the page size resets to the first page. Page size defaults to 50 (set the `limit
 attribute); the current page offset is the `offset` attribute — set both to start the
 list elsewhere.
 
+## Runs: filters
+
+`<sched-runs>` has a filter row in the footer: **task** (exact name), **since** /
+**until** (start-time window, inclusive) and **runner** (exact match — `docker`,
+`http`, `process`…). They map 1:1 onto `GET /runs`'s `task`/`since`/`until`/`runner`
+query params (the `datetime-local` inputs are converted to ISO in the browser) and
+are component state, so they **survive pagination**: `next`/`prev` keep sending the
+same filter set. Changing any filter drops back to the first page (an offset from
+the unfiltered list is meaningless); `clear` resets all four.
+
+The window is on **started_at**, not `finished_at` — a long run that started
+yesterday and failed an hour ago is not in "last 24h". Widen `since` when auditing
+long runners. See [Runs](runs) for why.
+
+## Runs: bulk cancel / retry
+
+Every row has a checkbox (the head checkbox ticks the whole page, unchecking
+clears the selection). With at least one row ticked, the header's **cancel** /
+**retry** buttons act on exactly those ids via `POST /runs/bulk/cancel|retry`
+(`{ ids: [...] }`, max 100 — more is a mass operation, use `prune`). The single-run
+`cancel`/`retry` routes are untouched.
+
+Bulk is **partial by design** — it is not a transaction, so the UI reports it
+honestly instead of one checkmark for the batch: the result line shows the ok
+count **and** every failed id with its reason
+(`not-found` / `already-terminal` / `not-cancellable`; `no-answer` is the
+UI-side reason for an id the api answered for in neither array — the list is
+reconciled client-side, so an unreported id cannot vanish silently). Failed ids
+stay ticked —
+that is exactly the work that did not happen, and the operator can retry them
+(or re-tick the successors of a cancel). A whole-batch failure (400/422/network)
+shows as an error and leaves the selection untouched.
+
+Selection lives in the component, so it also survives pagination and refreshes;
+a filter change clears the bulk result block.
+
+## Queue pause (header)
+
+`<sched-queue>` is the dashboard header widget: it reads `GET /queue` and shows
+**queue: active** / **queue: paused (since …)** with a single **pause** /
+**resume** button over `POST /queue/pause|resume` (idempotent on the server — the
+button never races). The shell mounts it in the header next to the token box; the
+standalone mode is where an operator stops the queue without touching the daemon.
+
+A pause is *skip, not catch-up*: recurring schedules do not run for the paused
+window (their next slot is computed forward), while one-off and retried runs that
+were already due do play once on resume. Alerts, `tasks.json` sync and
+retention/prune keep working. See [Admin API](admin-api) for the routes.
+
+When the host has no queue accessor (an embedded `createAdminApi` without the
+engine link), the routes answer **501** and the widget says **queue: n/a** with
+the button disabled — never a fake "active", never a button that cannot work.
+
 ## 4. Custom UI
 
 `createAdminApi` exposes the same REST surface the components use — health, runs,
 tasks, schedules, plus trigger / pause / resume / delete. See [Admin API](admin-api).
+
+## Footer & version
+
+The shell page footer shows the `@schedjs/ui` version, the daemon version (fetched
+from `/health`), the admin-api mount and a GitHub link. The header carries the queue
+indicator (`<sched-queue>`) and the token field.
 
 ## Auth (SCHED_ADMIN_KEY)
 

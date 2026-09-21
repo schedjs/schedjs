@@ -25,6 +25,7 @@
     "build": "yarn workspaces foreach --all -pt run build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "smoke:contour": "node scripts/contour-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "publish:check": "node scripts/publish-check.mjs"
   },

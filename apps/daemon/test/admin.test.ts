@@ -98,4 +98,31 @@ describe('daemon admin server', () => {
     expect(trigger.status).toBe(200);
     expect(((await trigger.json()) as { run: RunRecord }).run.status).toBe('succeeded');
   });
+
+  it('wires /api/queue to the engine pause state (R2 — the daemon owns the accessor)', async () => {
+    const { daemon, base, auth } = await startAdmin({ startPaused: true, now: () => NOW });
+
+    // the start-paused freeze is visible through the API (pausedAt = process start)
+    const state = await fetch(`${base}/api/queue`, { headers: auth });
+    expect(state.status).toBe(200);
+    expect(await state.json()).toEqual({ paused: true, pausedAt: NOW.toISOString(), startPaused: true });
+
+    // resume through the API really unpauses the engine
+    const resumed = await fetch(`${base}/api/queue/resume`, { method: 'POST', headers: auth });
+    expect(resumed.status).toBe(200);
+    expect(await resumed.json()).toEqual({ ok: true, paused: false, pausedAt: null });
+    expect(daemon.engine.isPaused()).toBe(false);
+
+    // repeat is idempotent (200, same state — never 409)
+    expect((await fetch(`${base}/api/queue/resume`, { method: 'POST', headers: auth })).status).toBe(200);
+    expect(await (await fetch(`${base}/api/queue`, { headers: auth })).json()).toEqual({
+      paused: false,
+      pausedAt: null,
+      startPaused: false,
+    });
+
+    const paused = await fetch(`${base}/api/queue/pause`, { method: 'POST', headers: auth });
+    expect(paused.status).toBe(200);
+    expect(daemon.engine.isPaused()).toBe(true);
+  });
 });

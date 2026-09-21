@@ -31,6 +31,18 @@ export interface RunUpdate {  /** Partial mid-flight update (poll loop, worker h
 export interface RunFilter {
   taskName?: string;
   status?: RunStatus;
+  /**
+   * Start-time window, **inclusive** on both bounds (`since <= startedAt <= until`).
+   * The window is anchored on `startedAt` — the same column `listRuns` sorts by —
+   * so an unfinished run is never lost from a window. Price (accepted): a long run
+   * that started before `since` and failed inside the window is not listed; widen
+   * `since` when auditing long runners (docs/05.runs.md → Filtering).
+   */
+  since?: Date;
+  /** Upper bound of the start-time window, inclusive. See {@link since}. */
+  until?: Date;
+  /** Exact runner match — 'docker', 'http', 'process'… (polyglot worker triage). */
+  runner?: string;
   limit?: number;
   offset?: number;
 }

@@ -301,6 +301,9 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
     );
     CREATE INDEX IF NOT EXISTS idx_due ON scheduled_tasks (next_run_at);
     CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs (task_name, started_at);
+    -- indexes below reference only base-CREATE columns: this block runs before the
+    -- v0.1→v0.2 ALTERs, so an index on an ALTER-added column would not exist yet
+    CREATE INDEX IF NOT EXISTS idx_runs_started ON task_runs (started_at);
     CREATE INDEX IF NOT EXISTS idx_schedules_task ON schedules (task_name);
   `);
 
@@ -560,6 +563,19 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
     if (filter.status !== undefined) {
       where.push('status = ?');
       params.push(filter.status);
+    }
+    if (filter.runner !== undefined) {
+      where.push('runner = ?');
+      params.push(filter.runner);
+    }
+    // Start-time window, both bounds inclusive (epoch ms column) — served by idx_runs_started.
+    if (filter.since !== undefined) {
+      where.push('started_at >= ?');
+      params.push(filter.since.getTime());
+    }
+    if (filter.until !== undefined) {
+      where.push('started_at <= ?');
+      params.push(filter.until.getTime());
     }
     const sql =
       `SELECT * FROM task_runs ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ` +

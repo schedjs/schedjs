@@ -68,10 +68,38 @@ embedded hosts — pass `version` to `createAdminApi` to override).
 { "ok": true, "uptimeMs": 123456 }
 ```
 
+## Queue (pause / resume)
+
+```text
+GET  /api/queue          → { "paused": false, "pausedAt": null, "startPaused": false }
+POST /api/queue/pause    → { "ok": true, "paused": true,  "pausedAt": "2026-09-20T09:30:00.000Z" }
+POST /api/queue/resume   → { "ok": true, "paused": false, "pausedAt": null }
+```
+
+Pausing stops the queue from claiming new work. It is a runtime kill-switch
+owned by the engine, **not** persisted state — a restart without `startPaused`
+is active again. While paused, `tasks.json` sync, retention/prune and alerts on
+already-running work keep going. On resume, recurring schedules **skip** the
+missed window (their `nextRunAt` moves to the next future slot — no catch-up
+storm, no `missed-slot` alert); `once`/delayed runs and pending retries still
+run, each exactly once.
+
+- Both mutations are **idempotent**: `POST /queue/pause` on an already-paused
+queue returns `200` with the **same** `pausedAt` (never `409`), and
+`POST /queue/resume` on an active queue returns `200` with `paused: false`.
+Think "bring the queue to this state", not a conditional write.
+- `pausedAt` — ISO-8601 timestamp of when the freeze started (`null` when
+active). With `SCHED_START_PAUSED=1` it is the process start time and
+`startPaused` is `true` ("frozen since boot", not an operator command).
+- Queue state is deliberately **not** part of the open `GET /health` payload —
+`/health` answers liveness for compose/LB probes, not control-plane state.
+- Embedded hosts that use `createAdminApi` without a queue accessor get `501`
+(`queue control not configured`) — the routes never invent a fake state.
+
 ## Runs
 
 ```text
-GET /runs?task=greet&status=failed&limit=20&offset=0
+GET /runs?task=greet&status=failed&since=2026-09-19T00:00:00Z&until=2026-09-20T00:00:00Z&runner=docker&limit=20&offset=0
 ```
 
 <table>
@@ -128,7 +156,59 @@ GET /runs?task=greet&status=failed&limit=20&offset=0
         cancelled
       </code>
       
-      )
+      ); any other value → <strong>
+        400
+      </strong>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        since
+      </code>
+      
+      , <code>
+        until
+      </code>
+    </td>
+    
+    <td>
+      start-time window on <code>
+        startedAt
+      </code>
+      
+      , <strong>
+        ISO-8601, both bounds inclusive
+      </strong>
+      
+      ; an unparseable timestamp → <strong>
+        400
+      </strong>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        runner
+      </code>
+    </td>
+    
+    <td>
+      exact runner match (<code>
+        docker
+      </code>
+      
+      , <code>
+        http
+      </code>
+      
+      , <code>
+        process
+      </code>
+      
+      …)
     </td>
   </tr>
   
@@ -149,6 +229,10 @@ GET /runs?task=greet&status=failed&limit=20&offset=0
   </tr>
 </tbody>
 </table>
+
+The window is on `startedAt`, matching the fixed `startedAt DESC` order — a long
+run that started before `since` is not in the window even if it failed inside it
+(see [Runs → Filtering run history](runs#filtering-run-history)).
 
 ```json
 { "runs": [ { "id": "...", "taskName": "greet", "status": "failed", ... } ] }
@@ -226,6 +310,30 @@ the response is sent after the worker actually stopped.
 
 `DELETE /runs/:id` refuses an **active** run (`409` — cancel it first); finished
 runs delete normally.
+
+### Bulk cancel / retry
+
+```text
+POST /runs/bulk/cancel   → { "ok": ["a1", "b2"], "failed": [ { "id": "c3", "reason": "already-terminal" } ] }
+POST /runs/bulk/retry    → { "ok": ["a1"],       "failed": [ { "id": "zz", "reason": "not-found" } ] }
+```
+
+Body: `{ "ids": ["a1", "b2", "c3"] }` — explicit run ids only (no selectors in
+v1; an unknown top-level field is a `400`).
+
+- The result is **partial, never atomic**: every id is applied independently
+through exactly the same logic as `POST /runs/:id/cancel|retry`, so a run that
+raced with another cancel does not block the rest of the batch.
+- `failed[].reason` ∈ `not-found` (unknown run id — or, for retry, the target's
+task is gone) · `already-terminal` (cancel on a run that already
+succeeded/failed/cancelled) · `not-cancellable` (the engine declined — the run
+was not in flight — or the cancel signal left the run non-terminal).
+- A missing or non-array `ids`, an empty `ids` array, or a non-string/empty
+element inside it → `400`.
+- More than **100** ids → `422` with the count: a 5000-run operation is
+`prune`, not a bulk call. Split the batch.
+- Route order matters: `/runs/bulk/cancel` is a distinct route — it is never
+interpreted as the id literally named `bulk`.
 
 ## Tasks
 

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export { AdminApiClient, AdminApiError } from './client.js';
-export type { RunListFilter } from './client.js';
+export type { RunListFilter, QueueState } from './client.js';
 export { createMcpServer } from './server.js';
 export type { McpServerOptions, McpServerHandle } from './server.js';
 export { TOOL_DEFS, MUTATIONS, runTool } from './tools.js';

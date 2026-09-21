@@ -351,12 +351,24 @@ on a shared connection. Unknown session ids are rejected with `404`.
     
     <td>
       <code>
-        task? status? limit? offset?
+        task? status? since? until? runner? limit? offset?
       </code>
     </td>
     
     <td>
-      Runs, newest first; filter by task/status
+      Runs, newest first; filter by task/status/runner and the <code>
+        startedAt
+      </code>
+      
+       window (<code>
+        since
+      </code>
+      
+      /<code>
+        until
+      </code>
+      
+      , ISO-8601, inclusive)
     </td>
   </tr>
   
@@ -477,6 +489,42 @@ on a shared connection. Unknown session ids are rejected with `404`.
   <tr>
     <td>
       <code>
+        pause_queue
+      </code>
+    </td>
+    
+    <td>
+      —
+    </td>
+    
+    <td>
+      Pause the whole queue (mutation, idempotent): recurring schedules skip the window, <code>
+        once
+      </code>
+      
+      /retries are deferred
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        resume_queue
+      </code>
+    </td>
+    
+    <td>
+      —
+    </td>
+    
+    <td>
+      Resume a paused queue (mutation, idempotent); deferred runs play out once
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
         delete_task
       </code>
     </td>
@@ -512,7 +560,12 @@ on a shared connection. Unknown session ids are rejected with `404`.
 </tbody>
 </table>
 
-Mutations (`trigger_task`, `pause_task`, `resume_task`, `delete_run`, `cancel_run`, `retry_run`, `delete_task`, `create_schedule`, `update_schedule`, `pause_schedule`, `resume_schedule`, `delete_schedule`) are disabled in `--readonly` mode.
+`pause_queue`/`resume_queue` are **mutations** — gated by `--readonly` like the
+rest. There are deliberately **no bulk run tools**: a batch cancel/retry is an
+operator action (CLI `sched cancel <id...>` / admin API); an agent makes an
+explicit loop of `cancel_run`/`retry_run` calls.
+
+Mutations (`trigger_task`, `pause_task`, `resume_task`, `pause_queue`, `resume_queue`, `delete_run`, `cancel_run`, `retry_run`, `delete_task`, `create_schedule`, `update_schedule`, `pause_schedule`, `resume_schedule`, `delete_schedule`) are disabled in `--readonly` mode.
 
 ## Safety model
 

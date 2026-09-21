@@ -771,8 +771,11 @@ npm install -g @schedjs/cli
 sched <command> [args] [--admin-url URL] [--api-key KEY] [--json]
 
 Commands:
-  status                   daemon health + task/schedule/run counts + next runs
+  status                   daemon health + queue state + task/schedule/run counts
   runs [--task T] [--status S] [--limit N] [--offset N]
+       [--since TIME] [--until TIME] [--runner R]
+  cancel <id...>           bulk-cancel runs (partial result; exit 1 on any failure)
+  retry <id...>            bulk-retry finished runs (partial result; exit 1 on any failure)
   tasks
   schedules
   trigger <task> [--data JSON]
@@ -780,6 +783,14 @@ Commands:
   resume <task> | resume --schedule <id>
   check-worker <url> [--api-key KEY] [--timeout SECONDS]
 ```
+
+`runs` filters: `task`, `status`, `limit`, `offset` plus the R4 window
+`--since` / `--until` and the exact `--runner` match. `--since`/`--until`
+accept **ISO-8601** or a **relative form** — `30m`, `24h`, `7d`, `2w` ("that
+long ago"); the relative form is resolved by the CLI, and the admin API always
+receives ISO-8601. The window is on `startedAt`, both bounds inclusive (see
+[Runs → Filtering](runs#filtering-run-history)). `--json` echoes the *resolved*
+filter, so `--since 24h` shows the exact ISO bound that was queried.
 
 Global flags:
 
@@ -911,21 +922,31 @@ Global flags:
 
 Exit codes: **0** ok / **1** api·network·data error / **2** usage.
 
+`cancel` / `retry` take one or more run ids and return a **partial result**
+(`{ ok, failed }`, reason ∈ `not-found | already-terminal | not-cancellable`).
+Exit code **1** whenever at least one id failed, **0** only on a fully clean
+batch — so a partial batch never reads as success to a shell.
+
 `--api-key` before the command is the admin key; after `check-worker` it is the
 *worker's* key (a different secret — see below).
 
 ## Examples
 
 ```bash
-sched status                                   # is my daemon alive? next runs?
+sched status                                   # is my daemon alive? queue paused? next runs?
 sched runs --status failed --limit 20 --json   # failed runs as JSON
+sched runs --since 24h --until 2h --runner docker   # what fell over in the last 22 hours, docker only
+sched cancel r-1 r-2 r-3                       # bulk-cancel a mixed batch
 sched trigger publish-video --data '{"videoId":"v-42"}'
 sched pause --schedule channel-ada             # pause one channel's schedule, not the task
 sched resume sync-channel-stats
 ```
 
-`status` composes one view: `/health` + `/tasks` + `/schedules` + a bounded
-failed-runs fetch, and lists the five soonest `nextRunAt` schedules.
+`status` composes one view: `/health` + `/queue` + `/tasks` + `/schedules` + a
+bounded failed-runs fetch, and lists the five soonest `nextRunAt` schedules. The
+queue line is `queue: active` or `queue: paused (since …, start-paused)` — the
+`start-paused` marker distinguishes a `SCHED_START_PAUSED` boot freeze from an
+operator pause. A host without a queue accessor prints `queue: n/a`.
 
 ## PowerShell note
 

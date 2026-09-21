@@ -74,5 +74,9 @@ function format(event: EngineEvent, prefix: string): string {
       return `${prefix} error: ${event.message}`;
     case 'sync-failed':
       return `${prefix} sync failed (${event.consecutiveFailures}×): ${event.error}`;
+    case 'queue-paused':
+      return `${prefix} queue paused${event.startPaused ? ' (start-paused)' : ''} at ${fmtTime(event.pausedAt)}`;
+    case 'queue-resumed':
+      return `${prefix} queue resumed after ${event.pausedMs}ms: skipped ${event.skippedSchedules} schedule(s), deferred ${event.deferredRuns} run(s)`;
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cron scheduler CLI for Node.js — status, runs, tasks, schedules, trigger/pause/resume via the admin API + worker conformance checker",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,6 +17,10 @@
   "files": [
     "dist"
   ],
+  "devDependencies": {
+    "@schedjs/admin-api": "workspace:*",
+    "@schedjs/core": "workspace:*"
+  },
   "scripts": {
     "build": "node ../../scripts/clean.mjs && tsc -p tsconfig.build.json"
   },

@@ -2321,6 +2321,45 @@ describe('engine — cancelRun', () => {
     await running; // the tick completes cleanly
   });
 
+  it('cancels a MANUALLY triggered sync run and returns the terminal record (no stale running snapshot)', async () => {
+    // Live-gate finding (phase-2 docker contour): the manual dispatch paths
+    // resolved the cancel-registry promise in `finally`, BEFORE the terminal
+    // write — cancelRun then read a pre-cancellation snapshot, so bulk cancel
+    // reported a genuinely cancelled run as `not-cancellable` (and
+    // POST /runs/:id/cancel answered with status=running).
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask());
+    let started!: () => void;
+    const startedP = new Promise<void>((r) => (started = r));
+    const runner: Runner = {
+      run: (_task, _runId, _at, hooks) =>
+        new Promise((_resolve, reject) => {
+          started();
+          hooks?.signal?.addEventListener('abort', () => {
+            const e = new Error('cancelled by user');
+            e.name = 'AbortError';
+            reject(e);
+          });
+        }),
+    };
+    // `onRunFinal` mirrors the daemon with alerts wired: the terminal hook reads
+    // storage BEFORE finishRun, which is what orders cancelRun's read ahead of
+    // the cancellation write. Without the hook the race stays hidden.
+    const engine = createEngine({ storage, runner, now: () => NOON, onRunFinal: async () => {} });
+
+    const trigger = engine.triggerTask('task-a');
+    await startedP;
+    const run = [...storage.runs.values()][0]!;
+    expect(run.trigger).toBe('manual');
+    expect(run.status).toBe('running');
+
+    const cancelled = await engine.cancelRun(run.id);
+    expect(cancelled!.status).toBe('cancelled'); // the caller reads THIS record — it must be terminal
+    expect(cancelled!.error).toBe('cancelled by user');
+    expect((await storage.getRun(run.id))!.status).toBe('cancelled');
+    await trigger; // the manual dispatch completes cleanly
+  });
+
   it('returns a terminal run unchanged (the caller decides — 409)', async () => {
     const storage = new MemoryStorage();
     await seedTask(storage, makeTask());

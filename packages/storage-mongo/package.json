@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/storage-mongo",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Cron scheduler MongoDB storage adapter for Node.js — contract-tested, bring-your-own-history path",
   "type": "module",
   "main": "./dist/index.js",

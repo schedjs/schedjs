@@ -237,9 +237,11 @@ describe('sched-tasks', () => {
       tasks: [
         { name: 't1', runner: 'http', schedule: { kind: 'interval', ms: 60000 }, tz: 'UTC', config: {}, label: null, description: null, nextRunAt: null, lastRunAt: null, lockedAt: null, failCount: 2, paused: false, disabled: false },
       ],
+      // the FAILS cell is the task row plus this task's schedule rows (fails.test.ts)
+      scheduleFails: new Map([['t1', 3]]),
     });
     expect(out.textContent).toContain('t1');
     expect(out.textContent).toContain('pause');
-    expect(out.textContent).toContain('2');
+    expect(out.textContent).toContain('5');
   });
 });

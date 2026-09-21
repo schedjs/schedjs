@@ -81,7 +81,12 @@ describe('openapi.json — route parity with the router', () => {
   it('covers the canonical endpoint list (docstring-parity)', () => {
     expect(Object.keys(SPEC.paths).sort()).toEqual([
       '/health',
+      '/queue',
+      '/queue/pause',
+      '/queue/resume',
       '/runs',
+      '/runs/bulk/cancel',
+      '/runs/bulk/retry',
       '/runs/{id}',
       '/runs/{id}/artifacts/{idx}',
       '/runs/{id}/cancel',

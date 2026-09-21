@@ -80,6 +80,15 @@ export default defineNuxtConfig({
       // The '/' redirect stops the crawler from discovering /docs/* —
       // seed the crawl from the first docs page instead.
       routes: ['/docs/introduction'],
+      // `/openapi.json` is a static public asset (docs/public/openapi.json,
+      // synced by sync-openapi.mjs, served at <base>/openapi.json on Pages).
+      // The crawler only understands page routes: it prefixes the base, the
+      // base-prefixed path misses Nitro's unprefixed-public-asset skip list,
+      // and the catch-all docs page renders it → a fatal
+      // `[request error] [fatal] ... openapi.json` 404 in every generate.
+      // The asset is copied to the output verbatim, so there is nothing to
+      // prerender here (docs gate: `nuxi generate` → 0 `request error`).
+      ignore: [/\/openapi\.json$/],
     },
   },
 })

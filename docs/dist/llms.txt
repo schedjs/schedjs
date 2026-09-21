@@ -10,7 +10,7 @@
 
 - [What's new](https://schedjs.github.io/schedjs/raw/docs/whats-new.md): Version history — release notes for every sched wave, newest first
 - [Introduction](https://schedjs.github.io/schedjs/raw/docs/introduction.md): What sched is and how it works
-- [Comparison](https://schedjs.github.io/schedjs/raw/docs/comparison.md): sched next to the Node.js job schedulers and queues it is usually weighed against — BullMQ, Bull, Kue, Bee, pg-boss and Agenda
+- [Comparison](https://schedjs.github.io/schedjs/raw/docs/comparison.md): sched next to the Node.js job schedulers and queues it is usually weighed against — BullMQ (and its commercial BullMQ-Pro), Bull, Kue, Bee, pg-boss and Agenda
 - [Quick start](https://schedjs.github.io/schedjs/raw/docs/quick-start.md): Three ways to run sched — pick your scale
 - [Tasks](https://schedjs.github.io/schedjs/raw/docs/tasks.md): The tasks.json format — schedules, runners, config
 - [Runs](https://schedjs.github.io/schedjs/raw/docs/runs.md): The run lifecycle and RunRecord

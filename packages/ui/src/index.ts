@@ -3,9 +3,10 @@ import { SchedTasks } from './sched-tasks.js';
 import { SchedSchedules } from './sched-schedules.js';
 import { SchedTaskRun } from './sched-task-run.js';
 import { SchedStatus } from './sched-status.js';
+import { SchedQueue } from './sched-queue.js';
 import { refreshFromSearch } from './refresh.js';
 
-export { SchedRuns, SchedTasks, SchedSchedules, SchedTaskRun, SchedStatus, refreshFromSearch };
+export { SchedRuns, SchedTasks, SchedSchedules, SchedTaskRun, SchedStatus, SchedQueue, refreshFromSearch };
 
 /**
  * Register all sched custom elements. Safe to call repeatedly (idempotent).
@@ -19,6 +20,7 @@ export function defineSchedElements(): void {
     ['sched-schedules', SchedSchedules],
     ['sched-task-run', SchedTaskRun],
     ['sched-status', SchedStatus],
+    ['sched-queue', SchedQueue],
   ] as const) {
     if (!customElements.get(tag)) customElements.define(tag, cls);
   }

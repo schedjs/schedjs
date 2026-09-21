@@ -9,7 +9,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { AdminApiClient, AdminApiError } from './client.js';
+import { AdminApiClient, AdminApiError, type QueueState, type RunStatusFilter } from './client.js';
 import { checkWorker, renderVerdict, type ScenarioResult } from './check-worker.js';
 import { field, formatTable, humanDuration, shortTime } from './table.js';
 
@@ -29,6 +29,25 @@ const DEFAULT_ADMIN_URL = 'http://127.0.0.1:8080/api';
 /** Runs filter status enum (F4) — mirrors RunStatus in @schedjs/core. */
 const RUN_STATUSES = new Set(['queued', 'running', 'succeeded', 'failed', 'cancelled']);
 
+/** Relative durations accepted by `--since`/`--until`: `30s`, `15m`, `24h`, `7d`, `2w`. */
+const RELATIVE_TIME = /^(\d+)(s|m|h|d|w)$/;
+const RELATIVE_MS: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+
+/**
+ * Parse a `--since`/`--until` value into ISO-8601 for the admin API. A relative
+ * form (`24h`, `7d`) means "that long ago"; anything else must be an ISO-8601
+ * timestamp. Relative parsing happens HERE only — the wire always carries ISO.
+ */
+function parseTimeFilter(value: string, flag: string, now = Date.now()): string {
+  const rel = RELATIVE_TIME.exec(value);
+  if (rel) return new Date(now - Number(rel[1]) * RELATIVE_MS[rel[2]!]!).toISOString();
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) {
+    throw new UsageError(`${flag}: invalid time '${value}' (expected ISO-8601 or a relative form like 24h/7d)`);
+  }
+  return d.toISOString();
+}
+
 /** Set by main() — lets the error handler keep --json a machine contract (F7). */
 let jsonMode = false;
 
@@ -43,9 +62,13 @@ const USAGE = `sched v${VERSION} — operator CLI for sched (admin API client)
 Usage: sched <command> [args] [--admin-url URL] [--api-key KEY] [--json]
 
 Commands:
-  status                 daemon health + task/schedule/run counts + next runs
+  status                 daemon health + queue state + task/schedule/run counts
   runs [--task T] [--status S] [--limit N] [--offset N]
-                         list runs (newest first); filters are forwarded to the API
+       [--since TIME] [--until TIME] [--runner R]
+                         list runs (newest first); --since/--until take ISO-8601
+                         or a relative form (30m, 24h, 7d); --runner is exact
+  cancel <id...>         bulk-cancel runs (exit 1 if any id failed)
+  retry <id...>          bulk-retry finished runs (exit 1 if any id failed)
   tasks                  list tasks
   schedules              list schedules
   trigger <task> [--data JSON]
@@ -67,6 +90,8 @@ Exit codes: 0 ok / 1 api, network or data error / 2 usage.
 Examples:
   sched status
   sched runs --status failed --limit 20 --json
+  sched runs --since 24h --until 2h --runner docker
+  sched cancel r-1 r-2 r-3
   sched trigger sync-seller --data '{"idSeller":2}'
   sched pause --schedule sch-123
   sched check-worker http://127.0.0.1:8081 --api-key $SCHED_API_KEY
@@ -178,8 +203,33 @@ function printJson(body: unknown): void {
   process.stdout.write(JSON.stringify(body, null, 2) + '\n');
 }
 
+/** GET /queue, degrading to null when the host has no queue accessor (501). */
+async function readQueue(client: AdminApiClient): Promise<QueueState | null> {
+  try {
+    return await client.getQueue();
+  } catch (err) {
+    if (err instanceof AdminApiError && err.status === 501) return null;
+    throw err;
+  }
+}
+
+/** R2 queue line: `queue: active` / `queue: paused (since …, start-paused)`. */
+function queueLine(queue: QueueState | null): string {
+  if (queue === null) return 'queue: n/a (no queue accessor)';
+  if (!queue.paused) return 'queue: active';
+  // pausedAt is non-null whenever the engine is paused; guard anyway — a wire
+  // client must not print "since —" on a partially-initialized state.
+  if (queue.pausedAt === null) return 'queue: paused';
+  return `queue: paused (since ${shortTime(queue.pausedAt)}${queue.startPaused ? ', start-paused' : ''})`;
+}
+
 async function cmdStatus(client: AdminApiClient, json: boolean): Promise<void> {
-  const [health, tasks, schedules] = await Promise.all([client.health(), client.listTasks(), client.listSchedules()]);
+  const [health, tasks, schedules, queue] = await Promise.all([
+    client.health(),
+    client.listTasks(),
+    client.listSchedules(),
+    readQueue(client),
+  ]);
   const failedRuns = await client.listRuns({ status: 'failed', limit: 100 });
   const now = Date.now();
   const nextRuns = schedules
@@ -195,13 +245,15 @@ async function cmdStatus(client: AdminApiClient, json: boolean): Promise<void> {
       tasks: tasks.length,
       schedules: schedules.length,
       failedRuns: failedRuns.length,
+      queue,
       nextRuns,
     });
     return;
   }
   process.stdout.write(
     `sched: daemon alive — version ${health.version}, uptime ${humanDuration(health.uptimeMs)}\n` +
-      `tasks ${tasks.length} | schedules ${schedules.length} | failed runs (last 100) ${failedRuns.length}\n`,
+      `tasks ${tasks.length} | schedules ${schedules.length} | failed runs (last 100) ${failedRuns.length}\n` +
+      `${queueLine(queue)}\n`,
   );
   if (nextRuns.length > 0) {
     process.stdout.write('next runs:\n');
@@ -215,9 +267,12 @@ async function cmdRuns(client: AdminApiClient, args: string[], json: boolean): P
     '--status': 'string',
     '--limit': 'string',
     '--offset': 'string',
+    '--since': 'string',
+    '--until': 'string',
+    '--runner': 'string',
   });
   if (positionals.length > 0) throw new UsageError(`runs: unexpected argument '${positionals[0]}'`);
-  const filter: { task?: string; status?: string; limit?: number; offset?: number } = {};
+  const filter: RunStatusFilter = {};
   if (typeof values['--task'] === 'string') filter.task = values['--task'];
   if (typeof values['--status'] === 'string') {
     // F4 (CLI-F&F): validate the status enum — a typo must not silently return an empty list.
@@ -235,9 +290,23 @@ async function cmdRuns(client: AdminApiClient, args: string[], json: boolean): P
     if (key === '--limit') filter.limit = n;
     else filter.offset = n;
   }
+  for (const key of ['--since', '--until'] as const) {
+    if (typeof values[key] !== 'string') continue;
+    filter[key === '--since' ? 'since' : 'until'] = parseTimeFilter(values[key], `runs: ${key}`);
+  }
+  if (typeof values['--runner'] === 'string') {
+    // an empty runner is a typo trap: `?runner=` matches nothing and reads as "no docker runs"
+    if (values['--runner'].length === 0) throw new UsageError('runs: --runner must not be empty');
+    filter.runner = values['--runner'];
+  }
+  // ISO-8601 UTC strings are fixed-width, so lexicographic order == time order.
+  if (filter.since !== undefined && filter.until !== undefined && filter.since > filter.until) {
+    throw new UsageError(`runs: --since (${filter.since}) is later than --until (${filter.until}) — empty window`);
+  }
   const runs = await client.listRuns(filter);
   if (json) {
-    printJson({ runs });
+    // echo the RESOLVED filter — a relative `24h` becomes a visible ISO bound
+    printJson({ runs, filter });
     return;
   }
   if (runs.length === 0) {
@@ -252,6 +321,50 @@ async function cmdRuns(client: AdminApiClient, args: string[], json: boolean): P
   );
 }
 
+async function cmdBulk(client: AdminApiClient, command: 'cancel' | 'retry', args: string[], json: boolean): Promise<void> {
+  const { positionals } = parseCommandArgs(args, {});
+  if (positionals.length === 0) throw new UsageError(`${command}: missing <id> (one or more run ids)`);
+  const result = await client.bulkRuns(command, positionals);
+  if (json) {
+    // the full partial result is the machine contract (R3)
+    printJson({ ok: result.ok, failed: result.failed });
+  } else {
+    const verb = command === 'cancel' ? 'cancelled' : 'retried';
+    for (const id of result.ok) process.stdout.write(`${verb} ${id}\n`);
+    for (const f of result.failed) process.stdout.write(`failed ${f.id}: ${f.reason}\n`);
+  }
+  // exit 1 on ANY failure — a partial batch must not read as success to a shell
+  if (result.failed.length > 0) process.exitCode = 1;
+}
+
+/**
+ * Per-task total of `schedule.failCount` (R1 follow-up). A schedule-driven run
+ * advances the SCHEDULE row (`engine.completeScheduleRun` →
+ * `storage.completeSchedule`), so a cron task's own `failCount` stays 0 forever
+ * and the FAILS column read '—' on exactly the boards it exists for. Only the
+ * human view aggregates — the API payload and the `--json` pass-through (which
+ * carries the raw task records) are untouched.
+ */
+async function scheduleFailCounts(client: AdminApiClient): Promise<Map<string, number>> {
+  const schedules = await client.listAllSchedules();
+  const byTask = new Map<string, number>();
+  for (const s of schedules) {
+    const name = typeof s.taskName === 'string' ? s.taskName : '';
+    const count = typeof s.failCount === 'number' ? s.failCount : 0;
+    if (name === '' || count === 0) continue;
+    byTask.set(name, (byTask.get(name) ?? 0) + count);
+  }
+  return byTask;
+}
+
+/** FAILS cell: task row + its schedule rows; zero prints as an em dash. */
+function failsCell(task: Record<string, unknown>, scheduleFails: Map<string, number>): string {
+  const name = typeof task.name === 'string' ? task.name : '';
+  const manual = typeof task.failCount === 'number' ? task.failCount : 0;
+  const total = manual + (name === '' ? 0 : (scheduleFails.get(name) ?? 0));
+  return total > 0 ? String(total) : '—';
+}
+
 async function cmdTasks(client: AdminApiClient, json: boolean): Promise<void> {
   const tasks = await client.listTasks();
   if (json) {
@@ -262,6 +375,7 @@ async function cmdTasks(client: AdminApiClient, json: boolean): Promise<void> {
     process.stdout.write('no tasks\n');
     return;
   }
+  const scheduleFails = await scheduleFailCounts(client);
   process.stdout.write(
     formatTable(
       ['NAME', 'RUNNER', 'PRIORITY', 'PAUSED', 'FAILS', 'NEXT RUN'],
@@ -270,10 +384,13 @@ async function cmdTasks(client: AdminApiClient, json: boolean): Promise<void> {
         field(t, 'runner'),
         field(t, 'priority'),
         t.paused ? 'yes' : 'no',
-        // FAILS — how long a task has been red, without waiting for a reminder
-        // (R1: no timer-based "still failing" notes). Zero prints as an em
-        // dash: a column of dashes reads as "nothing is red" at a glance.
-        typeof t.failCount === 'number' && t.failCount > 0 ? String(t.failCount) : '—',
+        // FAILS — how many failed completions the task has, without waiting for
+        // a reminder (R1: no timer-based "still failing" notes). Cumulative, NOT
+        // a streak: it counts manual runs (task row) plus every schedule row,
+        // since runtime state of a schedule-driven run lives on the schedule.
+        // Zero prints as an em dash: a column of dashes reads as "nothing is
+        // red" at a glance.
+        failsCell(t, scheduleFails),
         shortTime(t.nextRunAt as string),
       ]),
     ) + '\n',
@@ -399,6 +516,10 @@ async function main(): Promise<void> {
       break;
     case 'runs':
       await cmdRuns(client, rest, global.json);
+      break;
+    case 'cancel':
+    case 'retry':
+      await cmdBulk(client, command, rest, global.json);
       break;
     case 'tasks':
       await cmdTasks(client, global.json);

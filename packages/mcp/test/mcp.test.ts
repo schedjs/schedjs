@@ -73,6 +73,7 @@ async function start(opts: {
   engine?: (name: string) => Promise<RunRecord | null>;
   apiKey?: string;
   readonly?: boolean;
+  queue?: Parameters<typeof createAdminApi>[0]['queue'];
 } = {}): Promise<Ctx> {
   const db = new DatabaseSync(':memory:');
   const storage = createSqliteStorage(db);
@@ -100,6 +101,7 @@ async function start(opts: {
     engine: { triggerTask: trigger, cancelRun: cancel, retryRun: retry } as never,
     storage,
     ...(opts.apiKey ? { auth: { apiKey: opts.apiKey } } : {}),
+    ...(opts.queue !== undefined ? { queue: opts.queue } : {}),
   });
   const port = await api.listen(0);
   servers.push({ close: () => api.close() });
@@ -252,14 +254,22 @@ describe('product MCP over admin api', () => {
       'list_runs',
       'list_schedules',
       'list_tasks',
+      'pause_queue',
       'pause_schedule',
       'pause_task',
+      'resume_queue',
       'resume_schedule',
       'resume_task',
       'retry_run',
       'trigger_task',
       'update_schedule',
     ]);
+  });
+
+  it('exposes no bulk run tools — batch ops stay operator-only (R3 boundary)', async () => {
+    const { client } = await start();
+    const tools = await client.listTools();
+    expect(tools.tools.map((t) => t.name).filter((n) => /bulk/i.test(n))).toEqual([]);
   });
 
   it('list_tasks returns seeded tasks', async () => {
@@ -332,6 +342,64 @@ describe('product MCP over admin api', () => {
     const limited = await call(client, 'list_runs', { limit: 2 });
     // newest first
     expect((parse(limited.text) as RunRecord[]).map((r) => r.id)).toEqual(['r3', 'r2']);
+  });
+
+  it('list_runs forwards since/until/runner to the admin API (R4)', async () => {
+    const runs = [
+      makeRun('r1', { runner: 'http', status: 'succeeded', startedAt: new Date('2026-08-16T08:00:00Z') }),
+      makeRun('r2', { runner: 'docker', status: 'failed', startedAt: new Date('2026-08-16T09:00:00Z') }),
+      makeRun('r3', { runner: 'http', status: 'running', startedAt: new Date('2026-08-16T10:00:00Z') }),
+    ];
+    const { client } = await start({ runs });
+
+    // started_at window, both bounds inclusive
+    const window = await call(client, 'list_runs', { since: '2026-08-16T08:30:00.000Z', until: '2026-08-16T09:30:00.000Z' });
+    expect((parse(window.text) as RunRecord[]).map((r) => r.id)).toEqual(['r2']);
+
+    const byRunner = await call(client, 'list_runs', { runner: 'docker' });
+    expect((parse(byRunner.text) as RunRecord[]).map((r) => r.id)).toEqual(['r2']);
+
+    const combined = await call(client, 'list_runs', { since: '2026-08-16T00:00:00.000Z', runner: 'http' });
+    expect((parse(combined.text) as RunRecord[]).map((r) => r.id)).toEqual(['r3', 'r1']);
+  });
+
+  it('list_runs passes a bad since through to the admin API (400 surfaces as a tool error)', async () => {
+    const { client } = await start();
+    const bad = await call(client, 'list_runs', { since: 'yesterday' });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toMatch(/since/);
+  });
+
+  it('pause_queue / resume_queue drive the engine queue (R2)', async () => {
+    let paused = false;
+    let pausedAt: Date | null = null;
+    let startPaused = false;
+    const { client } = await start({
+      queue: {
+        pause: () => {
+          if (!paused) {
+            paused = true;
+            pausedAt = new Date('2026-08-16T09:00:00Z');
+            startPaused = false;
+          }
+        },
+        resume: async () => {
+          paused = false;
+          pausedAt = null;
+          startPaused = false;
+          return { pausedMs: 0, skippedSchedules: 0, deferredRuns: 0 };
+        },
+        getPauseInfo: () => ({ paused, pausedAt, startPaused }),
+      },
+    });
+
+    const p = await call(client, 'pause_queue');
+    expect(p.isError).toBe(false);
+    expect(parse(p.text)).toEqual({ ok: true, paused: true, pausedAt: '2026-08-16T09:00:00.000Z' });
+
+    const r = await call(client, 'resume_queue');
+    expect(r.isError).toBe(false);
+    expect(parse(r.text)).toEqual({ ok: true, paused: false, pausedAt: null });
   });
 
   it('get_run returns one run; unknown run is a tool error', async () => {
@@ -545,6 +613,14 @@ describe('product MCP over admin api', () => {
 
     const pause = await call(client, 'pause_task', { name: 'backup' });
     expect(pause.isError).toBe(true);
+
+    // queue control is a mutation too (R2)
+    const pauseQueue = await call(client, 'pause_queue');
+    expect(pauseQueue.isError).toBe(true);
+    expect(pauseQueue.text).toMatch(/readonly/i);
+    const resumeQueue = await call(client, 'resume_queue');
+    expect(resumeQueue.isError).toBe(true);
+    expect(resumeQueue.text).toMatch(/readonly/i);
 
     const reads = await call(client, 'list_tasks');
     expect(reads.isError).toBe(false);

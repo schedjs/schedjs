@@ -93,6 +93,18 @@ export type EngineEvent =
   | { type: 'retry-scheduled'; taskName: string; runId: string; attempt: number; nextRunAt: Date; backoffMs: number }
   | { type: 'poll'; taskName: string; runId: string; status: PollResult['status']; progress: number | null }
   | { type: 'zombie-reaped'; olderThan: Date; count: number }
+  /**
+   * The queue was frozen ({@link Engine.pause}) — no new claims until resume.
+   * `startPaused` distinguishes a process-start freeze (daemon `startPaused` /
+   * `SCHED_START_PAUSED=1`) from an operator command.
+   */
+  | { type: 'queue-paused'; pausedAt: Date; startPaused: boolean }
+  /**
+   * The queue was released ({@link Engine.resume}). The counters say what the
+   * pause cost: `skippedSchedules` recurring slots dropped (skip, not catch-up),
+   * `deferredRuns` overdue one-shots / pending retries left to play once.
+   */
+  | { type: 'queue-resumed'; pausedMs: number; skippedSchedules: number; deferredRuns: number }
   | { type: 'recovered-orphans'; count: number; clearedLocks: number }
   | { type: 'retention-pruned'; olderThanTemporary: Date; olderThanRegular: Date; removed: number }
   | { type: 'error'; message: string }
@@ -109,6 +121,30 @@ export type EngineEvent =
   | { type: 'cancel-ack'; taskName: string; runId: string; status?: number }
   | { type: 'cancel-failed'; taskName: string; runId: string; error: string }
   | { type: 'cancel-no-channel'; taskName: string; runId: string };
+
+/**
+ * Snapshot of the queue-freeze state — the admin API's `GET /queue` body and
+ * the daemon's startup report. `startPaused` is true only while the pause came
+ * from the daemon `startPaused` option / `SCHED_START_PAUSED=1` ("frozen since
+ * process start"), never for an operator command.
+ */
+export interface PauseInfo {
+  paused: boolean;
+  pausedAt: Date | null;
+  startPaused: boolean;
+}
+
+/**
+ * What a {@link Engine.resume} pass cost. `pausedMs` is wall time frozen;
+ * `skippedSchedules` counts recurring slots dropped (nextRunAt jumped to the
+ * next future slot); `deferredRuns` counts overdue one-shots and pending retries
+ * left in place to play exactly once after the pause.
+ */
+export interface ResumeInfo {
+  pausedMs: number;
+  skippedSchedules: number;
+  deferredRuns: number;
+}
 
 /**
  * Executes a claimed task. The engine owns scheduling and state; the runner owns
@@ -189,9 +225,12 @@ export interface Runner {
  * shared contract suite), so it cannot express «consecutive». A reset-on-success
  * column would be a Storage-contract change (5 adapters), out of scope for the
  * streak alert. Accepted cost (design wiki:3700): a daemon restart forgets an
- * in-flight streak — the next failure re-alerts once instead of staying silent.
- * No alert is ever *lost*, which is the direction that matters (a red task must
- * not go quiet).
+ * in-flight streak, so the count restarts at 1 — with `onStreak > 1` the next
+ * failure is silent (1 ≠ N) and the alert only lands after a further N−1
+ * terminal failures, reporting `consecutiveFailures: N` (the post-restart count) rather
+ * than the incident's true depth. The cost is lateness of up to N−1 runs, never
+ * silence: no alert is ever *lost*, which is the direction that matters (a red
+ * task must not go quiet).
  */
 export interface RunFinalContext {
   /** Terminal (persistent) failures of the current streak BEFORE this run (0 = fresh incident). */
@@ -277,6 +316,26 @@ export interface Engine {
   start(): void;
   /** Stop both intervals. In-flight run is awaited by the caller, not interrupted. */
   stop(): void;
+  /**
+   * Freeze the queue: no new claims until {@link resume}. Idempotent (a second
+   * pause keeps the original `pausedAt`/`startPaused` and fires no event).
+   * In-flight runs, the async poll loop, retention/prune and alerts keep
+   * running — a pause is a queue brake, not a process stop.
+   * `opts.startPaused` marks a process-start freeze (daemon startup).
+   */
+  pause(at?: Date, opts?: { startPaused?: boolean }): void;
+  /**
+   * Release the freeze and apply skip semantics: recurring (`cron`/`interval`)
+   * slots that came due while paused are SKIPPED (`nextRunAt` moves to the next
+   * future slot, no `missed-slot` for the pause window), while overdue one-shots
+   * and pending retries are left in place to play exactly once. Idempotent when
+   * the queue is already active (returns zeros, fires no event).
+   */
+  resume(at?: Date): Promise<ResumeInfo>;
+  /** True while the queue is frozen. */
+  isPaused(): boolean;
+  /** Pause-state snapshot (admin `GET /queue`). */
+  getPauseInfo(): PauseInfo;
   /** One tick pass: fire everything due at `now` (defaults to the clock). */
   runOnce(now?: Date): Promise<void>;
   /** One watchdog pass: reap zombie locks older than `now - lockTtl`. */
@@ -412,6 +471,28 @@ export function createEngine(config: EngineConfig): Engine {
    * pipeline). Keyed by task name — the same key alerts route on.
    */
   const failureStreaks = new Map<string, number>();
+
+  /**
+   * Queue freeze (R2 pause) — runtime state, deliberately NOT in Storage: a
+   * pause is a process kill-switch, not durable data. `pausedAt` is the moment
+   * the freeze started (process-start time for `startPaused`), `startPaused`
+   * says whether it came from the daemon startup flag, and `pauseWindow`
+   * remembers the last completed freeze so a deferred dispatch can tell a slot
+   * skipped on purpose from one genuinely lost (missed-slot suppression).
+   */
+  let paused = false;
+  let pausedAt: Date | null = null;
+  let startPaused = false;
+  let lastPauseWindow: { from: Date; to: Date } | null = null;
+  /**
+   * Bumped on every pause/resume transition. A tick that started before a pause
+   * (and is awaiting storage) must not dispatch its stale due-snapshot after a
+   * resume — the resume pass may already have skipped those slots. Cheap
+   * generation check beats re-reading every schedule at dispatch time.
+   */
+  let pauseGeneration = 0;
+  /** Page size for the resume skip scan (keeps a 1000+ schedule tenant from silently skipping only the first page). */
+  const scheduleScanPage = 500;
 
   /** Emit an engine-lifecycle event; observer errors never break the engine. */
   function fire(event: EngineEvent): void {
@@ -824,6 +905,9 @@ export function createEngine(config: EngineConfig): Engine {
   }
 
   async function runSchedule(schedule: ScheduleRecord, task: TaskRecord, now: Date): Promise<void> {
+    // Queue freeze (R2): while paused the engine claims nothing new — checked
+    // here as well as in tick(), so a direct dispatch stays frozen too.
+    if (paused) return;
     // Pause AND (decision 2026-08-18): a run fires iff !task.paused &&
     // !schedule.paused. The due query filters schedule.paused; the task flag is
     // the family stop (repair window) — checked here at dispatch (and the
@@ -835,7 +919,16 @@ export function createEngine(config: EngineConfig): Engine {
     // missed-slot: a schedule with history dispatching way past its slot means
     // the slot was lost (engine down / wedged lock) — the catch-up run is not
     // the on-time one. Cause-agnostic by design; grace is configurable.
+    // Exception: a slot that fell inside the pause window was skipped ON
+    // PURPOSE (queue freeze) — deferred one-shots/retries still play, and
+    // reporting their pause window as a "miss" would be a lie.
+    const slotInPauseWindow =
+      schedule.nextRunAt !== null &&
+      lastPauseWindow !== null &&
+      schedule.nextRunAt.getTime() >= lastPauseWindow.from.getTime() &&
+      schedule.nextRunAt.getTime() <= lastPauseWindow.to.getTime();
     if (
+      !slotInPauseWindow &&
       schedule.lastRunAt !== null &&
       schedule.nextRunAt !== null &&
       now.getTime() - schedule.nextRunAt.getTime() > missedSlotGraceMs
@@ -927,6 +1020,11 @@ export function createEngine(config: EngineConfig): Engine {
     if (ticking) return; // non-reentrant: never stack ticks
     ticking = true;
     try {
+      // Queue freeze (R2): no new claims while paused. Everything that is not a
+      // claim keeps running (async polls, watchdog, retention, alerts) — those
+      // live on their own loops, not here.
+      if (paused) return;
+      const generation = pauseGeneration;
       const due = await storage.listDueSchedules(now);
       if (due.length > 0) fire({ type: 'tick', at: now, dueCount: due.length });
       // Batches of maxConcurrent, priority-ordered (storage sorts priority DESC).
@@ -936,6 +1034,9 @@ export function createEngine(config: EngineConfig): Engine {
         const batch = due.slice(i, i + maxConcurrent);
         await Promise.all(
           batch.map(async (schedule) => {
+            // A pause/resume that landed while this tick was awaiting storage
+            // invalidates the snapshot — its slots were skipped on purpose.
+            if (generation !== pauseGeneration) return;
             const task = await storage.getTask(schedule.taskName);
             if (!task) return; // schedule survived but its task is gone — nothing to dispatch
             await runSchedule(schedule, task, now);
@@ -1001,9 +1102,87 @@ export function createEngine(config: EngineConfig): Engine {
     }
   }
 
+  /**
+   * Resume skip pass: an overdue recurring slot is dropped (nextRunAt jumps to
+   * the next FUTURE slot via the existing computeNext), an overdue one-shot or
+   * pending retry is left in place (it carries an operator intent and must play
+   * once). Runs while the queue is still marked frozen — the state flips to
+   * active only after every skip write landed, so a concurrent tick can never
+   * claim a slot this pass was about to skip.
+   */
+  async function skipPausedSlots(now: Date): Promise<{ skippedSchedules: number; deferredRuns: number }> {
+    const overdue: ScheduleRecord[] = [];
+    for (let offset = 0; ; offset += scheduleScanPage) {
+      const page = await storage.listSchedules({ limit: scheduleScanPage, offset });
+      overdue.push(
+        ...page.filter(
+          (s) =>
+            s.nextRunAt !== null &&
+            s.nextRunAt.getTime() <= now.getTime() &&
+            s.lockedAt === null && // an in-flight run's slot is not a lost slot
+            !s.paused &&
+            !s.disabled,
+        ),
+      );
+      if (page.length < scheduleScanPage) break;
+    }
+    let skippedSchedules = 0;
+    let deferredRuns = 0;
+    for (const s of overdue) {
+      // One-shot, or a schedule sitting on a pending retry — DEFERRED: nextRunAt
+      // stays put, so the very next tick after resume plays it exactly once
+      // (the slot carries an operator intent; silently dropping it loses work).
+      if (s.schedule.kind === 'once' || s.retryCount > 0) {
+        deferredRuns += 1;
+        continue;
+      }
+      await storage.updateSchedule(s.id, { nextRunAt: computeNext(s, now) });
+      skippedSchedules += 1;
+    }
+    return { skippedSchedules, deferredRuns };
+  }
+
   return {
     async runOnce(now) {
       await tick(now ?? clock());
+    },
+
+    pause(at, opts) {
+      if (paused) return; // idempotent: keep the original pausedAt / startPaused
+      pausedAt = at ?? clock();
+      paused = true;
+      startPaused = opts?.startPaused ?? false;
+      pauseGeneration += 1;
+      fire({ type: 'queue-paused', pausedAt, startPaused });
+    },
+
+    async resume(at) {
+      if (!paused) return { pausedMs: 0, skippedSchedules: 0, deferredRuns: 0 };
+      const now = at ?? clock();
+      // `paused ⇒ pausedAt set`; the fallback only guards against a future bug
+      // leaving a queue frozen with no way back through this path.
+      const from = pausedAt ?? now;
+      const pausedMs = now.getTime() - from.getTime();
+      const { skippedSchedules, deferredRuns } = await skipPausedSlots(now); // still frozen here
+      // Window BEFORE the flag flip: the two writes are synchronous, and this
+      // order keeps missed-slot suppression correct even if an await is ever
+      // inserted between them.
+      lastPauseWindow = { from, to: now };
+      paused = false;
+      pausedAt = null;
+      startPaused = false;
+      pauseGeneration += 1;
+      const info = { pausedMs, skippedSchedules, deferredRuns };
+      fire({ type: 'queue-resumed', ...info });
+      return info;
+    },
+
+    isPaused() {
+      return paused;
+    },
+
+    getPauseInfo() {
+      return { paused, pausedAt, startPaused };
     },
 
     async triggerTask(name, opts, now) {
@@ -1052,49 +1231,52 @@ export function createEngine(config: EngineConfig): Engine {
       runningRuns.set(runId, { controller, done: runDone });
       const deadline = armRunDeadline(task, controller);
       try {
-        // dispatch view: only an actual override rewrites the payload — a run that
-        // fell back to task defaults dispatches the raw task (body untouched),
-        // mirroring the schedule path. The worker receives the MERGED data
-        // (base + override), so the run record and the worker always agree.
-        outcome = await runner.run(
-          dispatchView(task, opts?.data !== undefined ? merged : undefined),
-          runId,
-          at,
-          {
-            onProgress: (p) => reportProgress(runId, p),
-            signal: controller.signal,
-          },
-        );
-      } catch (err) {
-        outcome = outcomeFromThrow(err);
-      } finally {
+        try {
+          // dispatch view: only an actual override rewrites the payload — a run that
+          // fell back to task defaults dispatches the raw task (body untouched),
+          // mirroring the schedule path. The worker receives the MERGED data
+          // (base + override), so the run record and the worker always agree.
+          outcome = await runner.run(
+            dispatchView(task, opts?.data !== undefined ? merged : undefined),
+            runId,
+            at,
+            {
+              onProgress: (p) => reportProgress(runId, p),
+              signal: controller.signal,
+            },
+          );
+        } catch (err) {
+          outcome = outcomeFromThrow(err);
+        }
+        // Timer lifecycle unchanged from the pre-fix shape: disarmed as soon as
+        // the runner settled, before the terminal bookkeeping below.
         deadline.dispose();
-        runningRuns.delete(runId);
-        runFinished();
-      }
-      outcome = applyRunDeadline(outcome, deadline, task.timeoutMs ?? 0);
+        outcome = applyRunDeadline(outcome, deadline, task.timeoutMs ?? 0);
 
-      if (outcome.status === 'accepted') {
-        const enqueued = await startAsyncRun(runId, task, null, outcome);
-        if (enqueued) {
+        if (outcome.status === 'accepted') {
+          await startAsyncRun(runId, task, null, outcome);
           // trigger: schedule untouched, no claim to release — poll only finishes the run
           return storage.getRun(runId);
         }
-        // accepted without poll(): run was failed fast — report it like any sync outcome
-        return storage.getRun(runId);
-      }
 
-      const finishedAt = clock();
-      // manual trigger: never auto-retries, alerts immediately, schedule untouched
-      await recordFinish(name, runId, outcome, task.retryCount + 1, true);
-      // r6 F5: reflect the manual run on the task (lastRunId/lastRunAt) without moving the schedule
-      await storage.completeTask(task.name, {
-        nextRunAt: task.nextRunAt,
-        lastRunAt: finishedAt,
-        failed: outcome.status === 'failed',
-        lastRunId: runId,
-      });
-      return storage.getRun(runId);
+        const finishedAt = clock();
+        // manual trigger: never auto-retries, alerts immediately, schedule untouched
+        await recordFinish(name, runId, outcome, task.retryCount + 1, true);
+        // r6 F5: reflect the manual run on the task (lastRunId/lastRunAt) without moving the schedule
+        await storage.completeTask(task.name, {
+          nextRunAt: task.nextRunAt,
+          lastRunAt: finishedAt,
+          failed: outcome.status === 'failed',
+          lastRunId: runId,
+        });
+        return storage.getRun(runId);
+      } finally {
+        // Registry teardown LAST: a concurrent `cancelRun` awaits `done` and then
+        // reads the run — releasing it before the terminal write (live phase-2
+        // gate finding) handed the caller a stale `running` snapshot.
+        runningRuns.delete(runId);
+        runFinished();
+      }
     },
 
     async retryRun(runId, opts, now) {
@@ -1135,33 +1317,35 @@ export function createEngine(config: EngineConfig): Engine {
       runningRuns.set(newRunId, { controller, done: runDone });
       const deadline = armRunDeadline(task, controller);
       try {
-        // dispatch view: a retry carries the original run's data (decision 6), not
-        // the task defaults — same view the original was dispatched with.
-        outcome = await runner.run(dispatchView(task, original.data), newRunId, at, {
-          onProgress: (p) => reportProgress(newRunId, p),
-          signal: controller.signal,
-        });
-      } catch (err) {
-        outcome = outcomeFromThrow(err);
-      } finally {
+        try {
+          // dispatch view: a retry carries the original run's data (decision 6), not
+          // the task defaults — same view the original was dispatched with.
+          outcome = await runner.run(dispatchView(task, original.data), newRunId, at, {
+            onProgress: (p) => reportProgress(newRunId, p),
+            signal: controller.signal,
+          });
+        } catch (err) {
+          outcome = outcomeFromThrow(err);
+        }
+        // Timer lifecycle unchanged from the pre-fix shape (see triggerTask).
         deadline.dispose();
+        outcome = applyRunDeadline(outcome, deadline, task.timeoutMs ?? 0);
+
+        if (outcome.status === 'accepted') {
+          await startAsyncRun(newRunId, task, null, outcome);
+          return storage.getRun(newRunId);
+        }
+
+        const finishedAt = clock();
+        // manual retry: schedule untouched, never auto-retries, alerts immediately
+        await recordFinish(original.taskName, newRunId, outcome, task.retryCount + 1, true);
+        return storage.getRun(newRunId);
+      } finally {
+        // Registry teardown LAST — see triggerTask (cancelRun reads the run
+        // after `done` resolves; the terminal write must have landed).
         runningRuns.delete(newRunId);
         runFinished();
       }
-      outcome = applyRunDeadline(outcome, deadline, task.timeoutMs ?? 0);
-
-      if (outcome.status === 'accepted') {
-        const enqueued = await startAsyncRun(newRunId, task, null, outcome);
-        if (enqueued) {
-          return storage.getRun(newRunId);
-        }
-        return storage.getRun(newRunId);
-      }
-
-      const finishedAt = clock();
-      // manual retry: schedule untouched, never auto-retries, alerts immediately
-      await recordFinish(original.taskName, newRunId, outcome, task.retryCount + 1, true);
-      return storage.getRun(newRunId);
     },
 
     async cancelRun(runId) {

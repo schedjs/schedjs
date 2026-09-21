@@ -16,6 +16,19 @@ export interface RunListFilter {
   status?: RunStatus;
   limit?: number;
   offset?: number;
+  /** Start of the `startedAt` window, ISO-8601 (inclusive). */
+  since?: string;
+  /** End of the `startedAt` window, ISO-8601 (inclusive). */
+  until?: string;
+  /** Exact runner match ('docker', 'http', …). */
+  runner?: string;
+}
+
+/** Wire shape of `GET /queue` (R2): `pausedAt` is an ISO string, null when active. */
+export interface QueueState {
+  paused: boolean;
+  pausedAt: string | null;
+  startPaused: boolean;
 }
 
 /**
@@ -109,9 +122,21 @@ export class AdminApiClient {
     if (filter.status !== undefined) params.set('status', filter.status);
     if (filter.limit !== undefined) params.set('limit', String(filter.limit));
     if (filter.offset !== undefined) params.set('offset', String(filter.offset));
+    if (filter.since !== undefined) params.set('since', filter.since);
+    if (filter.until !== undefined) params.set('until', filter.until);
+    if (filter.runner !== undefined) params.set('runner', filter.runner);
     const qs = params.toString();
     const body = await this.req<{ runs: RunRecord[] }>('GET', `/runs${qs ? `?${qs}` : ''}`);
     return body.runs;
+  }
+
+  async getQueue(): Promise<QueueState> {
+    return this.req<QueueState>('GET', '/queue');
+  }
+
+  /** Bring the queue to a paused/resumed state (R2, idempotent) — returns the effective state. */
+  async setQueuePaused(action: 'pause' | 'resume'): Promise<{ ok: true; paused: boolean; pausedAt: string | null }> {
+    return this.req<{ ok: true; paused: boolean; pausedAt: string | null }>('POST', `/queue/${action}`);
   }
 
   async getRun(runId: string): Promise<RunRecord> {

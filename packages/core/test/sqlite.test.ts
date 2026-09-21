@@ -40,6 +40,43 @@ describe('sqlite adapter', () => {
     expect(() => createSqliteStorage(db)).not.toThrow();
   });
 
+  it('adds idx_runs_started on an existing db with accumulated runs (no data loss)', async () => {
+    const db = new DatabaseSync(':memory:');
+    // Pre-R4 task_runs: every column the adapter reads, but no started_at index.
+    db.exec(`
+      CREATE TABLE task_runs (
+        id TEXT PRIMARY KEY, task_name TEXT NOT NULL, runner TEXT NOT NULL DEFAULT 'http',
+        started_at INTEGER NOT NULL, finished_at INTEGER, status TEXT NOT NULL,
+        data TEXT, result TEXT, error TEXT, progress INTEGER, log TEXT, artifacts TEXT,
+        worker_ref TEXT, attempt INTEGER NOT NULL DEFAULT 1,
+        "trigger" TEXT NOT NULL DEFAULT 'schedule', triggered_by TEXT, schedule_id TEXT,
+        temporary INTEGER NOT NULL DEFAULT 0, retry_of TEXT
+      );
+    `);
+    // 5k accumulated runs — migration must not touch them
+    const ins = db.prepare(`
+      INSERT INTO task_runs (id, task_name, runner, started_at, status, attempt, "trigger", temporary)
+      VALUES (?, 'task-a', ?, ?, 'succeeded', 1, 'schedule', 0)
+    `);
+    for (let i = 0; i < 5000; i++) ins.run(`r${i}`, i % 2 ? 'docker' : 'http', 1_750_000_000_000 + i * 1000);
+
+    const hasIndex = () =>
+      db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_runs_started'`).all().length === 1;
+    expect(hasIndex()).toBe(false);
+
+    const storage = createSqliteStorage(db); // migrate-on-open
+
+    expect(hasIndex()).toBe(true);
+    expect((db.prepare(`SELECT COUNT(*) AS c FROM task_runs`).get() as { c: number }).c).toBe(5000);
+    // the window query works on the pre-existing data: [r1000 … r1002] by started_at
+    const window = await storage.listRuns({
+      since: new Date(1_750_000_000_000 + 1000 * 1000),
+      until: new Date(1_750_000_000_000 + 1002 * 1000),
+    });
+    expect(window.map((r) => r.id)).toEqual(['r1002', 'r1001', 'r1000']);
+    expect((await storage.listRuns({ runner: 'docker', until: new Date(1_750_000_002_000) })).map((r) => r.id)).toEqual(['r1']);
+  });
+
   it('migrates an existing v0.1 db (no runner/label/description columns)', async () => {
     const db = new DatabaseSync(':memory:');
     // the pre-format-parity schema

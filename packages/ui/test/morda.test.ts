@@ -107,6 +107,15 @@ describe('mordaHtml', () => {
     expect(html).toContain('/health');
   });
 
+  it('hosts the queue indicator in the dashboard header (R5)', () => {
+    const html = mordaHtml();
+    expect(html).toContain('id="queueBox"');
+    expect(html).toContain("'sched-queue'");
+    // the header widget is configured (base/token/refresh) and mounted after
+    // defineSchedElements — otherwise its first /queue GET goes out unauthenticated
+    expect(html.indexOf("queueBox.appendChild")).toBeGreaterThan(html.indexOf('defineSchedElements()'));
+  });
+
   it('widens the main container so the 8-column schedules table fits (r8 U2)', () => {
     const html = mordaHtml();
     expect(html).toMatch(/main \{ padding:24px; max-width:1280px;/);

@@ -103,6 +103,16 @@ export interface DaemonOptions {
    * stays) — fail-fast applies only to the startup load. Default: 60 s.
    */
   syncIntervalMs?: number;
+  /**
+   * Start with the queue frozen (R2 pause): the daemon boots paused and claims
+   * no new runs until `POST /queue/resume` (admin API). `pausedAt` is the
+   * process-start time and `getPauseInfo().startPaused` is true — "frozen since
+   * start", not an operator command. The state is runtime-only: a restart
+   * without this option starts active. Wired from the explicit option or the
+   * `SCHED_START_PAUSED=1` ENV fallback (read by `createDaemon`); there is
+   * deliberately no CLI flag (the env covers compose / Portainer).
+   */
+  startPaused?: boolean;
 }
 
 export interface Daemon {
@@ -133,6 +143,13 @@ export interface Daemon {
  * registered fails fast at start (no silent no-ops).
  */
 export function createDaemon(options: DaemonOptions): Daemon {
+  // Process-start time for the `startPaused` freeze (pausedAt must say "since
+  // boot", not "when the sync pass happened"; `now` is the injectable clock).
+  const processStartedAt = options.now ? options.now() : new Date();
+  // R2: the freeze is driven by the explicit option; `SCHED_START_PAUSED=1` is
+  // the ENV fallback for compose/Portainer. An explicit `startPaused: false`
+  // wins (the only way to override a stray env in the process).
+  const startPaused = options.startPaused ?? process.env.SCHED_START_PAUSED === '1';
   // r6 D1: an explicit storage adapter wins; sqlite is only the default backend.
   const db = options.storage ? null : new DatabaseSync(options.dbPath!);
   const storage = options.storage ?? createSqliteStorage(db!);
@@ -247,6 +264,9 @@ export function createDaemon(options: DaemonOptions): Daemon {
     adminApi = createAdminApi({
       engine,
       storage,
+      // R2: the pause flag lives in the engine — hand the API the accessor so
+      // GET/POST /queue drive the real queue, not a daemon-side mirror.
+      queue: engine,
       version: DAEMON_VERSION,
       ...(options.artifactsS3 ? { artifactsReader: await createS3ArtifactReader(options.artifactsS3) } : {}),
       ...(options.admin.apiKey ? { auth: { apiKey: options.admin.apiKey } } : {}),
@@ -310,6 +330,10 @@ export function createDaemon(options: DaemonOptions): Daemon {
       // Restart recovery: cancel orphaned in-flight runs and release locks left
       // by the previous process (engine-level; before the loops start).
       await engine.recoverOrphanRuns(now);
+      // R2: freeze the queue from process start — set after recovery so a raw
+      // restart still cleans up orphans, and before engine.start() so the very
+      // first tick cannot claim anything.
+      if (startPaused) engine.pause(processStartedAt, { startPaused: true });
       engine.start();
       const syncIntervalMs = options.syncIntervalMs ?? 60_000;
       if (syncIntervalMs > 0) {

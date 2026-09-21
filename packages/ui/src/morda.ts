@@ -71,6 +71,7 @@ export function mordaHtml(options: MordaOptions = {}): string {
   .token-box { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--sched-muted); }
   .token-box input { background:var(--sched-bg); border:1px solid var(--sched-line); color:var(--sched-text); border-radius:6px; padding:4px 8px; font:inherit; font-size:12px; width:180px; }
   .token-box .hint { cursor:pointer; }
+  .queue-box { display:flex; align-items:center; gap:8px; }
   main { padding:24px; max-width:1280px; margin:0 auto; display:flex; flex-direction:column; gap:24px; }
   section { background:var(--sched-card); border:1px solid var(--sched-line); border-radius:8px; padding:16px; }
   footer { display:flex; align-items:center; gap:12px; padding:12px 24px; border-top:1px solid var(--sched-line); color:var(--sched-muted); font-size:12px; }
@@ -84,6 +85,7 @@ export function mordaHtml(options: MordaOptions = {}): string {
 <header>
   <span class="dot"></span><h1>sched</h1>
   <span class="spacer"></span>
+  <div class="queue-box" id="queueBox"></div>
   <div class="token-box" id="tokenBox" hidden>
     <label for="tokenInput">token</label>
     <input id="tokenInput" type="password" placeholder="SCHED_ADMIN_KEY" autocomplete="off">
@@ -127,7 +129,14 @@ export function mordaHtml(options: MordaOptions = {}): string {
     section.appendChild(el);
     return { section, el };
   });
-  const components = () => created.map((c) => c.el);
+  // R5: the queue pause indicator lives in the header. Created here (not written
+  // into the markup) so applyConfig sets base/token BEFORE it connects — its
+  // first GET /queue must not go out unauthenticated. Implementation (the
+  // <sched-queue> element) is in sched-queue.ts because this module is
+  // node-only (fs/http) and never reaches the browser bundle.
+  const queueEl = document.createElement('sched-queue');
+  const queueBox = document.getElementById('queueBox');
+  const components = () => [...created.map((c) => c.el), queueEl];
 
   function applyConfig() {
     for (const el of components()) {
@@ -143,6 +152,7 @@ export function mordaHtml(options: MordaOptions = {}): string {
   applyConfig();
   const mount = document.getElementById('mount');
   for (const { section } of created) mount.appendChild(section);
+  if (queueBox) queueBox.appendChild(queueEl);
 
   // token field (only shown when no token is known yet)
   const box = document.getElementById('tokenBox');

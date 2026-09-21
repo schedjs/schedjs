@@ -6,7 +6,9 @@
  *
  * Native routes (no /api prefix — the CLI test passes --admin-url at root):
  *   GET    /health                 → { ok, uptimeMs, version }
+ *   GET    /queue                  → { paused, pausedAt, startPaused }
  *   GET    /runs?task&status&limit&offset → { runs }
+ *   POST   /runs/bulk/cancel|retry { ids } → { ok, failed:[{id,reason}] }
  *   GET    /tasks                  → { tasks }
  *   GET    /schedules              → { schedules }
  *   GET    /schedules/:id          → schedule | 404
@@ -25,7 +27,7 @@
 import { createServer } from 'node:http';
 
 export function createAdminFixture({ key } = {}) {
-  let state = { tasks: [], runs: [], schedules: [] };
+  let state = { tasks: [], runs: [], schedules: [], queue: { paused: false, pausedAt: null, startPaused: false } };
   /** @type {Array<{method: string, path: string, auth: boolean}>} */
   let requests = [];
 
@@ -65,11 +67,12 @@ export function createAdminFixture({ key } = {}) {
         tasks: body.tasks ?? [],
         runs: body.runs ?? [],
         schedules: body.schedules ?? [],
+        queue: body.queue ?? { paused: false, pausedAt: null, startPaused: false },
       };
       return json(res, 200, { ok: true });
     }
     if (path === '/__reset' && method === 'POST') {
-      state = { tasks: [], runs: [], schedules: [] };
+      state = { tasks: [], runs: [], schedules: [], queue: { paused: false, pausedAt: null, startPaused: false } };
       requests = [];
       return json(res, 200, { ok: true });
     }
@@ -80,6 +83,45 @@ export function createAdminFixture({ key } = {}) {
     // --- health ---
     if (method === 'GET' && path === '/health') {
       return json(res, 200, { ok: true, uptimeMs: 4242, version: '9.9.9-fixture' });
+    }
+
+    // --- queue ---
+    if (method === 'GET' && path === '/queue') {
+      return json(res, 200, state.queue);
+    }
+
+    // --- bulk cancel/retry (R3) ---
+    const bulkMatch = path.match(/^\/runs\/bulk\/(cancel|retry)$/);
+    if (bulkMatch && method === 'POST') {
+      const body = await readBody(req);
+      const ids = Array.isArray(body.ids) ? body.ids : [];
+      const ok = [];
+      const failed = [];
+      const terminal = ['succeeded', 'failed', 'cancelled'];
+      for (const id of ids) {
+        const run = state.runs.find((r) => r.id === id);
+        if (!run) {
+          failed.push({ id, reason: 'not-found' });
+          continue;
+        }
+        if (bulkMatch[1] === 'cancel') {
+          if (terminal.includes(run.status)) {
+            failed.push({ id, reason: 'already-terminal' });
+            continue;
+          }
+          run.status = 'cancelled';
+          run.finishedAt = new Date().toISOString();
+          ok.push(id);
+          continue;
+        }
+        // retry — mirror the admin API: a fresh queued run linked to the original
+        state.runs = [
+          { ...run, id: `${id}-retry`, status: 'queued', retryOf: id, finishedAt: null, startedAt: new Date().toISOString() },
+          ...state.runs,
+        ];
+        ok.push(id);
+      }
+      return json(res, 200, { ok, failed });
     }
 
     // --- runs ---
@@ -103,7 +145,14 @@ export function createAdminFixture({ key } = {}) {
 
     // --- schedules ---
     if (method === 'GET' && path === '/schedules') {
-      return json(res, 200, { schedules: state.schedules });
+      // limit/offset honored when present (the real endpoint paginates; a client
+      // that aggregates a per-task total must page, or it silently undercounts).
+      let schedules = state.schedules;
+      const offset = Number(url.searchParams.get('offset') ?? '0');
+      if (Number.isFinite(offset) && offset > 0) schedules = schedules.slice(offset);
+      const limit = Number(url.searchParams.get('limit'));
+      if (Number.isFinite(limit) && limit > 0) schedules = schedules.slice(0, limit);
+      return json(res, 200, { schedules });
     }
     const scheduleAction = path.match(/^\/schedules\/([^/]+)\/(pause|resume)$/);
     if (scheduleAction && method === 'POST') {
@@ -171,7 +220,7 @@ export function createAdminFixture({ key } = {}) {
     server,
     listen,
     seed: (s) => {
-      state = { tasks: [], runs: [], schedules: [], ...s };
+      state = { tasks: [], runs: [], schedules: [], queue: { paused: false, pausedAt: null, startPaused: false }, ...s };
     },
     clearLog: () => {
       requests = [];

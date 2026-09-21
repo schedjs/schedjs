@@ -60,15 +60,25 @@ export function runMysqlContractSuite(name: string, url: string): void {
         );
         expect((idx as Array<{ name: string }>).map((i) => i.name)).toContain('idx_due');
 
+        // R4: the started_at index the since/until window rides on
+        const [runIdx] = await pool.query(
+          `SELECT INDEX_NAME AS name FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'task_runs'`,
+        );
+        expect((runIdx as Array<{ name: string }>).map((i) => i.name)).toContain('idx_runs_started');
+
         // exactly one version row — never one INSERT per migration (peer-review fix)
         const [v] = await pool.query(`SELECT COUNT(*) AS c FROM sched_schema_version`);
         expect(Number((v as Array<{ c: string | number }>)[0]!.c)).toBe(1);
       }, 120_000);
 
       it('re-open is idempotent and keeps the schema version', async () => {
+        const [beforeRows] = await pool.query('SELECT version FROM sched_schema_version');
         await createMysqlStorage(pool); // second open on migrated schema
         const [rows] = await pool.query('SELECT version FROM sched_schema_version');
-        expect((rows as Array<{ version: number }>)[0]!.version).toBe(6);
+        // self-relative, not a hardcoded latest: the invariant is "re-open does not
+        // bump/rewrite the version row", and the next migration must not break it.
+        const versionOf = (r: unknown) => Number((r as Array<{ version: number }>)[0]!.version);
+        expect(versionOf(rows)).toBe(versionOf(beforeRows));
       });
 
       it('v3 -> v5 upgrade synthesizes legacy task schedules (F2)', { timeout: 30_000 }, async () => {

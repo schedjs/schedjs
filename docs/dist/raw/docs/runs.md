@@ -67,6 +67,40 @@ cadence — no daemon-only cron needed, embedded engines stay clean too:
 it hourly (configurable via `retentionIntervalMs`). Non-terminal runs are never
 pruned by the sweeper — the watchdog handles zombie locks instead.
 
+## Filtering run history
+
+`listRuns` (the seam the admin API's `GET /runs` sits on) filters by
+`taskName`, `status`, `runner` and a start-time window:
+
+```ts
+await storage.listRuns({
+  taskName: 'greet',
+  status: 'failed',
+  runner: 'docker',
+  since: new Date('2026-09-19T00:00:00Z'),
+  until: new Date('2026-09-20T00:00:00Z'),
+  limit: 50,
+});
+```
+
+The same filters travel up the stack: `GET /runs?since=&until=&runner=` on the
+admin API (ISO-8601), `sched runs --since 24h --until 2h --runner docker` on the
+CLI (relative forms resolved client-side to ISO — see [CLI](cli)), and the
+`since`/`until`/`runner` arguments of the MCP `list_runs` tool (see [MCP](mcp)).
+
+**Why the window goes on startedAt** — both bounds inclusive
+(`since <= startedAt <= until`). `startedAt` is the column `listRuns` already
+orders by, it is never null, and the new `idx_runs_started` index lives on it; a
+`finishedAt` window would silently drop every `queued`/`running` run — exactly the
+rows you open the history for. The same choice is what `taskName + startedAt`
+(`idx_runs_task`) already does for per-task reads.
+
+**The price, stated honestly**: a long run that started *before* `since` and
+failed *inside* the window is **not** listed — the window bounds starts, not
+finishes. "What failed in the last 24h?" misses a 30-hour job that died an hour
+ago; widen `since` (or drop the lower bound) when auditing long runners. Same
+reason a wide `until` buys nothing for that case.
+
 ## Manual retry
 
 `POST /runs/:id/retry` (admin api) re-executes a run: the new run gets

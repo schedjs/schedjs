@@ -4,6 +4,45 @@ Version history for sched, newest first. Versioning is **per-package** (monorepo
 so each wave lists the version matrix it shipped. The full, commit-level history
 lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob/main/CHANGELOG.md){rel="&#x22;nofollow&#x22;"}.
 
+## In development — queue control, run window, bulk runs (core / storage / admin-api / cli / mcp)
+
+- **Pause the whole queue without stopping the daemon.** `engine.pause()` /
+  `resume()` (`isPaused()` / `getPauseInfo()`) freezes claiming and nothing else:
+  `tasks.json` sync, retention/prune, the async poll loop and alerts for runs
+  already in flight keep going, so a pause is a queue brake, not `docker stop`.
+  Boot frozen with `createDaemon({ startPaused: true })` or
+  `SCHED_START_PAUSED=1` (there is deliberately no `--start-paused` flag — one
+  switch, and compose/Portainer can pass an env where a flag cannot be appended).
+  Release is **skip, not catch-up**: a recurring slot that came due during the
+  pause moves to its next future slot with no `missed-slot` alert, while overdue
+  `once`/delayed runs and pending retries play exactly once. Events
+  `queue-paused` (`{ pausedAt, startPaused }`) and `queue-resumed` — the latter
+  carries the answer to "what did I miss": `{ pausedMs, skippedSchedules, deferredRuns }` (see [Self-hosting](https://schedjs.github.io/schedjs/self-hosting#pausing-the-queue)).
+- **Queue control plane.** `GET /queue` → `{ paused, pausedAt, startPaused }`,
+  `POST /queue/pause|resume` → `200` and **idempotent** (never `409` — "bring
+  the queue to this state", not a conditional write); `sched status` prints a
+  `queue:` line (`active` / `paused (since …, start-paused)`); MCP gains
+  `pause_queue` / `resume_queue` (mutations, off under `--readonly`). Queue state
+  stays out of the open `GET /health`: liveness answers liveness.
+- **Run filters — `RunFilter += since / until / runner`.**`GET /runs?since=&until=&runner=` (ISO-8601 on the wire;
+  `sched runs --since 24h --until 2h --runner docker` resolves the relative form
+  client-side), plus a fail-fast **400** on an unparseable timestamp or an
+  unknown `status` — `?status=bogus` used to return an empty list, which reads as
+  "no failures" over curl/MCP. The window is on `startedAt`, both bounds
+  inclusive, because that is the column `listRuns` orders by and it never drops
+  `queued`/`running` rows; the stated price is that a long run started *before*`since` is not listed even when it failed inside the window. Backed by
+  `idx_runs_started` in every adapter — idempotent DDL on open in sqlite, a v8
+  migration in mysql/postgres, and mongo reuses its existing `{ startedAt: -1 }`
+  index (walked in reverse).
+- **Bulk cancel / retry.** `POST /runs/bulk/cancel|retry` with
+  `{ ids: [...] }` returns a **partial** result `{ ok, failed: [{ id, reason }] }`
+  — never atomic, so one racing cancel cannot block the other 99 — with reasons
+  `not-found | already-terminal | not-cancellable`, a `400` on an empty/unknown
+  body and **422** past 100 ids (a 5000-run operation is `prune`). The CLI takes
+  the same batch: `sched cancel <id...>` / `retry <id...>` exits **1** whenever
+  any id failed. MCP stays deliberate: no bulk tools — an agent loops
+  `cancel_run` / `retry_run`.
+
 ## In development — streak alerts (core / cli)
 
 - **`alerts.onStreak` — one alert per incident, not one per run.** A task that
@@ -15,10 +54,16 @@ lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob
   success ended (send it by adding `'succeeded'` to `on`). Default
   `onStreak: 1` = every terminal failure alerts, i.e. exactly the behaviour
   before this option, so an existing deployment is not silently re-tuned.
-- **`FAILS` column in `sched tasks`.** How long a task has been red, without a
-  single reminder: `onStreak` suppresses the repeats, the CLI keeps the running
-  count visible (zero prints as `—`). `--json` is unchanged (`failCount` was
-  already in the task record).
+- **`FAILS` column in `sched tasks` and in the admin UI.** How many failed
+  completions a task has, without a single reminder: `onStreak` suppresses the
+  repeats, the human views keep the count visible (zero prints as `—`). The
+  number is **cumulative** — every failure of the row's life, not "how many runs
+  in a row are red" — and it is the **effective** count: the task row **plus its
+  schedule rows**, so a schedule-driven task (whose runtime state lives on the
+  schedule and whose task row never moves) no longer reads `—` while it is red.
+  The CLI aggregates by sweeping `GET /schedules`; `<sched-tasks>` does the same
+  in the browser. `--json` and the REST payloads are unchanged (they pass the
+  raw task records through, `failCount` included).
 - **`tasks.json` alert validation, root block included.** The top-level `alerts`
   block is now validated by the same rules as the per-task blocks (it used to be
   cast through unchecked): `onStreak` must be an integer ≥ 1, `onSyncFailed` a
@@ -215,8 +260,8 @@ and what to use instead.
 # Comparison
 
 This page puts sched next to the job schedulers and queues it is normally weighed
-against in the Node ecosystem: **BullMQ**, **Bull**, **Kue**, **Bee**, **pg-boss** and
-**Agenda**.
+against in the Node ecosystem: **BullMQ** — plus its commercial tier **BullMQ-Pro** —
+**Bull**, **Kue**, **Bee**, **pg-boss** and **Agenda**.
 
 A note on honesty before the table: our own column is written from sched's own code and
 docs. The columns for the other projects are taken from two published comparison charts —
@@ -269,7 +314,9 @@ there.
 | Human-readable intervals                          | ✓         |            |        |      |     |     |         | ✓      |
 | Cron with a timezone, DST-safe                    | ✓         |            |        |      |     |     |         |        |
 | Run history: progress, log, artifacts             | ✓         |            |        |      |     |     |         |        |
+| Run history window (`since` / `until` / `runner`) | ✓         |            |        |      |     |     |         |        |
 | Cancel a *running* job                            | ✓         |            |        |      |     |     |         |        |
+| Bulk cancel / retry (many runs in one call)       | ✓         |            |        |      |     |     |         |        |
 | Run deadline (`timeoutMs`)                        | ✓         |            |        |      |     |     |         |        |
 | Many schedules per task                           | ✓         |            |        |      |     |     |         |        |
 | Polyglot workers (HTTP / Docker / SSH / process)  | ✓         |            |        |      |     |     |         |        |
@@ -1085,6 +1132,40 @@ cadence — no daemon-only cron needed, embedded engines stay clean too:
 `runRetentionOnce()` runs the sweep on demand; the daemon's retention loop calls
 it hourly (configurable via `retentionIntervalMs`). Non-terminal runs are never
 pruned by the sweeper — the watchdog handles zombie locks instead.
+
+## Filtering run history
+
+`listRuns` (the seam the admin API's `GET /runs` sits on) filters by
+`taskName`, `status`, `runner` and a start-time window:
+
+```ts
+await storage.listRuns({
+  taskName: 'greet',
+  status: 'failed',
+  runner: 'docker',
+  since: new Date('2026-09-19T00:00:00Z'),
+  until: new Date('2026-09-20T00:00:00Z'),
+  limit: 50,
+});
+```
+
+The same filters travel up the stack: `GET /runs?since=&until=&runner=` on the
+admin API (ISO-8601), `sched runs --since 24h --until 2h --runner docker` on the
+CLI (relative forms resolved client-side to ISO — see [CLI](https://schedjs.github.io/schedjs/cli)), and the
+`since`/`until`/`runner` arguments of the MCP `list_runs` tool (see [MCP](https://schedjs.github.io/schedjs/mcp)).
+
+**Why the window goes on `startedAt`** — both bounds inclusive
+(`since <= startedAt <= until`). `startedAt` is the column `listRuns` already
+orders by, it is never null, and the new `idx_runs_started` index lives on it; a
+`finishedAt` window would silently drop every `queued`/`running` run — exactly the
+rows you open the history for. The same choice is what `taskName + startedAt`
+(`idx_runs_task`) already does for per-task reads.
+
+**The price, stated honestly**: a long run that started *before* `since` and
+failed *inside* the window is **not** listed — the window bounds starts, not
+finishes. "What failed in the last 24h?" misses a 30-hour job that died an hour
+ago; widen `since` (or drop the lower bound) when auditing long runners. Same
+reason a wide `until` buys nothing for that case.
 
 ## Manual retry
 
@@ -2568,8 +2649,10 @@ four groups:
   writes `lastRunId`/`lastRunAt` on the task row).
 - **Run history** — `createRun`, `getRun`, `updateRun` (partial mid-flight),
   `finishRun` (terminal: sets `finishedAt` itself), `deleteRun` (idempotent
-  no-op for unknown runs), `listRuns` (newest-first, `taskName`/`status`
-  filters, `limit`/`offset`, hard cap 1000), `pruneRuns` (retention sweep:
+  no-op for unknown runs), `listRuns` (newest-first — `startedAt` DESC;
+  `taskName`/`status`/`runner` filters plus a `since`/`until` start-time window,
+  **bounds inclusive**, see [Runs → Filtering history](https://schedjs.github.io/schedjs/../runs#filtering-run-history);
+  `limit`/`offset`, hard cap 1000), `pruneRuns` (retention sweep:
   delete terminal runs of one `temporary` class finished before `olderThan`;
   the engine calls it twice — temp class at 24h, regular at 30d).
 
@@ -2869,10 +2952,18 @@ export class MemoryStorage implements Storage {
     return count;
   }
 
-  async listRuns(filter: { taskName?: string; status?: string; limit?: number; offset?: number } = {}): Promise<RunRecord[]> {
+  async listRuns(
+    filter: { taskName?: string; status?: string; since?: Date; until?: Date; runner?: string; limit?: number; offset?: number } = {},
+  ): Promise<RunRecord[]> {
     let list = [...this.runs.values()];
     if (filter.taskName !== undefined) list = list.filter((r) => r.taskName === filter.taskName);
     if (filter.status !== undefined) list = list.filter((r) => r.status === filter.status);
+    if (filter.runner !== undefined) list = list.filter((r) => r.runner === filter.runner);
+    // Start-time window, both bounds inclusive — anchored on startedAt, like the sort.
+    const since = filter.since?.getTime();
+    const until = filter.until?.getTime();
+    if (since !== undefined) list = list.filter((r) => r.startedAt.getTime() >= since);
+    if (until !== undefined) list = list.filter((r) => r.startedAt.getTime() <= until);
     list.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime());
     return list.slice(filter.offset ?? 0, (filter.offset ?? 0) + (filter.limit ?? 100));
   }
@@ -3032,20 +3123,23 @@ pipeline). A `succeeded` run resets it.
 `createAlerts` (`onStreak`, see [Self-hosting → Status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts))
 uses it to send **one** message per incident instead of one per run:
 
-| run          | `previousFailures` | `onStreak: 3` → alert                                 |
-| ------------ | ------------------ | ----------------------------------------------------- |
-| 1st failure  | 0                  | silent (1 ≠ 3)                                        |
-| 2nd failure  | 1                  | silent                                                |
-| 3rd failure  | 2                  | `run.failed` + `consecutiveFailures: 3`               |
-| 4th failure  | 3                  | silent — one alert per streak, no reminders           |
-| success      | 3                  | `run.succeeded` + `previousFailures: 3` («отпустило») |
-| next failure | 0                  | a fresh incident alerts again                         |
+| run          | `previousFailures` | `onStreak: 3` → alert                                      |
+| ------------ | ------------------ | ---------------------------------------------------------- |
+| 1st failure  | 0                  | silent (1 ≠ 3)                                             |
+| 2nd failure  | 1                  | silent                                                     |
+| 3rd failure  | 2                  | `run.failed` + `consecutiveFailures: 3`                    |
+| 4th failure  | 3                  | silent — one alert per streak, no reminders                |
+| success      | 3                  | `run.succeeded` + `previousFailures: 3` («отпустило»)      |
+| next failure | 0                  | a fresh incident — silent until the streak reaches 3 again |
 
 The counter lives in the engine process, not in storage: the storage
 `failCount` is *cumulative* (never reset by a success), and a persisted
 consecutive-counter would be a `Storage`-contract change. A daemon restart
-forgets an in-flight streak — the next failure alerts once more rather than
-staying silent (no alert is ever lost).
+**forgets an in-flight streak**: the count restarts from 1, so with
+`onStreak: N > 1` the next failure is silent again and the alert only lands
+after a further N−1 terminal failures — carrying `consecutiveFailures: N`, the
+post-restart count, not the incident's true depth. The cost is lateness (up to
+N−1 runs), never silence: no alert is ever lost for good.
 
 `createAlerts` (webhook) is a ready-made `onRunFinal` consumer — wire it as
 `onRunFinal: createAlerts(config).handleFinal` and
@@ -3245,17 +3339,51 @@ embedded hosts — pass `version` to `createAdminApi` to override).
 { "ok": true, "uptimeMs": 123456 }
 ```
 
+## Queue (pause / resume)
+
+```text
+GET  /api/queue          → { "paused": false, "pausedAt": null, "startPaused": false }
+POST /api/queue/pause    → { "ok": true, "paused": true,  "pausedAt": "2026-09-20T09:30:00.000Z" }
+POST /api/queue/resume   → { "ok": true, "paused": false, "pausedAt": null }
+```
+
+Pausing stops the queue from claiming new work. It is a runtime kill-switch
+owned by the engine, **not** persisted state — a restart without `startPaused`
+is active again. While paused, `tasks.json` sync, retention/prune and alerts on
+already-running work keep going. On resume, recurring schedules **skip** the
+missed window (their `nextRunAt` moves to the next future slot — no catch-up
+storm, no `missed-slot` alert); `once`/delayed runs and pending retries still
+run, each exactly once.
+
+- Both mutations are **idempotent**: `POST /queue/pause` on an already-paused
+  queue returns `200` with the **same** `pausedAt` (never `409`), and
+  `POST /queue/resume` on an active queue returns `200` with `paused: false`.
+  Think "bring the queue to this state", not a conditional write.
+- `pausedAt` — ISO-8601 timestamp of when the freeze started (`null` when
+  active). With `SCHED_START_PAUSED=1` it is the process start time and
+  `startPaused` is `true` ("frozen since boot", not an operator command).
+- Queue state is deliberately **not** part of the open `GET /health` payload —
+  `/health` answers liveness for compose/LB probes, not control-plane state.
+- Embedded hosts that use `createAdminApi` without a queue accessor get `501`
+  (`queue control not configured`) — the routes never invent a fake state.
+
 ## Runs
 
 ```text
-GET /runs?task=greet&status=failed&limit=20&offset=0
+GET /runs?task=greet&status=failed&since=2026-09-19T00:00:00Z&until=2026-09-20T00:00:00Z&runner=docker&limit=20&offset=0
 ```
 
-| Query             | Description                                                                    |
-| ----------------- | ------------------------------------------------------------------------------ |
-| `task`            | filter by task name                                                            |
-| `status`          | filter by status (`queued` / `running` / `succeeded` / `failed` / `cancelled`) |
-| `limit`, `offset` | pagination                                                                     |
+| Query             | Description                                                                                               |
+| ----------------- | --------------------------------------------------------------------------------------------------------- |
+| `task`            | filter by task name                                                                                       |
+| `status`          | filter by status (`queued` / `running` / `succeeded` / `failed` / `cancelled`); any other value → **400** |
+| `since`, `until`  | start-time window on `startedAt`, **ISO-8601, both bounds inclusive**; an unparseable timestamp → **400** |
+| `runner`          | exact runner match (`docker`, `http`, `process`…)                                                         |
+| `limit`, `offset` | pagination                                                                                                |
+
+The window is on `startedAt`, matching the fixed `startedAt DESC` order — a long
+run that started before `since` is not in the window even if it failed inside it
+(see [Runs → Filtering run history](https://schedjs.github.io/schedjs/runs#filtering-run-history)).
 
 ```json
 { "runs": [ { "id": "...", "taskName": "greet", "status": "failed", ... } ] }
@@ -3333,6 +3461,30 @@ POST /runs/nope/cancel       → 404
 
 `DELETE /runs/:id` refuses an **active** run (`409` — cancel it first); finished
 runs delete normally.
+
+### Bulk cancel / retry
+
+```text
+POST /runs/bulk/cancel   → { "ok": ["a1", "b2"], "failed": [ { "id": "c3", "reason": "already-terminal" } ] }
+POST /runs/bulk/retry    → { "ok": ["a1"],       "failed": [ { "id": "zz", "reason": "not-found" } ] }
+```
+
+Body: `{ "ids": ["a1", "b2", "c3"] }` — explicit run ids only (no selectors in
+v1; an unknown top-level field is a `400`).
+
+- The result is **partial, never atomic**: every id is applied independently
+  through exactly the same logic as `POST /runs/:id/cancel|retry`, so a run that
+  raced with another cancel does not block the rest of the batch.
+- `failed[].reason` ∈ `not-found` (unknown run id — or, for retry, the target's
+  task is gone) · `already-terminal` (cancel on a run that already
+  succeeded/failed/cancelled) · `not-cancellable` (the engine declined — the run
+  was not in flight — or the cancel signal left the run non-terminal).
+- A missing or non-array `ids`, an empty `ids` array, or a non-string/empty
+  element inside it → `400`.
+- More than **100** ids → `422` with the count: a 5000-run operation is
+  `prune`, not a bulk call. Split the batch.
+- Route order matters: `/runs/bulk/cancel` is a distinct route — it is never
+  interpreted as the id literally named `bulk`.
 
 ## Tasks
 
@@ -3530,6 +3682,10 @@ mounts at `/api/*` and embedded apps can mount at any path. The shell page
 footer shows the `@schedjs/ui` version, the daemon version (fetched from
 `/health`), the admin-api mount and a GitHub link.
 
+Run operations from the browser: filter the run history, cancel or retry a
+batch of runs, and stop/start the queue from the header — see
+[Runs: filters](https://schedjs.github.io/schedjs/#runs-filters) and [Queue pause](https://schedjs.github.io/schedjs/#queue-pause-header).
+
 Four consumption modes:
 
 | Mode                      | How                                                       | When                                 |
@@ -3568,6 +3724,7 @@ folder) and point it at your admin api mount:
 <sched-runs base="/api" token="…" limit="50"></sched-runs>
 <sched-tasks base="/api"></sched-tasks>
 <sched-schedules base="/api"></sched-schedules>
+<sched-queue base="/api"></sched-queue>
 ```
 
 Components are Lit custom elements — they work in any framework. Theming is via CSS
@@ -3579,17 +3736,29 @@ Run deletion in `<sched-runs>` is two-step: the row's **del** button arms to &#x
 and only a second click within 3s deletes (auto-disarms on timeout or refresh) — a
 stray click can't wipe a run.
 
-**Auto-refresh** — every list (`<sched-runs>`, `<sched-tasks>`, `<sched-schedules>`)
-polls the admin api on the `refreshMs` interval (property, or the `refresh-ms`
-attribute; default 5000 ms) so live fields — run status/progress, next-run and
-last-run times, fail counts — stay current; set `refreshMs=0` to disable polling.
-The shell sets this from the `?refresh=…` query override.
+**Auto-refresh** — every list (`<sched-runs>`, `<sched-tasks>`, `<sched-schedules>`) and
+`<sched-queue>` polls the admin api on the `refreshMs` interval (property, or the
+`refresh-ms` attribute; default 5000 ms) so live fields — run status/progress,
+next-run and last-run times, fail counts — stay current; set `refreshMs=0` to
+disable polling. The shell sets this from the `?refresh=…` query override.
 
 **Last status** — `<sched-schedules>` and `<sched-tasks>` show a `last status`
 column (✔ succeeded / ✘ failed / ⊘ cancelled) so you can see how the most recent
 run ended at a glance. The value comes from the server (`lastRunStatus` in
 `GET /schedules` / `GET /tasks`), resolved in one pass — the browser does not
 fetch the run per row.
+
+**Fails** — the `<sched-tasks>` `fails` column is the task's **cumulative**
+failed completions (zero prints as `—`): the task row (manual `trigger` /
+`retry`) **plus its schedule rows**, because a schedule-fired run advances the
+schedule, not the task — a cron task's own `failCount` stays 0 forever. The
+component sweeps `GET /schedules` (paged, like `sched tasks`) and sums per task,
+so the browser and the CLI show the same number — the price is ⌈N/1000⌉ extra
+requests per refresh, and the total is a near-snapshot (a board mutating
+mid-sweep can shift the offset window, exactly as in the CLI). It is **not** the
+failure streak — that lives in the daemon process (see
+[Logging → alerts](https://schedjs.github.io/schedjs/logging)). The REST payloads stay raw: `GET /tasks` and
+`sched tasks --json` are untouched.
 
 **Schedules are first-class** (schedule-as-entity) — `<sched-schedules>` lists each
 schedule row: `task`, rule, `tz&#x60;, &#x2A;*`data`** (the per-tenant parameters), next run,
@@ -3617,10 +3786,69 @@ the page size resets to the first page. Page size defaults to 50 (set the `limit
 attribute); the current page offset is the `offset` attribute — set both to start the
 list elsewhere.
 
+## Runs: filters
+
+`<sched-runs>` has a filter row in the footer: **task** (exact name), **since** /
+**until** (start-time window, inclusive) and **runner** (exact match — `docker`,
+`http`, `process`…). They map 1:1 onto `GET /runs`'s `task`/`since`/`until`/`runner`
+query params (the `datetime-local` inputs are converted to ISO in the browser) and
+are component state, so they **survive pagination**: `next`/`prev` keep sending the
+same filter set. Changing any filter drops back to the first page (an offset from
+the unfiltered list is meaningless); `clear` resets all four.
+
+The window is on &#x2A;*`started_at`**, not `finished_at` — a long run that started
+yesterday and failed an hour ago is not in "last 24h". Widen `since` when auditing
+long runners. See [Runs](https://schedjs.github.io/schedjs/runs) for why.
+
+## Runs: bulk cancel / retry
+
+Every row has a checkbox (the head checkbox ticks the whole page, unchecking
+clears the selection). With at least one row ticked, the header's **cancel** /
+**retry** buttons act on exactly those ids via `POST /runs/bulk/cancel|retry`
+(`{ ids: [...] }`, max 100 — more is a mass operation, use `prune`). The single-run
+`cancel`/`retry` routes are untouched.
+
+Bulk is **partial by design** — it is not a transaction, so the UI reports it
+honestly instead of one checkmark for the batch: the result line shows the ok
+count **and** every failed id with its reason
+(`not-found` / `already-terminal` / `not-cancellable`; `no-answer` is the
+UI-side reason for an id the api answered for in neither array — the list is
+reconciled client-side, so an unreported id cannot vanish silently). Failed ids
+stay ticked —
+that is exactly the work that did not happen, and the operator can retry them
+(or re-tick the successors of a cancel). A whole-batch failure (400/422/network)
+shows as an error and leaves the selection untouched.
+
+Selection lives in the component, so it also survives pagination and refreshes;
+a filter change clears the bulk result block.
+
+## Queue pause (header)
+
+`<sched-queue>` is the dashboard header widget: it reads `GET /queue&#x60; and shows
+&#x2A;*`queue: active`*&#x2A; / &#x2A;*`queue: paused (since …)`** with a single **pause** /
+**resume** button over `POST /queue/pause|resume` (idempotent on the server — the
+button never races). The shell mounts it in the header next to the token box; the
+standalone mode is where an operator stops the queue without touching the daemon.
+
+A pause is *skip, not catch-up*: recurring schedules do not run for the paused
+window (their next slot is computed forward), while one-off and retried runs that
+were already due do play once on resume. Alerts, `tasks.json` sync and
+retention/prune keep working. See [Admin API](https://schedjs.github.io/schedjs/admin-api) for the routes.
+
+When the host has no queue accessor (an embedded `createAdminApi` without the
+engine link), the routes answer **501*&#x2A; and the widget says &#x2A;*`queue: n/a`** with
+the button disabled — never a fake "active", never a button that cannot work.
+
 ## 4. Custom UI
 
 `createAdminApi` exposes the same REST surface the components use — health, runs,
 tasks, schedules, plus trigger / pause / resume / delete. See [Admin API](https://schedjs.github.io/schedjs/admin-api).
+
+## Footer & version
+
+The shell page footer shows the `@schedjs/ui` version, the daemon version (fetched
+from `/health`), the admin-api mount and a GitHub link. The header carries the queue
+indicator (`<sched-queue>`) and the token field.
 
 ## Auth (SCHED\_ADMIN\_KEY)
 
@@ -3698,28 +3926,35 @@ on a shared connection. Unknown session ids are rejected with `404`.
 
 ## Tools
 
-| Tool              | Args                           | Description                                                                                             |
-| ----------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------- |
-| `list_tasks`      | —                              | All tasks: name, runner, schedule, paused, next run                                                     |
-| `get_task`        | `name`                         | One task, full config                                                                                   |
-| `list_schedules`  | —                              | Schedules: taskName, schedule (cron/interval/once), tz, nextRunAt, lastRunAt, paused, effectiveStatus   |
-| `get_schedule`    | `scheduleId`                   | One schedule: rule, tz, data, effectiveStatus                                                           |
-| `create_schedule` | `taskName schedule tz?`        | Create (or upsert by `dedupKey`) a schedule (mutation); `data` validated against the task `inputSchema` |
-| `update_schedule` | `scheduleId schedule? tz?`     | Edit a schedule in place (mutation, partial merge)                                                      |
-| `pause_schedule`  | `scheduleId`                   | Pause one schedule instance (mutation)                                                                  |
-| `resume_schedule` | `scheduleId`                   | Resume a paused schedule (mutation)                                                                     |
-| `delete_schedule` | `scheduleId`                   | Delete a schedule; runs keep history (mutation)                                                         |
-| `list_runs`       | `task? status? limit? offset?` | Runs, newest first; filter by task/status                                                               |
-| `get_run`         | `runId`                        | One run: status, error, log, result, artifacts                                                          |
-| `trigger_task`    | `name data?`                   | Run a task immediately (mutation); `data` validated against the task `inputSchema`                      |
-| `cancel_run`      | `runId`                        | Cancel a running/queued run (mutation); a terminal run → 409                                            |
-| `retry_run`       | `runId triggeredBy?`           | Re-execute a finished run with its original data (mutation)                                             |
-| `pause_task`      | `name`                         | Stop scheduling a task (mutation)                                                                       |
-| `resume_task`     | `name`                         | Resume a paused task (mutation)                                                                         |
-| `delete_task`     | `name`                         | Delete a task; runs keep history (mutation)                                                             |
-| `delete_run`      | `runId`                        | Delete a run from history (mutation)                                                                    |
+| Tool              | Args                                                 | Description                                                                                                        |
+| ----------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `list_tasks`      | —                                                    | All tasks: name, runner, schedule, paused, next run                                                                |
+| `get_task`        | `name`                                               | One task, full config                                                                                              |
+| `list_schedules`  | —                                                    | Schedules: taskName, schedule (cron/interval/once), tz, nextRunAt, lastRunAt, paused, effectiveStatus              |
+| `get_schedule`    | `scheduleId`                                         | One schedule: rule, tz, data, effectiveStatus                                                                      |
+| `create_schedule` | `taskName schedule tz?`                              | Create (or upsert by `dedupKey`) a schedule (mutation); `data` validated against the task `inputSchema`            |
+| `update_schedule` | `scheduleId schedule? tz?`                           | Edit a schedule in place (mutation, partial merge)                                                                 |
+| `pause_schedule`  | `scheduleId`                                         | Pause one schedule instance (mutation)                                                                             |
+| `resume_schedule` | `scheduleId`                                         | Resume a paused schedule (mutation)                                                                                |
+| `delete_schedule` | `scheduleId`                                         | Delete a schedule; runs keep history (mutation)                                                                    |
+| `list_runs`       | `task? status? since? until? runner? limit? offset?` | Runs, newest first; filter by task/status/runner and the `startedAt` window (`since`/`until`, ISO-8601, inclusive) |
+| `get_run`         | `runId`                                              | One run: status, error, log, result, artifacts                                                                     |
+| `trigger_task`    | `name data?`                                         | Run a task immediately (mutation); `data` validated against the task `inputSchema`                                 |
+| `cancel_run`      | `runId`                                              | Cancel a running/queued run (mutation); a terminal run → 409                                                       |
+| `retry_run`       | `runId triggeredBy?`                                 | Re-execute a finished run with its original data (mutation)                                                        |
+| `pause_task`      | `name`                                               | Stop scheduling a task (mutation)                                                                                  |
+| `resume_task`     | `name`                                               | Resume a paused task (mutation)                                                                                    |
+| `pause_queue`     | —                                                    | Pause the whole queue (mutation, idempotent): recurring schedules skip the window, `once`/retries are deferred     |
+| `resume_queue`    | —                                                    | Resume a paused queue (mutation, idempotent); deferred runs play out once                                          |
+| `delete_task`     | `name`                                               | Delete a task; runs keep history (mutation)                                                                        |
+| `delete_run`      | `runId`                                              | Delete a run from history (mutation)                                                                               |
 
-Mutations (`trigger_task`, `pause_task`, `resume_task`, `delete_run`, `cancel_run`, `retry_run`, `delete_task`, `create_schedule`, `update_schedule`, `pause_schedule`, `resume_schedule`, `delete_schedule`) are disabled in `--readonly` mode.
+`pause_queue`/`resume_queue` are **mutations** — gated by `--readonly` like the
+rest. There are deliberately **no bulk run tools**: a batch cancel/retry is an
+operator action (CLI `sched cancel <id...>` / admin API); an agent makes an
+explicit loop of `cancel_run`/`retry_run` calls.
+
+Mutations (`trigger_task`, `pause_task`, `resume_task`, `pause_queue`, `resume_queue`, `delete_run`, `cancel_run`, `retry_run`, `delete_task`, `create_schedule`, `update_schedule`, `pause_schedule`, `resume_schedule`, `delete_schedule`) are disabled in `--readonly` mode.
 
 ## Safety model
 
@@ -3898,8 +4133,11 @@ npm install -g @schedjs/cli
 sched <command> [args] [--admin-url URL] [--api-key KEY] [--json]
 
 Commands:
-  status                   daemon health + task/schedule/run counts + next runs
+  status                   daemon health + queue state + task/schedule/run counts
   runs [--task T] [--status S] [--limit N] [--offset N]
+       [--since TIME] [--until TIME] [--runner R]
+  cancel <id...>           bulk-cancel runs (partial result; exit 1 on any failure)
+  retry <id...>            bulk-retry finished runs (partial result; exit 1 on any failure)
   tasks
   schedules
   trigger <task> [--data JSON]
@@ -3907,6 +4145,14 @@ Commands:
   resume <task> | resume --schedule <id>
   check-worker <url> [--api-key KEY] [--timeout SECONDS]
 ```
+
+`runs` filters: `task`, `status`, `limit`, `offset` plus the R4 window
+`--since` / `--until` and the exact `--runner` match. `--since`/`--until`
+accept **ISO-8601** or a **relative form** — `30m`, `24h`, `7d`, `2w` ("that
+long ago"); the relative form is resolved by the CLI, and the admin API always
+receives ISO-8601. The window is on `startedAt`, both bounds inclusive (see
+[Runs → Filtering](https://schedjs.github.io/schedjs/runs#filtering-run-history)). `--json` echoes the *resolved*
+filter, so `--since 24h` shows the exact ISO bound that was queried.
 
 Global flags:
 
@@ -3919,21 +4165,31 @@ Global flags:
 
 Exit codes: **0** ok / **1** api·network·data error / **2** usage.
 
+`cancel` / `retry` take one or more run ids and return a **partial result**
+(`{ ok, failed }`, reason ∈ `not-found | already-terminal | not-cancellable`).
+Exit code **1** whenever at least one id failed, **0** only on a fully clean
+batch — so a partial batch never reads as success to a shell.
+
 `--api-key` before the command is the admin key; after `check-worker` it is the
 *worker's* key (a different secret — see below).
 
 ## Examples
 
 ```bash
-sched status                                   # is my daemon alive? next runs?
+sched status                                   # is my daemon alive? queue paused? next runs?
 sched runs --status failed --limit 20 --json   # failed runs as JSON
+sched runs --since 24h --until 2h --runner docker   # what fell over in the last 22 hours, docker only
+sched cancel r-1 r-2 r-3                       # bulk-cancel a mixed batch
 sched trigger publish-video --data '{"videoId":"v-42"}'
 sched pause --schedule channel-ada             # pause one channel's schedule, not the task
 sched resume sync-channel-stats
 ```
 
-`status` composes one view: `/health` + `/tasks` + `/schedules` + a bounded
-failed-runs fetch, and lists the five soonest `nextRunAt` schedules.
+`status` composes one view: `/health` + `/queue` + `/tasks` + `/schedules` + a
+bounded failed-runs fetch, and lists the five soonest `nextRunAt` schedules. The
+queue line is `queue: active` or `queue: paused (since …, start-paused)` — the
+`start-paused` marker distinguishes a `SCHED_START_PAUSED` boot freeze from an
+operator pause. A host without a queue accessor prints `queue: n/a`.
 
 ## PowerShell note
 
@@ -4114,6 +4370,55 @@ docker runner ──▶ docker-socket proxy (tecnativa, POST=0) + image allowlis
 - The daemon never listens on a public interface.
 - Deployment artifacts go through the standard admin flow (Portainer, traefik labels).
 
+## Pausing the queue
+
+A running daemon can be frozen with one action and released later — no restart,
+no dead `tasks.json` sync, no dead retention. The freeze is **runtime state, not
+data**: it is deliberately not persisted, so a restart always comes back in the
+state the operator asked for at boot.
+
+Start frozen — boot ordering (DB migrations, worker deploy) where a startup
+catch-up burst would hit a half-ready world:
+
+```bash
+docker run -e SCHED_START_PAUSED=1 ... schedd --tasks tasks.json
+```
+
+`SCHED_START_PAUSED=1` sets the *initial* state only. Release the queue through
+the control plane (`engine.resume()` embedded; the admin API / CLI surface ships
+with the same wave). There is intentionally no `--start-paused` CLI flag: the
+env is the one flag, and compose / Portainer can pass it where a flag cannot be
+appended. With the env unset the daemon starts active, exactly as before.
+
+While paused the engine **claims nothing new**. Everything that is not a claim
+keeps running: `tasks.json` sync, retention/prune, the async poll loop and
+alerts for runs already in flight — a pause is a queue brake, not `docker stop`.
+
+**One caveat: the freeze is per daemon process.** The flag lives in the engine,
+not in storage, so with two daemons pointed at the same database
+`POST /queue/pause` freezes only the daemon that served the request while its
+sibling keeps claiming. Several daemons against one database is not a supported
+topology today (the SQL adapters assume a single writer and their migrations are
+not lock-guarded); if it becomes one, the pause flag has to move into storage.
+
+### Why pause = skip, not catch-up
+
+On release, a recurring schedule (`cron` / `interval`) whose slot came due while
+paused is **skipped**: `nextRunAt` moves to the next future slot via the ordinary
+next-slot calculation, and no `missed-slot` fires for the paused window (the slot
+was dropped on purpose, not lost). Overdue one-shots (`once`, a deferred `at`)
+and pending retries are **kept and played exactly once** — they carry an operator
+intent, and silently dropping them loses work.
+
+Catch-up was rejected on purpose. Pause overnight and catch-up means every
+schedule fires at once in the morning, each one reported as a `missed-slot`,
+against whatever concurrency the box has — the classic thundering herd, plus an
+alert storm caused by the operator. "Pause = turn the daemon off" was rejected
+too: `tasks.json` sync, retention and in-flight alerts would die with it, and a
+pause would be indistinguishable from `docker stop`. Skip semantics is the honest
+contract: **missed slots are missed**. To run one on demand, trigger the task by
+hand (`sched trigger <task>`).
+
 ## Status alerts
 
 sched can push a notification when a run reaches a **terminal state** — failed by
@@ -4178,8 +4483,11 @@ retry ladder is one incident; its depth shows up as `run.attempt`):
 - `onStreak: N > 1` → the failure alert fires **exactly once per streak**, when
   the N-th consecutive failure lands. Failures 2..N stay silent, and so does the
   rest of the streak (no reminders — `consecutiveFailures` is in the payload, and
-  the `FAILS` column in `sched tasks` shows the running state). A success breaks
-  the streak: the next incident alerts again.
+  the `FAILS` column in `sched tasks` shows how many failures the task has
+  accumulated: the task row plus its schedule rows, since a schedule-fired run
+  advances the schedule, not the task. It is **not** the streak itself — the
+  streak lives in the engine process, below). A success breaks the streak: the
+  next incident alerts again.
 - **«Отпустило» (recovery)** — the success that broke a streak which had reached
   the threshold carries `previousFailures` (how many failures it ended). It is a
   `run.succeeded` alert like any other, so it is gated by `on`: with the default
@@ -4190,7 +4498,11 @@ retry ladder is one incident; its depth shows up as `run.attempt`):
 The streak is counted in the daemon process (the storage `failCount` is
 *cumulative* — it never resets on success — and a persisted consecutive-counter
 would be a `Storage`-contract change): a restart forgets an in-flight streak, so
-the next failure alerts once more instead of staying silent. Per-task override:
+the count restarts from 1 and with `onStreak: N > 1` an incident already in
+progress does not alert on the next failure — it re-alerts only after another
+N−1 terminal failures, with `consecutiveFailures: N` (the post-restart count,
+not the true depth). The cost is lateness, never silence: no alert is lost for
+good. Per-task override:
 one `alerts` block per task, same field (`onStreak` merges field-wise, task
 wins). `onSyncFailed` is root-only — sync health is daemon-global, not a per-task
 property.
