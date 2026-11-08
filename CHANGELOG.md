@@ -25,6 +25,13 @@ history is summarized below and fully preserved in the git log.
   (строка или её таска выключена) перебивает паузы, UI рисует ⛔, CLI в колонке
   PAUSED печатает `disabled` вместо зелёного `no`. Доки: `04.tasks.md`
   (Sync semantics), `10.admin-api.md`, `12.mcp.md`; спека admin-api — 0.5.0.
+  **Опубликовано 2026-11-08 в публичный npm** (`@schedjs/core 0.57.0` …
+  `@schedjs/cli 0.3.1` — все 9 пакетов; сайт — `/docs/whats-new`) и в публичный
+  git (`schedjs/schedjs@5b6d0e0`, CI зелёный). Той же волной уехал
+  `fix(build)`: build-скрипты пакетов зовут `yarn run -T tsc` вместо голого
+  `tsc` — на Linux root `.bin` не попадает в PATH и CI падал
+  `command not found: tsc` (воспроизводится на любом прежнем коммите в чистом
+  контейнере).
 
 - **R2+R3+R4 — пауза очереди, окно ранов, массовые операции** (волна core
   **0.56.0** → storage-mongo **0.6.0** / storage-mysql **0.5.0** /
