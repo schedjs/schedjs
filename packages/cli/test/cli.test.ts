@@ -167,6 +167,20 @@ describe('@schedjs/cli contract (spawn bin → fixture admin api)', () => {
     expect(runsReq?.path).toContain('status=failed');
   });
 
+  it('schedules (human): a disabled rule says so — never a green-looking «no» (task:4218)', async () => {
+    fixture.seed({
+      schedules: [
+        schedule('parked', 'sync-seller', { disabled: true, disabledBy: 'sync', effectiveStatus: 'disabled' }),
+        schedule('live', 'sync-other', { effectiveStatus: 'active' }),
+      ],
+    });
+    const res = await runCli(['schedules', '--admin-url', base]);
+    expect(res.code).toBe(0);
+    const parkedLine = res.stdout.split(String.fromCharCode(10)).find((l) => l.includes('parked')) ?? res.stdout;
+    expect(parkedLine).toContain('disabled');
+    expect(parkedLine.trim().endsWith('no')).toBe(false);
+  });
+
   it('schedules --json: lists schedules, exit 0', async () => {
     fixture.seed({ schedules: [schedule('s1', 'sync-seller')] });
     const res = await runCli(['schedules', '--json', '--admin-url', base]);

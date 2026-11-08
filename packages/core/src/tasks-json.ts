@@ -6,7 +6,7 @@ import { parseSchedule } from './human.js';
 import type { Schedule } from './human.js';
 import { assertValidInputSchema, validateInput } from './input-schema.js';
 import type { Storage } from './storage.js';
-import type { RetryPolicy, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
+import type { DisabledBy, RetryPolicy, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
 
 /**
  * One entry of a tasks.json file — the desired-state contract.
@@ -430,6 +430,7 @@ export function toTasks(defs: TaskDefinition[], now: Date): TaskRecord[] {
       timeoutMs: p.timeoutMs,
       paused: false,
       disabled: false,
+      disabledBy: null,
       // file tasks are managed by tasks.json — sync may disable them on removal (r7 F1)
       fileManaged: true,
     };
@@ -474,6 +475,7 @@ export function toSchedules(defs: TaskDefinition[], now: Date): ScheduleRecord[]
         lastRunId: null,
         paused: false,
         disabled: false,
+        disabledBy: null,
         // file schedules are managed by tasks.json — sync disables them on removal
         fileManaged: true,
       });
@@ -640,11 +642,32 @@ export function readTasksJsonTaskAlertsSync(path: string): Record<string, Partia
 }
 
 /**
+ * The `disabled` fields a sync apply must write for an existing row.
+ *
+ * Task:4218 — `disabled` alone could not tell «sync parked this rule because it
+ * left the file» from «the operator stopped it». A rule that RETURNED to the
+ * file therefore stayed parked forever (measured: a whole mappa fleet silent
+ * for 23 h). With the reason recorded, sync clears exactly its own flag and
+ * never an operator's: unmarked (legacy) rows count as operator intent.
+ */
+function disabledPatch(existing: { disabled: boolean; disabledBy?: DisabledBy | null }): {
+  disabled: boolean;
+  disabledBy: DisabledBy | null;
+} {
+  const revived = existing.disabled && existing.disabledBy === 'sync';
+  return revived
+    ? { disabled: false, disabledBy: null }
+    : { disabled: existing.disabled, disabledBy: existing.disabledBy ?? null };
+}
+
+/**
  * Apply one validated TaskRecord to storage with syncTasks semantics: create
  * when absent; on upsert update runner/schedule/tz/config/priority/retry/
  * timeoutMs/label/description while preserving runtime state (nextRunAt kept
- * unless the schedule changed, lockedAt/failCount/paused/retryCount/disabled
- * untouched). Returns the stored record.
+ * unless the schedule changed, lockedAt/failCount/paused/retryCount untouched).
+ * A row sync itself disabled is re-enabled when the task returns to the file —
+ * with nextRunAt from `now`, so the return does not fire a burst of catch-ups.
+ * Returns the stored record.
  */
 async function applyTask(storage: Storage, task: TaskRecord): Promise<TaskRecord> {
   const existing = await storage.getTask(task.name);
@@ -654,6 +677,9 @@ async function applyTask(storage: Storage, task: TaskRecord): Promise<TaskRecord
   }
   const scheduleChanged =
     JSON.stringify(existing.schedule) !== JSON.stringify(task.schedule) || existing.tz !== task.tz;
+  const disabled = disabledPatch(existing);
+  // a revived row starts from `now` — a return to the file must not fire a burst of catch-ups
+  const revived = existing.disabled && !disabled.disabled;
   const merged = {
     ...existing,
     runner: task.runner,
@@ -666,7 +692,8 @@ async function applyTask(storage: Storage, task: TaskRecord): Promise<TaskRecord
     timeoutMs: task.timeoutMs ?? null,
     label: task.label,
     description: task.description,
-    nextRunAt: scheduleChanged ? task.nextRunAt : existing.nextRunAt,
+    ...disabled,
+    nextRunAt: revived || scheduleChanged ? task.nextRunAt : existing.nextRunAt,
   };
   await storage.upsertTask(merged);
   return merged;
@@ -676,7 +703,8 @@ async function applyTask(storage: Storage, task: TaskRecord): Promise<TaskRecord
  * Apply one ScheduleRecord with syncTasks semantics — the schedule twin of
  * {@link applyTask}: create when absent; on upsert update the declarative
  * fields while preserving runtime state (nextRunAt kept unless the firing rule
- * or tz changed; lockedAt/failCount/paused/retryCount/disabled untouched).
+ * or tz changed; lockedAt/failCount/paused/retryCount untouched), and clear a
+ * sync-owned `disabled` when the schedule returns to the file.
  */
 async function applySchedule(storage: Storage, schedule: ScheduleRecord): Promise<void> {
   const existing = await storage.getSchedule(schedule.id);
@@ -686,6 +714,8 @@ async function applySchedule(storage: Storage, schedule: ScheduleRecord): Promis
   }
   const scheduleChanged =
     JSON.stringify(existing.schedule) !== JSON.stringify(schedule.schedule) || existing.tz !== schedule.tz;
+  const disabled = disabledPatch(existing);
+  const revived = existing.disabled && !disabled.disabled;
   await storage.createSchedule({
     ...existing,
     schedule: schedule.schedule,
@@ -695,7 +725,8 @@ async function applySchedule(storage: Storage, schedule: ScheduleRecord): Promis
     dedupKey: schedule.dedupKey,
     priority: schedule.priority,
     retry: schedule.retry,
-    nextRunAt: scheduleChanged ? schedule.nextRunAt : existing.nextRunAt,
+    ...disabled,
+    nextRunAt: revived || scheduleChanged ? schedule.nextRunAt : existing.nextRunAt,
   });
 }
 
@@ -724,9 +755,9 @@ export async function upsertTaskDefinition(storage: Storage, def: TaskDefinition
  * (tasks or schedules) are disabled — kept in history, never tick again — the
  * documented contract (docs/03.tasks.md § Sync semantics). Runtime state
  * (nextRunAt, lockedAt, failCount, paused) is preserved unless the schedule
- * actually changed — then nextRunAt recomputes from `now`. `disabled` is
- * flip-only-on-removal: a schedule disabled by the operator or a previous
- * removal is never re-enabled by sync.
+ * actually changed — then nextRunAt recomputes from `now`. `disabled` carries
+ * its reason (`disabledBy`): sync flips its own flag back when a removed rule
+ * RETURNS to the file (task:4218), while an operator stop is never cleared.
  */
 export async function syncTasks(storage: Storage, defs: TaskDefinition[], now: Date): Promise<void> {
   const tasks = toTasks(defs, now); // eager validation of the whole file (fail-fast)
@@ -738,15 +769,15 @@ export async function syncTasks(storage: Storage, defs: TaskDefinition[], now: D
   for (const sched of schedules) {
     await applySchedule(storage, sched);
   }
-  // remove-from-file → disabled: a zombie task must not keep ticking silently.
-  // Re-adding it to tasks.json keeps it disabled (enable via taskOps) — sync
-  // never flips `disabled` back, so operator intent is never overwritten.
+  // remove-from-file → disabled, marked `disabledBy: 'sync'`: a zombie task must
+  // not keep ticking silently, and the mark is what lets sync clear exactly its
+  // own flag when the task returns (task:4218) — operator intent stays untouched.
   const existing = await storage.listTasks();
   for (const t of existing) {
     // r7 F1: only file-managed tasks are disabled on removal — a task registered
     // at runtime (POST /tasks, fileManaged=false) is never touched by sync.
     if (!desired.has(t.name) && t.fileManaged !== false && !t.disabled) {
-      await storage.upsertTask({ ...t, disabled: true });
+      await storage.upsertTask({ ...t, disabled: true, disabledBy: 'sync' });
     }
   }
   // same contract for schedules: removed from the file → disabled (file-managed
@@ -755,7 +786,7 @@ export async function syncTasks(storage: Storage, defs: TaskDefinition[], now: D
   const existingSchedules = await storage.listSchedules();
   for (const s of existingSchedules) {
     if (!desiredSchedIds.has(s.id) && s.fileManaged !== false && !s.disabled) {
-      await storage.updateSchedule(s.id, { disabled: true });
+      await storage.updateSchedule(s.id, { disabled: true, disabledBy: 'sync' });
     }
   }
 }

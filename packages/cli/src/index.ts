@@ -53,6 +53,9 @@ let jsonMode = false;
 
 /** Effective pause state of a schedule row (F5): task-level hold is visible. */
 function effectivePaused(s: Record<string, unknown>): string {
+  // task:4218 — a disabled rule is not «not paused»: never tick and never resume
+  // by a pause toggle. Say it plainly instead of a green-looking 'no'.
+  if (s.effectiveStatus === 'disabled') return 'disabled';
   if (s.effectiveStatus === 'paused-task') return 'yes (task)';
   return s.paused ? 'yes' : 'no';
 }

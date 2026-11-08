@@ -44,6 +44,18 @@ describe('task ops (queue-ops, books Phase 3)', () => {
     expect((await storage.getTask('task-a'))!.disabled).toBe(false);
   });
 
+  it('marks a manual disable as operator intent (sync must never clear it — task:4218)', async () => {
+    const storage = new MemoryStorage();
+    const ops = createTaskOps(storage);
+    await storage.upsertTask(makeTask());
+
+    await ops.disableTask('task-a');
+    expect((await storage.getTask('task-a'))!.disabledBy).toBe('operator');
+
+    await ops.enableTask('task-a');
+    expect((await storage.getTask('task-a'))!.disabledBy ?? null).toBeNull();
+  });
+
   it('getTask returns null for a missing task', async () => {
     const storage = new MemoryStorage();
     const ops = createTaskOps(storage);

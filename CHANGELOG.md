@@ -7,6 +7,25 @@ history is summarized below and fully preserved in the git log.
 
 ## [Unreleased]
 
+- **sync снимает свой зомби-`disabled`: у выключения появилась причина** (волна
+  core **0.57.0** → storage-mongo **0.6.1** / storage-mysql **0.6.0** /
+  storage-postgres **0.6.0** → admin-api **0.5.0** → mcp **0.6.1** →
+  ui **0.4.1** → daemon **0.13.4** → cli **0.3.1**). `scheduled_tasks`/`schedules`
+  получили `disabled_by` (`'sync' | 'operator'`, NULL = легаси-строка, читается как
+  операторский интент): правило, выпавшее из `tasks.json`, помечается
+  `disabled:true, disabledBy:'sync'`, а когда оно **возвращается** в файл, sync
+  снимает ровно свою пометку — правило тикает снова, `nextRunAt` от `now` (без
+  залпа догонов). Операторский `disableTask` (`disabledBy:'operator'`) sync не
+  снимает никогда. Без этой развилки правило, на минуту ушедшее из файла, молчало
+  навсегда: у mappa так простоял весь парк 23 часа при `effectiveStatus:"active"`
+  и бодром логе `[sched] embedded engine started, 6 rule(s)` (task:4218).
+  Миграции аддитивные (sqlite — `ALTER` на открытии, mysql/postgres — v9), так что
+  существующие зомби один раз включаются вручную (у них нет метки, безопасный
+  дефолт — операторский интент). `effectiveStatus` больше не врёт: `disabled`
+  (строка или её таска выключена) перебивает паузы, UI рисует ⛔, CLI в колонке
+  PAUSED печатает `disabled` вместо зелёного `no`. Доки: `04.tasks.md`
+  (Sync semantics), `10.admin-api.md`, `12.mcp.md`; спека admin-api — 0.5.0.
+
 - **R2+R3+R4 — пауза очереди, окно ранов, массовые операции** (волна core
   **0.56.0** → storage-mongo **0.6.0** / storage-mysql **0.5.0** /
   storage-postgres **0.5.0** → admin-api **0.4.0** → mcp **0.6.0** →

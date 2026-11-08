@@ -220,7 +220,11 @@ on a shared connection. Unknown session ids are rejected with `404`.
     </td>
     
     <td>
-      Schedules: taskName, schedule (cron/interval/once), tz, nextRunAt, lastRunAt, paused, effectiveStatus
+      Schedules: taskName, schedule (cron/interval/once), tz, nextRunAt, lastRunAt, paused, disabled, disabledBy, effectiveStatus (<code>
+        disabled
+      </code>
+      
+       when the row or its task is disabled)
     </td>
   </tr>
   

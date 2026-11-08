@@ -1148,6 +1148,25 @@ describe('admin api', () => {
     expect(byId['b']!.effectiveStatus).toBe('paused-schedule');
   });
 
+  it('effective status never says active for a disabled row (task:4218 — silent park looked healthy)', async () => {
+    const storage = freshStorage();
+    await storage.upsertTask(makeTask('a'));
+    await storage.createSchedule(makeSchedule({ id: 'a', taskName: 'a', disabled: true, disabledBy: 'sync' }));
+    await storage.upsertTask(makeTask('b', { disabled: true, disabledBy: 'operator' }));
+    await storage.createSchedule(makeSchedule({ id: 'b', taskName: 'b' }));
+    const { base } = await startTracked({ storage });
+
+    const body = (await (await fetch(`${base}/schedules`)).json()) as {
+      schedules: Array<{ id: string; effectiveStatus: string; disabled: boolean; disabledBy: string | null }>;
+    };
+    const byId = Object.fromEntries(body.schedules.map((s) => [s.id, s]));
+    expect(byId['a']!.effectiveStatus).toBe('disabled');
+    expect(byId['a']!.disabledBy).toBe('sync'); // the reason is on the wire
+    expect(byId['b']!.effectiveStatus).toBe('disabled'); // task-level disable counts too
+    const one = (await (await fetch(`${base}/schedules/a`)).json()) as { effectiveStatus: string };
+    expect(one.effectiveStatus).toBe('disabled');
+  });
+
   it('GET /schedules/:id, DELETE /schedules/:id, and pause/resume per schedule', async () => {
     const storage = freshStorage();
     await storage.upsertTask(makeTask('a'));

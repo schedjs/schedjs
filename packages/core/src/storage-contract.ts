@@ -37,6 +37,8 @@ export function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
     timeoutMs: null,
     paused: false,
     disabled: false,
+    // contract default: no recorded reason (legacy rows / enabled rows — treated as operator intent)
+    disabledBy: null,
     // contract default: tasks are file-managed (runtime POST /tasks sets false)
     fileManaged: true,
     ...overrides,
@@ -65,6 +67,8 @@ export function makeSchedule(overrides: Partial<ScheduleRecord> = {}): ScheduleR
     lastRunId: null,
     paused: false,
     disabled: false,
+    // contract default: no recorded reason (legacy rows / enabled rows — treated as operator intent)
+    disabledBy: null,
     // contract default: file-managed (runtime POST /schedules sets false)
     fileManaged: true,
     ...overrides,
@@ -136,6 +140,13 @@ export function storageContractTests(api: ContractTestApi, name: string, make: (
         await s.upsertTask(makeTask());
         await s.deleteTask('task-a');
         expect(await s.getTask('task-a')).toBeNull();
+      });
+
+      it('round-trips disabledBy (the disable reason distinguishes sync from operator — task:4218)', async () => {
+        await s.upsertTask(makeTask({ disabled: true, disabledBy: 'sync' }));
+        expect((await s.getTask('task-a'))!.disabledBy).toBe('sync');
+        await s.upsertTask(makeTask({ disabled: false, disabledBy: null }));
+        expect((await s.getTask('task-a'))!.disabledBy).toBeNull();
       });
     });
 
@@ -281,6 +292,15 @@ export function storageContractTests(api: ContractTestApi, name: string, make: (
         });
         await s.createSchedule(sched);
         expect(await s.getSchedule('sched-1')).toEqual(sched);
+      });
+
+      it('round-trips disabledBy through create and updateSchedule (task:4218)', async () => {
+        await s.createSchedule(makeSchedule({ disabled: true, disabledBy: 'sync' }));
+        expect((await s.getSchedule('sched-1'))!.disabledBy).toBe('sync');
+        await s.updateSchedule('sched-1', { disabled: true, disabledBy: 'operator' });
+        expect((await s.getSchedule('sched-1'))!.disabledBy).toBe('operator');
+        await s.updateSchedule('sched-1', { disabled: false, disabledBy: null });
+        expect((await s.getSchedule('sched-1'))!.disabledBy).toBeNull();
       });
 
       it('dedupKey upsert: second create with the same key updates the row (id preserved, no duplicate)', async () => {

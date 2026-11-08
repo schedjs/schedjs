@@ -60,6 +60,23 @@ async function lastRunStatusMap(storage: Storage): Promise<Map<string, RunStatus
   return new Map(runs.map((r) => [r.id, r.status]));
 }
 
+/**
+ * Effective state of a schedule, with the reason a row is not firing.
+ *
+ * task:4218 — `disabled` used to be invisible here, so a parked rule answered
+ * `effectiveStatus: 'active'` (a fleet looked healthy while it was 23 h silent).
+ * Disabled beats paused: neither a paused nor a disabled row ticks, and
+ * 'disabled' is the state an operator actually has to clear.
+ */
+function effectiveStatusOf(
+  task: TaskRecord | null | undefined,
+  schedule: ScheduleRecord,
+): 'disabled' | 'paused-task' | 'paused-schedule' | 'active' {
+  if (schedule.disabled || task?.disabled === true) return 'disabled';
+  if (task?.paused) return 'paused-task';
+  return schedule.paused ? 'paused-schedule' : 'active';
+}
+
 export interface AdminApiOptions {
   /** Engine surface the API drives (trigger + manual retry + user cancel). */
   engine: Pick<Engine, 'triggerTask' | 'retryRun' | 'cancelRun'>;
@@ -692,17 +709,15 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
             storage.listTasks(),
             lastRunStatusMap(storage),
           ]);
-          const taskPaused = new Map(tasks.map((t) => [t.name, t.paused]));
+          const taskByName = new Map(tasks.map((t) => [t.name, t]));
           json(res, 200, {
             schedules: schedules.map((s) => ({
               ...s,
               lastRunStatus: s.lastRunId !== null ? (runStatus.get(s.lastRunId) ?? null) : null,
-              // AND-semantics made visible: which level is holding this schedule
-              effectiveStatus: taskPaused.get(s.taskName)
-                ? 'paused-task'
-                : s.paused
-                  ? 'paused-schedule'
-                  : 'active',
+              // AND-semantics made visible: which level is holding this schedule.
+              // task:4218 — a disabled row is never 'active': reporting a silent
+              // rule as healthy is the drift that parked a whole fleet unseen.
+              effectiveStatus: effectiveStatusOf(taskByName.get(s.taskName), s),
             })),
           });
           return;
@@ -730,7 +745,7 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
             json(res, 200, {
               ...schedule,
               lastRunStatus: lastRun?.status ?? null,
-              effectiveStatus: task?.paused ? 'paused-task' : schedule.paused ? 'paused-schedule' : 'active',
+              effectiveStatus: effectiveStatusOf(task, schedule),
             });
             return;
           }

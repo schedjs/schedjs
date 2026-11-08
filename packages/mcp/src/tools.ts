@@ -27,12 +27,15 @@ export const TOOL_DEFS: McpToolDef[] = [
   },
   {
     name: 'list_schedules',
-    description: 'List schedules: name, runner, schedule, tz, nextRunAt, lastRunAt, paused.',
+    description:
+      'List schedules: name, runner, schedule, tz, nextRunAt, lastRunAt, paused, disabled, ' +
+      'disabledBy (sync = parked because the rule left tasks.json; operator = a hand-stop), effectiveStatus.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
     name: 'get_schedule',
-    description: 'Get one schedule by id, including its effective pause status.',
+    description:
+      'Get one schedule by id, including its effective status (active / paused-task / paused-schedule / disabled).',
     inputSchema: {
       type: 'object',
       properties: { scheduleId: { type: 'string', description: 'Schedule id' } },

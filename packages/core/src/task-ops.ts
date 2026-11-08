@@ -36,8 +36,10 @@ export function createTaskOps(storage: Storage): TaskOps {
     resumeTask: (name) => setFlag(name, { paused: false }),
     pauseSchedule: (id) => storage.updateSchedule(id, { paused: true }),
     resumeSchedule: (id) => storage.updateSchedule(id, { paused: false }),
-    disableTask: (name) => setFlag(name, { disabled: true }),
-    enableTask: (name) => setFlag(name, { disabled: false }),
+    // marked as operator intent: sync only ever clears its own 'sync' flag
+    // (task:4218) — a hand-stop must survive every re-sync
+    disableTask: (name) => setFlag(name, { disabled: true, disabledBy: 'operator' }),
+    enableTask: (name) => setFlag(name, { disabled: false, disabledBy: null }),
     deleteTask: (name) => storage.deleteTask(name),
     getTask: (name) => storage.getTask(name),
     getSchedule: (id) => storage.getSchedule(id),

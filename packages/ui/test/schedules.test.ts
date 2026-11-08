@@ -81,6 +81,20 @@ describe('sched-schedules (schedule-as-entity)', () => {
     expect(out.textContent).toContain('🟡 paused (schedule)');
   });
 
+  it('never renders a disabled row as active (task:4218 — the silent-park lie)', () => {
+    const out = renderInto(SchedSchedules.prototype, {
+      schedules: [mkSchedule({ disabled: true, disabledBy: 'sync', effectiveStatus: 'disabled' })],
+      hasMore: false,
+      error: '',
+      tasks: [],
+      form: null,
+      editingId: null,
+    });
+    const text = out.textContent ?? '';
+    expect(text).toContain('⛔ disabled');
+    expect(text).not.toContain('▶ active');
+  });
+
   it('renders the create form with task picker and schedule fields when open', () => {
     const out = renderInto(SchedSchedules.prototype, {
       schedules: [],

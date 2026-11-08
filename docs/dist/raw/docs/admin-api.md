@@ -479,15 +479,19 @@ them; remove one with `DELETE /schedules/:id`.
 
 ### GET /schedules
 
-Returns every schedule as a first-class row: `id/taskName/schedule/tz/data/externalId/ dedupKey/nextRunAt/lastRunAt/lastRunId/failCount/retryCount/priority/retry/paused/disabled`
-plus two resolved fields (no N+1 — three reads total):
+Returns every schedule as a first-class row: `id/taskName/schedule/tz/data/externalId/ dedupKey/nextRunAt/lastRunAt/lastRunId/failCount/retryCount/priority/retry/paused/disabled/disabledBy`
+plus two resolved fields (no N+1 — three reads total). `disabledBy` records **why** a
+row is disabled: `'sync'` (parked because the rule left `tasks.json` — sync clears it
+when the rule returns) or `'operator'` (an explicit hand-stop — sync never clears it);
+`null` = no reason recorded (legacy rows, enabled rows).
 
 - `lastRunStatus` — how the schedule's most recent run ended (`null` when it has no run,
 or its last run fell out of the recent window; listRuns is recent-first, capped at 1000).
-- `effectiveStatus` — the **AND-semantics made visible**: `'paused-task'`
-(the family stop holds), `'paused-schedule'` (only this instance), or `'active'`. The UI
-renders 🔴 for paused-task and 🟡 for paused-schedule, so «снял паузу, а оно молчит»
-never happens.
+- `effectiveStatus` — the **AND-semantics made visible**: `'disabled'` (the schedule or
+its task is disabled — a parked rule is never reported as `active`; task:4218),
+`'paused-task'` (the family stop holds), `'paused-schedule'` (only this instance), or
+`'active'`. The UI renders 🔴 for paused-task, 🟡 for paused-schedule and ⛔ for
+disabled, so «снял паузу, а оно молчит» never happens.
 
 ```json
 {
@@ -496,7 +500,7 @@ never happens.
       "tz": "UTC", "data": { "channelId": "UC-ada" }, "nextRunAt": "...", "lastRunAt": null,
       "lastRunId": null, "lastRunStatus": null, "failCount": 0, "retryCount": 0,
       "priority": 0, "retry": null, "paused": false, "disabled": false,
-      "effectiveStatus": "active" }
+      "disabledBy": null, "effectiveStatus": "active" }
   ]
 }
 ```

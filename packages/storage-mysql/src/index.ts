@@ -3,6 +3,7 @@ import { createPool } from 'mysql2/promise';
 import type {
   ArtifactRef,
   CompleteResult,
+  DisabledBy,
   RetryPolicy,
   RunFilter,
   RunFinish,
@@ -59,6 +60,7 @@ interface TaskRow {
   timeout_ms: number | null;
   paused: number;
   disabled: number;
+  disabled_by: string | null;
   file_managed: number;
   created_at: number;
   updated_at: number;
@@ -82,6 +84,7 @@ interface ScheduleRow {
   last_run_id: string | null;
   paused: number;
   disabled: number;
+  disabled_by: string | null;
   file_managed: number;
   created_at: number;
   updated_at: number;
@@ -143,6 +146,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     timeoutMs: row.timeout_ms,
     paused: row.paused === 1,
     disabled: row.disabled === 1,
+    disabledBy: (row.disabled_by as DisabledBy | null) ?? null,
     fileManaged: row.file_managed === 1,
   };
 }
@@ -166,6 +170,7 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     lastRunId: row.last_run_id,
     paused: row.paused === 1,
     disabled: row.disabled === 1,
+    disabledBy: (row.disabled_by as DisabledBy | null) ?? null,
     fileManaged: row.file_managed === 1,
   };
 }
@@ -218,7 +223,7 @@ function runValues(r: RunRecord): Array<string | number | null> {
   ];
 }
 
-/** Non-id schedule column values in upsert binding order (19). */
+/** Schedule column values in upsert binding order — 19: id + 18 non-id. */
 function scheduleValues(s: ScheduleRecord): Array<string | number | null> {
   return [
     s.id,
@@ -238,6 +243,7 @@ function scheduleValues(s: ScheduleRecord): Array<string | number | null> {
     s.lastRunId,
     s.paused ? 1 : 0,
     s.disabled ? 1 : 0,
+    s.disabledBy ?? null,
     s.fileManaged === false ? 0 : 1,
   ];
 }
@@ -437,6 +443,17 @@ const MIGRATIONS: Array<{ version: number; up: MigrationStep[] }> = [
       },
     ],
   },
+  {
+    // v9 — disable reason (task:4218): 'sync' = sync parked the row because the
+    // rule left tasks.json (sync clears its OWN flag when the rule returns),
+    // 'operator' = a hand-stop (never cleared). NULL = legacy row, read as
+    // operator intent — the safe default.
+    version: 9,
+    up: [
+      { sql: `ALTER TABLE scheduled_tasks ADD COLUMN disabled_by VARCHAR(16)`, guard: { table: 'scheduled_tasks', column: 'disabled_by' } },
+      { sql: `ALTER TABLE schedules ADD COLUMN disabled_by VARCHAR(16)`, guard: { table: 'schedules', column: 'disabled_by' } },
+    ],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -507,8 +524,8 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
   async function upsertScheduleRow(s: ScheduleRecord): Promise<void> {
     await pool.query(
       `INSERT INTO schedules
-        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, file_managed, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         task_name     = VALUES(task_name),
         schedule_json = VALUES(schedule_json),
@@ -526,6 +543,7 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
         last_run_id   = VALUES(last_run_id),
         paused        = VALUES(paused),
         disabled      = VALUES(disabled),
+        disabled_by   = VALUES(disabled_by),
         file_managed  = VALUES(file_managed),
         updated_at    = VALUES(updated_at)`,
       [...scheduleValues(s), Date.now(), Date.now()],
@@ -547,8 +565,8 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
     async upsertTask(task) {
       await pool.query(
         `INSERT INTO scheduled_tasks
-          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
           runner        = VALUES(runner),
           schedule_json = VALUES(schedule_json),
@@ -568,6 +586,7 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
           timeout_ms    = VALUES(timeout_ms),
           paused        = VALUES(paused),
           disabled      = VALUES(disabled),
+          disabled_by   = VALUES(disabled_by),
           file_managed  = VALUES(file_managed),
           updated_at    = VALUES(updated_at)`,
         [
@@ -590,6 +609,7 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
           task.timeoutMs ?? null,
           task.paused ? 1 : 0,
           task.disabled ? 1 : 0,
+          task.disabledBy ?? null,
           task.fileManaged === false ? 0 : 1,
           now(),
           now(),

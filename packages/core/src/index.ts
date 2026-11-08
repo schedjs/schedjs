@@ -38,4 +38,4 @@ export {
   assertValidMcpToolSpecs,
 } from './allowlist.js';
 export type { DockerTool, McpToolSpec } from './allowlist.js';
-export type { TaskRecord, RunRecord, ScheduleRecord, RunStatus, RunTrigger, ArtifactRef, RetryPolicy } from './types.js';
+export type { TaskRecord, RunRecord, ScheduleRecord, RunStatus, RunTrigger, DisabledBy, ArtifactRef, RetryPolicy } from './types.js';

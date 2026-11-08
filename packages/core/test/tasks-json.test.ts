@@ -808,9 +808,10 @@ describe('syncTasks', () => {
     expect((await storage.getSchedule('rt-sched'))!.disabled).toBe(false);
   });
 
-  it('never re-enables a schedule — sync flips disabled only on removal', async () => {
+  it('never re-enables an operator-disabled schedule — sync flips disabled only on removal', async () => {
     const storage = new MemoryStorage();
     await syncTasks(storage, defs, NOON);
+    // unmarked disable = operator intent (legacy rows included)
     await storage.updateSchedule('sync', { disabled: true });
 
     await syncTasks(storage, defs, NOON);
@@ -834,6 +835,76 @@ describe('syncTasks', () => {
     const after = await storage.getTask('manual-only');
     expect(after!.schedule).toBeNull();
     expect(after!.nextRunAt).toBeNull();
+  });
+});
+
+describe('syncTasks — zombie disabled is cleared when the rule returns (task:4218)', () => {
+  it('marks a rule removed from the file as disabledBy sync (task and schedule rows)', async () => {
+    const storage = new MemoryStorage();
+    await syncTasks(storage, defs, NOON);
+
+    await syncTasks(storage, [defs[0]!, defs[2]!], NOON); // 'daily' dropped
+
+    expect((await storage.getTask('daily'))!.disabled).toBe(true);
+    expect((await storage.getTask('daily'))!.disabledBy).toBe('sync');
+    expect((await storage.getSchedule('daily'))!.disabled).toBe(true);
+    expect((await storage.getSchedule('daily'))!.disabledBy).toBe('sync');
+    // a rule still in the file carries no reason
+    expect((await storage.getSchedule('sync'))!.disabledBy ?? null).toBeNull();
+  });
+
+  it('re-enables a sync-disabled rule when it returns to the file — nextRunAt from now, no catch-up', async () => {
+    const storage = new MemoryStorage();
+    await syncTasks(storage, defs, NOON);
+    await syncTasks(storage, [defs[0]!, defs[2]!], NOON); // dropped → zombie
+    expect((await storage.getSchedule('daily'))!.disabled).toBe(true);
+
+    // the rule comes BACK to tasks.json, a day later
+    const later = new Date('2026-08-17T12:00:00Z');
+    await syncTasks(storage, defs, later);
+
+    const task = (await storage.getTask('daily'))!;
+    expect(task.disabled).toBe(false);
+    expect(task.disabledBy ?? null).toBeNull();
+    // nextRunAt recomputed from `now`, not the stale pre-removal value
+    expect(task.nextRunAt!.getTime()).toBe(Date.parse('2026-08-18T06:00:00Z'));
+
+    const sched = (await storage.getSchedule('daily'))!;
+    expect(sched.disabled).toBe(false);
+    expect(sched.disabledBy ?? null).toBeNull();
+    expect(sched.nextRunAt!.getTime()).toBe(Date.parse('2026-08-18T06:00:00Z'));
+    // and it is tickable again (the whole point: no silent park)
+    const due = await storage.listDueSchedules(new Date('2026-08-18T06:00:00Z'));
+    expect(due.map((s) => s.id)).toContain('daily');
+  });
+
+  it('never re-enables an operator-disabled rule, even across remove → return', async () => {
+    const storage = new MemoryStorage();
+    await syncTasks(storage, defs, NOON);
+    // operator stops the rule by hand (admin API / taskOps) — the intent is marked
+    await storage.updateSchedule('daily', { disabled: true, disabledBy: 'operator' });
+    await storage.upsertTask({ ...(await storage.getTask('daily'))!, disabled: true, disabledBy: 'operator' });
+
+    await syncTasks(storage, [defs[0]!, defs[2]!], NOON); // removal must not rewrite the reason
+    expect((await storage.getSchedule('daily'))!.disabledBy).toBe('operator');
+
+    await syncTasks(storage, defs, NOON); // return must not clear operator intent
+    expect((await storage.getSchedule('daily'))!.disabled).toBe(true);
+    expect((await storage.getSchedule('daily'))!.disabledBy).toBe('operator');
+    expect((await storage.getTask('daily'))!.disabled).toBe(true);
+  });
+
+  it('leaves a legacy disabled row (no disabledBy) alone — unmarked means operator', async () => {
+    const storage = new MemoryStorage();
+    await syncTasks(storage, defs, NOON);
+    // a row written before disabledBy existed: disabled, no reason recorded
+    const legacy = { ...(await storage.getSchedule('daily'))!, disabled: true };
+    delete (legacy as { disabledBy?: unknown }).disabledBy;
+    await storage.createSchedule(legacy);
+
+    await syncTasks(storage, defs, NOON);
+
+    expect((await storage.getSchedule('daily'))!.disabled).toBe(true);
   });
 });
 

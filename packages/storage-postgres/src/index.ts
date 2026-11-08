@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 import type {
   ArtifactRef,
   CompleteResult,
+  DisabledBy,
   RetryPolicy,
   RunFilter,
   RunFinish,
@@ -59,6 +60,7 @@ interface TaskRow {
   timeout_ms: number | null;
   paused: boolean;
   disabled: boolean;
+  disabled_by: string | null;
   file_managed: boolean;
   created_at: string;
   updated_at: string;
@@ -82,6 +84,7 @@ interface ScheduleRow {
   last_run_id: string | null;
   paused: boolean;
   disabled: boolean;
+  disabled_by: string | null;
   file_managed: boolean;
   created_at: string;
   updated_at: string;
@@ -148,6 +151,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     timeoutMs: row.timeout_ms,
     paused: row.paused,
     disabled: row.disabled,
+    disabledBy: (row.disabled_by as DisabledBy | null) ?? null,
     fileManaged: row.file_managed,
   };
 }
@@ -171,6 +175,7 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     lastRunId: row.last_run_id,
     paused: row.paused,
     disabled: row.disabled,
+    disabledBy: (row.disabled_by as DisabledBy | null) ?? null,
     fileManaged: row.file_managed,
   };
 }
@@ -223,7 +228,7 @@ function runValues(r: RunRecord): Array<string | number | null | boolean> {
   ];
 }
 
-/** Non-id schedule column values in upsert binding order (19). */
+/** Schedule column values in upsert binding order — 19: id + 18 non-id. */
 function scheduleValues(s: ScheduleRecord): Array<string | number | null | boolean> {
   return [
     s.id,
@@ -243,6 +248,7 @@ function scheduleValues(s: ScheduleRecord): Array<string | number | null | boole
     s.lastRunId,
     s.paused,
     s.disabled,
+    s.disabledBy ?? null,
     s.fileManaged === false ? false : true,
   ];
 }
@@ -422,6 +428,17 @@ const MIGRATIONS: Array<{ version: number; up: Array<string | ((pool: Pool) => P
     version: 8,
     up: [`CREATE INDEX IF NOT EXISTS idx_runs_started ON task_runs (started_at)`],
   },
+  {
+    // v9 — disable reason (task:4218): 'sync' = sync parked the row because the
+    // rule left tasks.json (sync clears its OWN flag when the rule returns),
+    // 'operator' = a hand-stop (never cleared). NULL = legacy row, read as
+    // operator intent — the safe default.
+    version: 9,
+    up: [
+      `ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS disabled_by VARCHAR(16)`,
+      `ALTER TABLE schedules ADD COLUMN IF NOT EXISTS disabled_by VARCHAR(16)`,
+    ],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -480,8 +497,8 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
   async function upsertScheduleRow(s: ScheduleRecord): Promise<void> {
     await pool.query(
       `INSERT INTO schedules
-        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, file_managed, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
       ON CONFLICT (id) DO UPDATE SET
         task_name     = EXCLUDED.task_name,
         schedule_json = EXCLUDED.schedule_json,
@@ -499,6 +516,7 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
         last_run_id   = EXCLUDED.last_run_id,
         paused        = EXCLUDED.paused,
         disabled      = EXCLUDED.disabled,
+        disabled_by   = EXCLUDED.disabled_by,
         file_managed  = EXCLUDED.file_managed,
         updated_at    = EXCLUDED.updated_at`,
       [...scheduleValues(s), Date.now(), Date.now()],
@@ -520,8 +538,8 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
     async upsertTask(task) {
       await pool.query(
         `INSERT INTO scheduled_tasks
-          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         ON CONFLICT (name) DO UPDATE SET
           runner        = EXCLUDED.runner,
           schedule_json = EXCLUDED.schedule_json,
@@ -541,6 +559,7 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
           timeout_ms    = EXCLUDED.timeout_ms,
           paused        = EXCLUDED.paused,
           disabled      = EXCLUDED.disabled,
+          disabled_by   = EXCLUDED.disabled_by,
           file_managed  = EXCLUDED.file_managed,
           updated_at    = EXCLUDED.updated_at`,
         [
@@ -563,6 +582,7 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
           task.timeoutMs ?? null,
           task.paused,
           task.disabled,
+          task.disabledBy ?? null,
           task.fileManaged === false ? false : true,
           now(),
           now(),

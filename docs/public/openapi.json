@@ -3,7 +3,7 @@
   "info": {
     "title": "sched admin API",
     "description": "REST control-plane of the sched scheduler (daemon `--admin-port`, mounted at `/api/*` by default). Plain HTTP + JSON, Bearer auth when `SCHED_ADMIN_KEY` is set (unset → open, dev mode). Contract lives in `docs/content/docs/09.admin-api.md`; generate a client in any language from this spec (`openapi-generator`, `kiota`, …).",
-    "version": "0.2.1",
+    "version": "0.5.0",
     "contact": { "name": "sched", "url": "https://github.com/schedjs" }
   },
   "servers": [
@@ -610,6 +610,7 @@
           "fileManaged": { "type": "boolean", "description": "true/absent = tasks.json-managed; false = runtime" },
           "paused": { "type": "boolean" },
           "disabled": { "type": "boolean" },
+          "disabledBy": { "type": ["string", "null"], "description": "disable reason: sync = parked because the rule left tasks.json (sync clears it when the rule returns); operator = a hand-stop sync never clears; null = legacy/unrecorded (read as operator intent)" },
           "lastRunStatus": { "oneOf": [{ "$ref": "#/components/schemas/RunStatus" }, { "type": "null" }], "description": "how the last run ended — present on list responses" }
         }
       },
@@ -677,9 +678,10 @@
           "lastRunId": { "type": ["string", "null"] },
           "paused": { "type": "boolean" },
           "disabled": { "type": "boolean" },
+          "disabledBy": { "type": ["string", "null"], "description": "disable reason: sync = parked because the rule left tasks.json (sync clears it when the rule returns); operator = a hand-stop sync never clears; null = legacy/unrecorded (read as operator intent)" },
           "fileManaged": { "type": "boolean" },
           "lastRunStatus": { "oneOf": [{ "$ref": "#/components/schemas/RunStatus" }, { "type": "null" }], "description": "how the last run ended (list + single GET)" },
-          "effectiveStatus": { "oneOf": [{ "type": "string", "enum": ["active", "paused-schedule", "paused-task"] }, { "type": "null" }], "description": "AND-semantics pause: paused-task (task holds the family) / paused-schedule / active" }
+          "effectiveStatus": { "oneOf": [{ "type": "string", "enum": ["active", "paused-schedule", "paused-task", "disabled"] }, { "type": "null" }], "description": "AND-semantics state: disabled (schedule or its task is disabled — never reported as active) / paused-task (task holds the family) / paused-schedule / active" }
         }
       }
     }

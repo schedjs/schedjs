@@ -9,7 +9,7 @@ import type {
   Storage,
   TaskListFilter,
 } from './storage.js';
-import type { ArtifactRef, RetryPolicy, RunRecord, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
+import type { ArtifactRef, DisabledBy, RetryPolicy, RunRecord, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
 
 interface TaskRow {
   name: string;
@@ -31,6 +31,7 @@ interface TaskRow {
   timeout_ms: number | null;
   paused: number;
   disabled: number;
+  disabled_by: string | null;
   file_managed: number;
   created_at: number;
   updated_at: number;
@@ -54,6 +55,7 @@ interface ScheduleRow {
   last_run_id: string | null;
   paused: number;
   disabled: number;
+  disabled_by: string | null;
   file_managed: number;
   created_at: number;
   updated_at: number;
@@ -115,6 +117,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     timeoutMs: row.timeout_ms,
     paused: row.paused === 1,
     disabled: row.disabled === 1,
+    disabledBy: (row.disabled_by as DisabledBy | null) ?? null,
     fileManaged: row.file_managed === 1,
   };
 }
@@ -162,6 +165,7 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     lastRunId: row.last_run_id,
     paused: row.paused === 1,
     disabled: row.disabled === 1,
+    disabledBy: (row.disabled_by as DisabledBy | null) ?? null,
     fileManaged: row.file_managed === 1,
   };
 }
@@ -210,6 +214,7 @@ function scheduleValues(s: ScheduleRecord): Array<string | number | null> {
     s.lastRunId,
     s.paused ? 1 : 0,
     s.disabled ? 1 : 0,
+    s.disabledBy ?? null,
     s.fileManaged === false ? 0 : 1,
     Date.now(),
     Date.now(),
@@ -253,6 +258,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       timeout_ms    INTEGER,
       paused        INTEGER NOT NULL DEFAULT 0,
       disabled      INTEGER NOT NULL DEFAULT 0,
+      disabled_by   TEXT,
       created_at    INTEGER NOT NULL,
       updated_at    INTEGER NOT NULL
     );
@@ -274,6 +280,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       last_run_id   TEXT,
       paused        INTEGER NOT NULL DEFAULT 0,
       disabled      INTEGER NOT NULL DEFAULT 0,
+      disabled_by   TEXT,
       file_managed  INTEGER NOT NULL DEFAULT 1,
       created_at    INTEGER NOT NULL,
       updated_at    INTEGER NOT NULL
@@ -356,6 +363,14 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
   // schema (any data). Backfill NULL: existing tasks keep legacy behavior.
   if (!have.has('input_schema')) db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN input_schema TEXT`);
 
+  // v0.9 → v0.10 (task:4218): disabled reason — 'sync' (parked by removal from
+  // tasks.json, cleared by sync when the rule returns) vs 'operator' (a
+  // hand-stop, never cleared). NULL backfill = the safe default: legacy rows
+  // count as operator intent.
+  if (!have.has('disabled_by')) db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN disabled_by TEXT`);
+  const schedCols = db.prepare(`PRAGMA table_info(schedules)`).all() as Array<{ name: string }>;
+  if (!schedCols.some((c) => c.name === 'disabled_by')) db.exec(`ALTER TABLE schedules ADD COLUMN disabled_by TEXT`);
+
   // v0.6 → v0.7 one-shot synthesis: legacy task rows with a schedule become
   // schedule rows — id = task name, dedupKey = task name (deterministic, so a
   // re-synthesis is an idempotent upsert and runtime state transfers by name).
@@ -402,8 +417,8 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
 
   const upsertTask = db.prepare(`
     INSERT INTO scheduled_tasks
-      (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, file_managed, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       runner        = excluded.runner,
       schedule_json = excluded.schedule_json,
@@ -423,14 +438,15 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       timeout_ms    = excluded.timeout_ms,
       paused        = excluded.paused,
       disabled      = excluded.disabled,
+      disabled_by   = excluded.disabled_by,
       file_managed  = excluded.file_managed,
       updated_at    = excluded.updated_at
   `);
 
   const upsertSchedule = db.prepare(`
     INSERT INTO schedules
-      (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, file_managed, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       task_name     = excluded.task_name,
       schedule_json = excluded.schedule_json,
@@ -448,6 +464,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       last_run_id   = excluded.last_run_id,
       paused        = excluded.paused,
       disabled      = excluded.disabled,
+      disabled_by   = excluded.disabled_by,
       file_managed  = excluded.file_managed,
       updated_at    = excluded.updated_at
   `);
@@ -614,6 +631,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
         task.timeoutMs ?? null,
         task.paused ? 1 : 0,
         task.disabled ? 1 : 0,
+        task.disabledBy ?? null,
         task.fileManaged === false ? 0 : 1,
         now(),
         now(),

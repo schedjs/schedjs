@@ -4,7 +4,31 @@ Version history for sched, newest first. Versioning is **per-package** (monorepo
 so each wave lists the version matrix it shipped. The full, commit-level history
 lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob/main/CHANGELOG.md).
 
-## In development — queue control, run window, bulk runs (core / storage / admin-api / cli / mcp)
+## 2026-10-31 — disable reason, sync un-parks a returned rule (core 0.57.0 / storage-mongo 0.6.1 / storage-mysql 0.6.0 / storage-postgres 0.6.0 / admin-api 0.5.0 / mcp 0.6.1 / ui 0.4.1 / daemon 0.13.4 / cli 0.3.1)
+
+- **disabled now says WHY.** New field `disabledBy: 'sync' | 'operator'`
+(`disabled_by` column; `null` on legacy rows) on both tasks and schedules.
+`syncTasks` marks a rule it parked because it left `tasks.json` with
+`disabledBy: 'sync'`, and an operator stop (`disableTask` / a hand-written
+`disabled: true`) with `'operator'`. Unmarked rows count as operator intent —
+the safe default.
+- **A rule that returns to tasks.json ticks again.** Sync clears *only its
+own* `disabled` mark when the rule comes back, and recomputes `nextRunAt` from
+now (no catch-up burst). An operator stop survives any number of
+remove/re-add cycles. Before this, a rule that briefly left the file stayed
+parked **forever** while the list and the boot log (`6 rule(s)`) looked
+healthy — the failure that silently stopped a whole fleet for 23 hours.
+- **effectiveStatus cannot lie any more.** It gained `'disabled'` (the
+schedule or its task is disabled) and it beats the pause values: a parked row
+is never reported as `'active'`. The dashboard renders ⛔ and `sched schedules`
+prints `disabled` in the PAUSED column instead of a green-looking `no`. See
+[tasks → Sync semantics](tasks#sync-semantics) and
+[admin-api → GET /schedules](admin-api#get-schedules).
+- **Additive migrations only:** sqlite adds the column on open, mysql/postgres
+run migration 9, mongo is schemaless. Zombie rows parked by pre-0.57.0
+releases carry no mark and need one manual `enableTask`.
+
+## 2026-09-21 — queue control, run window, bulk runs (core 0.56.0 / storage-mongo 0.6.0 / storage-mysql 0.5.0 / storage-postgres 0.5.0 / admin-api 0.4.0 / mcp 0.6.0 / daemon 0.13.3 / cli 0.3.0)
 
 - **Pause the whole queue without stopping the daemon.** `engine.pause()` /
 `resume()` (`isPaused()` / `getPauseInfo()`) freezes claiming and nothing else:
@@ -42,8 +66,16 @@ body and **422** past 100 ids (a 5000-run operation is `prune`). The CLI takes
 the same batch: `sched cancel <id...>` / `retry <id...>` exits **1** whenever
 any id failed. MCP stays deliberate: no bulk tools — an agent loops
 `cancel_run` / `retry_run`.
+- **The same operations in the browser (@schedjs/ui 0.4.0).** The runs table
+grew a filter row (`task` / `since` / `until` / `runner`, window on
+`started_at`) that survives pagination, per-row checkboxes with header
+**cancel** / **retry** over `POST /runs/bulk/cancel|retry` — the result line is
+partial and honest (ok count plus every failed id with its reason, failed ids
+stay ticked) — and a queue widget in the header (`queue: active` /
+`queue: paused (since …)`) with one pause/resume button. See
+[Admin UI](ui#runs-filters).
 
-## In development — streak alerts (core / cli)
+## 2026-09-20 — streak alerts (core 0.55.0 / admin-api 0.3.3 / mcp 0.5.2 / daemon 0.13.2 / cli 0.2.0)
 
 - **alerts.onStreak — one alert per incident, not one per run.** A task that
 keeps failing sends a single `run.failed` when the streak reaches

@@ -4,7 +4,31 @@ Version history for sched, newest first. Versioning is **per-package** (monorepo
 so each wave lists the version matrix it shipped. The full, commit-level history
 lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob/main/CHANGELOG.md){rel="&#x22;nofollow&#x22;"}.
 
-## In development — queue control, run window, bulk runs (core / storage / admin-api / cli / mcp)
+## 2026-10-31 — disable reason, sync un-parks a returned rule (core 0.57.0 / storage-mongo 0.6.1 / storage-mysql 0.6.0 / storage-postgres 0.6.0 / admin-api 0.5.0 / mcp 0.6.1 / ui 0.4.1 / daemon 0.13.4 / cli 0.3.1)
+
+- **`disabled` now says WHY.** New field `disabledBy: 'sync' | 'operator'`
+  (`disabled_by` column; `null` on legacy rows) on both tasks and schedules.
+  `syncTasks` marks a rule it parked because it left `tasks.json` with
+  `disabledBy: 'sync'`, and an operator stop (`disableTask` / a hand-written
+  `disabled: true`) with `'operator'`. Unmarked rows count as operator intent —
+  the safe default.
+- **A rule that returns to `tasks.json` ticks again.** Sync clears *only its
+  own* `disabled` mark when the rule comes back, and recomputes `nextRunAt` from
+  now (no catch-up burst). An operator stop survives any number of
+  remove/re-add cycles. Before this, a rule that briefly left the file stayed
+  parked **forever** while the list and the boot log (`6 rule(s)`) looked
+  healthy — the failure that silently stopped a whole fleet for 23 hours.
+- **`effectiveStatus` cannot lie any more.** It gained `'disabled'` (the
+  schedule or its task is disabled) and it beats the pause values: a parked row
+  is never reported as `'active'`. The dashboard renders ⛔ and `sched schedules`
+  prints `disabled` in the PAUSED column instead of a green-looking `no`. See
+  [tasks → Sync semantics](https://schedjs.github.io/schedjs/tasks#sync-semantics) and
+  [admin-api → GET /schedules](https://schedjs.github.io/schedjs/admin-api#get-schedules).
+- **Additive migrations only:** sqlite adds the column on open, mysql/postgres
+  run migration 9, mongo is schemaless. Zombie rows parked by pre-0.57.0
+  releases carry no mark and need one manual `enableTask`.
+
+## 2026-09-21 — queue control, run window, bulk runs (core 0.56.0 / storage-mongo 0.6.0 / storage-mysql 0.5.0 / storage-postgres 0.5.0 / admin-api 0.4.0 / mcp 0.6.0 / daemon 0.13.3 / cli 0.3.0)
 
 - **Pause the whole queue without stopping the daemon.** `engine.pause()` /
   `resume()` (`isPaused()` / `getPauseInfo()`) freezes claiming and nothing else:
@@ -42,8 +66,16 @@ lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob
   the same batch: `sched cancel <id...>` / `retry <id...>` exits **1** whenever
   any id failed. MCP stays deliberate: no bulk tools — an agent loops
   `cancel_run` / `retry_run`.
+- **The same operations in the browser (`@schedjs/ui` 0.4.0).** The runs table
+  grew a filter row (`task` / `since` / `until` / `runner`, window on
+  `started_at`) that survives pagination, per-row checkboxes with header
+  **cancel** / **retry** over `POST /runs/bulk/cancel|retry` — the result line is
+  partial and honest (ok count plus every failed id with its reason, failed ids
+  stay ticked) — and a queue widget in the header (`queue: active` /
+  `queue: paused (since …)`) with one pause/resume button. See
+  [Admin UI](https://schedjs.github.io/schedjs/ui#runs-filters).
 
-## In development — streak alerts (core / cli)
+## 2026-09-20 — streak alerts (core 0.55.0 / admin-api 0.3.3 / mcp 0.5.2 / daemon 0.13.2 / cli 0.2.0)
 
 - **`alerts.onStreak` — one alert per incident, not one per run.** A task that
   keeps failing sends a single `run.failed` when the streak reaches
@@ -1038,8 +1070,16 @@ gates it too; unpausing re-arms it.
 
 - new task → created (scheduled from its first `nextRunAt`)
 - changed task → updated in place
-- removed task → **disabled** (kept in history, never ticks again; re-adding it
-  to the file keeps it disabled — enable via `taskOps` in embedded code)
+- removed task → **disabled** (kept in history, never ticks again) and marked
+  `disabledBy: 'sync'` — the removal reason, so the file can undo exactly its
+  own parking
+- removed task **returned** to the file → sync clears its own `disabled`
+  again (rule ticks, `nextRunAt` recomputed from *now*, so the return does not
+  fire a burst of catch-ups). A task disabled by an operator (`taskOps.disableTask`
+  / `disabledBy: 'operator'`) is **never** re-enabled by sync; a legacy row with
+  no recorded reason counts as operator intent (the safe default). Without this
+  split a rule that briefly left the file stayed parked forever — the failure
+  that silently stopped a whole fleet for 23 h (task:4218)
 
 The daemon **re-syncs on a live interval** (default 60 s, `syncIntervalMs`): an
 edit to `tasks.json` is picked up without a restart — same create / update /
@@ -3630,15 +3670,19 @@ Content-Type: application/json
 
 ### GET /schedules
 
-Returns every schedule as a first-class row: `id/taskName/schedule/tz/data/externalId/ dedupKey/nextRunAt/lastRunAt/lastRunId/failCount/retryCount/priority/retry/paused/disabled`
-plus two resolved fields (no N+1 — three reads total):
+Returns every schedule as a first-class row: `id/taskName/schedule/tz/data/externalId/ dedupKey/nextRunAt/lastRunAt/lastRunId/failCount/retryCount/priority/retry/paused/disabled/disabledBy`
+plus two resolved fields (no N+1 — three reads total). `disabledBy` records **why** a
+row is disabled: `'sync'` (parked because the rule left `tasks.json` — sync clears it
+when the rule returns) or `'operator'` (an explicit hand-stop — sync never clears it);
+`null` = no reason recorded (legacy rows, enabled rows).
 
 - `lastRunStatus` — how the schedule's most recent run ended (`null` when it has no run,
   or its last run fell out of the recent window; listRuns is recent-first, capped at 1000).
-- `effectiveStatus` — the **AND-semantics made visible**: `'paused-task'`
-  (the family stop holds), `'paused-schedule'` (only this instance), or `'active'`. The UI
-  renders 🔴 for paused-task and 🟡 for paused-schedule, so «снял паузу, а оно молчит»
-  never happens.
+- `effectiveStatus` — the **AND-semantics made visible**: `'disabled'` (the schedule or
+  its task is disabled — a parked rule is never reported as `active`; task:4218),
+  `'paused-task'` (the family stop holds), `'paused-schedule'` (only this instance), or
+  `'active'`. The UI renders 🔴 for paused-task, 🟡 for paused-schedule and ⛔ for
+  disabled, so «снял паузу, а оно молчит» never happens.
 
 ```json
 {
@@ -3647,7 +3691,7 @@ plus two resolved fields (no N+1 — three reads total):
       "tz": "UTC", "data": { "channelId": "UC-ada" }, "nextRunAt": "...", "lastRunAt": null,
       "lastRunId": null, "lastRunStatus": null, "failCount": 0, "retryCount": 0,
       "priority": 0, "retry": null, "paused": false, "disabled": false,
-      "effectiveStatus": "active" }
+      "disabledBy": null, "effectiveStatus": "active" }
   ]
 }
 ```
@@ -3926,28 +3970,28 @@ on a shared connection. Unknown session ids are rejected with `404`.
 
 ## Tools
 
-| Tool              | Args                                                 | Description                                                                                                        |
-| ----------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `list_tasks`      | —                                                    | All tasks: name, runner, schedule, paused, next run                                                                |
-| `get_task`        | `name`                                               | One task, full config                                                                                              |
-| `list_schedules`  | —                                                    | Schedules: taskName, schedule (cron/interval/once), tz, nextRunAt, lastRunAt, paused, effectiveStatus              |
-| `get_schedule`    | `scheduleId`                                         | One schedule: rule, tz, data, effectiveStatus                                                                      |
-| `create_schedule` | `taskName schedule tz?`                              | Create (or upsert by `dedupKey`) a schedule (mutation); `data` validated against the task `inputSchema`            |
-| `update_schedule` | `scheduleId schedule? tz?`                           | Edit a schedule in place (mutation, partial merge)                                                                 |
-| `pause_schedule`  | `scheduleId`                                         | Pause one schedule instance (mutation)                                                                             |
-| `resume_schedule` | `scheduleId`                                         | Resume a paused schedule (mutation)                                                                                |
-| `delete_schedule` | `scheduleId`                                         | Delete a schedule; runs keep history (mutation)                                                                    |
-| `list_runs`       | `task? status? since? until? runner? limit? offset?` | Runs, newest first; filter by task/status/runner and the `startedAt` window (`since`/`until`, ISO-8601, inclusive) |
-| `get_run`         | `runId`                                              | One run: status, error, log, result, artifacts                                                                     |
-| `trigger_task`    | `name data?`                                         | Run a task immediately (mutation); `data` validated against the task `inputSchema`                                 |
-| `cancel_run`      | `runId`                                              | Cancel a running/queued run (mutation); a terminal run → 409                                                       |
-| `retry_run`       | `runId triggeredBy?`                                 | Re-execute a finished run with its original data (mutation)                                                        |
-| `pause_task`      | `name`                                               | Stop scheduling a task (mutation)                                                                                  |
-| `resume_task`     | `name`                                               | Resume a paused task (mutation)                                                                                    |
-| `pause_queue`     | —                                                    | Pause the whole queue (mutation, idempotent): recurring schedules skip the window, `once`/retries are deferred     |
-| `resume_queue`    | —                                                    | Resume a paused queue (mutation, idempotent); deferred runs play out once                                          |
-| `delete_task`     | `name`                                               | Delete a task; runs keep history (mutation)                                                                        |
-| `delete_run`      | `runId`                                              | Delete a run from history (mutation)                                                                               |
+| Tool              | Args                                                 | Description                                                                                                                                                                   |
+| ----------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_tasks`      | —                                                    | All tasks: name, runner, schedule, paused, next run                                                                                                                           |
+| `get_task`        | `name`                                               | One task, full config                                                                                                                                                         |
+| `list_schedules`  | —                                                    | Schedules: taskName, schedule (cron/interval/once), tz, nextRunAt, lastRunAt, paused, disabled, disabledBy, effectiveStatus (`disabled` when the row or its task is disabled) |
+| `get_schedule`    | `scheduleId`                                         | One schedule: rule, tz, data, effectiveStatus                                                                                                                                 |
+| `create_schedule` | `taskName schedule tz?`                              | Create (or upsert by `dedupKey`) a schedule (mutation); `data` validated against the task `inputSchema`                                                                       |
+| `update_schedule` | `scheduleId schedule? tz?`                           | Edit a schedule in place (mutation, partial merge)                                                                                                                            |
+| `pause_schedule`  | `scheduleId`                                         | Pause one schedule instance (mutation)                                                                                                                                        |
+| `resume_schedule` | `scheduleId`                                         | Resume a paused schedule (mutation)                                                                                                                                           |
+| `delete_schedule` | `scheduleId`                                         | Delete a schedule; runs keep history (mutation)                                                                                                                               |
+| `list_runs`       | `task? status? since? until? runner? limit? offset?` | Runs, newest first; filter by task/status/runner and the `startedAt` window (`since`/`until`, ISO-8601, inclusive)                                                            |
+| `get_run`         | `runId`                                              | One run: status, error, log, result, artifacts                                                                                                                                |
+| `trigger_task`    | `name data?`                                         | Run a task immediately (mutation); `data` validated against the task `inputSchema`                                                                                            |
+| `cancel_run`      | `runId`                                              | Cancel a running/queued run (mutation); a terminal run → 409                                                                                                                  |
+| `retry_run`       | `runId triggeredBy?`                                 | Re-execute a finished run with its original data (mutation)                                                                                                                   |
+| `pause_task`      | `name`                                               | Stop scheduling a task (mutation)                                                                                                                                             |
+| `resume_task`     | `name`                                               | Resume a paused task (mutation)                                                                                                                                               |
+| `pause_queue`     | —                                                    | Pause the whole queue (mutation, idempotent): recurring schedules skip the window, `once`/retries are deferred                                                                |
+| `resume_queue`    | —                                                    | Resume a paused queue (mutation, idempotent); deferred runs play out once                                                                                                     |
+| `delete_task`     | `name`                                               | Delete a task; runs keep history (mutation)                                                                                                                                   |
+| `delete_run`      | `runId`                                              | Delete a run from history (mutation)                                                                                                                                          |
 
 `pause_queue`/`resume_queue` are **mutations** — gated by `--readonly` like the
 rest. There are deliberately **no bulk run tools**: a batch cancel/retry is an

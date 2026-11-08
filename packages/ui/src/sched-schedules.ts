@@ -26,9 +26,12 @@ const dataOf = (d: unknown): string => {
  * Effective pause state (decision 2026-08-18, AND semantics) — the UI must show
  * WHICH level holds the schedule, or «снял паузу, а оно молчит» happens.
  */
-type EffectiveStatus = 'paused-task' | 'paused-schedule' | 'active';
+type EffectiveStatus = 'paused-task' | 'paused-schedule' | 'disabled' | 'active';
 
 const effectiveBadge = (s: EffectiveStatus): ReturnType<typeof html> => {
+  // a disabled row is never «active»: sync parks a rule that left tasks.json and
+  // un-parks it when the rule returns (task:4218); an operator stop is manual
+  if (s === 'disabled') return html`<span class="st disabled" title="disabled — parked by sync (clears when the rule returns to tasks.json) or by an operator">⛔ disabled</span>`;
   if (s === 'paused-task') return html`<span class="st paused-task" title="task paused — the family stop holds">🔴 paused (task)</span>`;
   if (s === 'paused-schedule') return html`<span class="st paused-schedule" title="schedule paused — one instance">🟡 paused (schedule)</span>`;
   return html`<span class="st active" title="running">▶ active</span>`;

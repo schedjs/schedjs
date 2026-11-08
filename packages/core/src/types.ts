@@ -6,6 +6,17 @@ export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancell
 export type RunTrigger = 'schedule' | 'manual';
 
 /**
+ * Why a row is disabled — the intent, which `disabled` alone cannot express
+ * (task:4218: a rule parked by sync looked identical to an operator stop, so
+ * a zombie stayed parked forever). `'sync'` = sync disabled it because the rule
+ * left tasks.json — sync clears it again when the rule returns. `'operator'` =
+ * an explicit hand-stop — sync never clears it. Absent/null = no reason
+ * recorded (legacy rows, enabled rows) — treated as operator intent, the safe
+ * default: a zombie needs a real return-to-file event, not a guess.
+ */
+export type DisabledBy = 'sync' | 'operator';
+
+/**
  * Per-task retry policy (engine feature — retries are the foundation of the
  * AI-operator trigger: a *persistent* failure is one where retries ran out).
  * On a failed run with retries left, the engine schedules another attempt
@@ -81,6 +92,8 @@ export interface ScheduleRecord {
   lastRunId: string | null;
   paused: boolean;
   disabled: boolean;
+  /** Disable reason: sync clears its own ('sync') when the rule returns to the file; an 'operator' stop is never cleared. */
+  disabledBy?: DisabledBy | null;
   /**
    * True/absent = managed by tasks.json (sync disables it when removed from
    * the file); false = runtime-registered (admin API) — sync never disables it.
@@ -143,6 +156,8 @@ export interface TaskRecord {
   fileManaged?: boolean;
   paused: boolean;
   disabled: boolean;
+  /** Disable reason: sync clears its own ('sync') when the rule returns to the file; an 'operator' stop is never cleared. */
+  disabledBy?: DisabledBy | null;
 }
 
 /**
