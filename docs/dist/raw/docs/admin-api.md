@@ -488,7 +488,7 @@ when the rule returns) or `'operator'` (an explicit hand-stop — sync never cle
 - `lastRunStatus` — how the schedule's most recent run ended (`null` when it has no run,
 or its last run fell out of the recent window; listRuns is recent-first, capped at 1000).
 - `effectiveStatus` — the **AND-semantics made visible**: `'disabled'` (the schedule or
-its task is disabled — a parked rule is never reported as `active`; task:4218),
+its task is disabled — a parked rule is never reported as `active`),
 `'paused-task'` (the family stop holds), `'paused-schedule'` (only this instance), or
 `'active'`. The UI renders 🔴 for paused-task, 🟡 for paused-schedule and ⛔ for
 disabled, so «снял паузу, а оно молчит» never happens.

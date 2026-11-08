@@ -644,11 +644,11 @@ export function readTasksJsonTaskAlertsSync(path: string): Record<string, Partia
 /**
  * The `disabled` fields a sync apply must write for an existing row.
  *
- * Task:4218 — `disabled` alone could not tell «sync parked this rule because it
+ * `disabled` alone could not tell «sync parked this rule because it
  * left the file» from «the operator stopped it». A rule that RETURNED to the
- * file therefore stayed parked forever (measured: a whole mappa fleet silent
- * for 23 h). With the reason recorded, sync clears exactly its own flag and
- * never an operator's: unmarked (legacy) rows count as operator intent.
+ * file therefore stayed parked forever (measured: a whole fleet silent for
+ * 23 h). With the reason recorded, sync clears exactly its own flag and never
+ * an operator's: unmarked (legacy) rows count as operator intent.
  */
 function disabledPatch(existing: { disabled: boolean; disabledBy?: DisabledBy | null }): {
   disabled: boolean;

@@ -827,7 +827,7 @@ fire a burst of catch-ups). A task disabled by an operator (`taskOps.disableTask
 / `disabledBy: 'operator'`) is **never** re-enabled by sync; a legacy row with
 no recorded reason counts as operator intent (the safe default). Without this
 split a rule that briefly left the file stayed parked forever — the failure
-that silently stopped a whole fleet for 23 h (task:4218)
+that silently stopped a whole fleet for 23 h
 
 The daemon **re-syncs on a live interval** (default 60 s, `syncIntervalMs`): an
 edit to `tasks.json` is picked up without a restart — same create / update /

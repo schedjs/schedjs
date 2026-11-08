@@ -7,31 +7,37 @@ history is summarized below and fully preserved in the git log.
 
 ## [Unreleased]
 
-- **sync снимает свой зомби-`disabled`: у выключения появилась причина** (волна
-  core **0.57.0** → storage-mongo **0.6.1** / storage-mysql **0.6.0** /
-  storage-postgres **0.6.0** → admin-api **0.5.0** → mcp **0.6.1** →
-  ui **0.4.1** → daemon **0.13.4** → cli **0.3.1**). `scheduled_tasks`/`schedules`
-  получили `disabled_by` (`'sync' | 'operator'`, NULL = легаси-строка, читается как
-  операторский интент): правило, выпавшее из `tasks.json`, помечается
-  `disabled:true, disabledBy:'sync'`, а когда оно **возвращается** в файл, sync
-  снимает ровно свою пометку — правило тикает снова, `nextRunAt` от `now` (без
-  залпа догонов). Операторский `disableTask` (`disabledBy:'operator'`) sync не
-  снимает никогда. Без этой развилки правило, на минуту ушедшее из файла, молчало
-  навсегда: у mappa так простоял весь парк 23 часа при `effectiveStatus:"active"`
-  и бодром логе `[sched] embedded engine started, 6 rule(s)` (task:4218).
-  Миграции аддитивные (sqlite — `ALTER` на открытии, mysql/postgres — v9), так что
-  существующие зомби один раз включаются вручную (у них нет метки, безопасный
-  дефолт — операторский интент). `effectiveStatus` больше не врёт: `disabled`
-  (строка или её таска выключена) перебивает паузы, UI рисует ⛔, CLI в колонке
-  PAUSED печатает `disabled` вместо зелёного `no`. Доки: `04.tasks.md`
-  (Sync semantics), `10.admin-api.md`, `12.mcp.md`; спека admin-api — 0.5.0.
-  **Опубликовано 2026-11-08 в публичный npm** (`@schedjs/core 0.57.0` …
-  `@schedjs/cli 0.3.1` — все 9 пакетов; сайт — `/docs/whats-new`) и в публичный
-  git (`schedjs/schedjs@5b6d0e0`, CI зелёный). Той же волной уехал
-  `fix(build)`: build-скрипты пакетов зовут `yarn run -T tsc` вместо голого
-  `tsc` — на Linux root `.bin` не попадает в PATH и CI падал
-  `command not found: tsc` (воспроизводится на любом прежнем коммите в чистом
-  контейнере).
+### Added
+
+- `disabled_by` on tasks and schedules (`'sync' | 'operator'`, `null` on legacy
+  rows): the disable reason now lives next to the flag. Exposed as `disabledBy`
+  by the admin API, the MCP tools and the dashboard.
+- `effectiveStatus: 'disabled'` — a disabled schedule (or a schedule whose task
+  is disabled) is never reported as `active`. The dashboard renders ⛔ and
+  `sched schedules` prints `disabled` in the PAUSED column.
+
+### Changed
+
+- **Sync un-parks its own rule when it returns to `tasks.json`.** A rule removed
+  from the file is disabled with `disabledBy: 'sync'`; when it comes back, sync
+  clears that mark and recomputes `nextRunAt` from now (no catch-up burst). An
+  operator stop (`disableTask` / `disabledBy: 'operator'`) is never cleared by
+  sync; a legacy row without a mark counts as operator intent. Before this, a
+  rule that briefly left the file stayed parked forever while the schedule list
+  and the boot log (`6 rule(s)`) looked healthy.
+- Additive migrations: SQLite adds the column on open, MySQL and PostgreSQL run
+  migration 9, MongoDB is schemaless. Rows parked by earlier releases carry no
+  mark and need one manual `enableTask`.
+
+### Fixed
+
+- Package build scripts call `yarn run -T tsc` instead of a bare `tsc`: on Linux
+  the root `.bin` is not on `PATH`, so `yarn workspaces foreach … run build`
+  failed with `command not found: tsc`.
+
+Wave: core **0.57.0** · storage-mongo **0.6.1** · storage-mysql **0.6.0** ·
+storage-postgres **0.6.0** · admin-api **0.5.0** · mcp **0.6.1** · ui **0.4.1** ·
+daemon **0.13.4** · cli **0.3.1**.
 
 - **R2+R3+R4 — пауза очереди, окно ранов, массовые операции** (волна core
   **0.56.0** → storage-mongo **0.6.0** / storage-mysql **0.5.0** /
