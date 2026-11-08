@@ -22,7 +22,7 @@
     "@schedjs/core": "workspace:*"
   },
   "scripts": {
-    "build": "node ../../scripts/clean.mjs && tsc -p tsconfig.build.json"
+    "build": "node ../../scripts/clean.mjs && yarn run -T tsc -p tsconfig.build.json"
   },
   "keywords": [
     "cron",
