@@ -165,7 +165,7 @@ uses it to send **one** message per incident instead of one per run:
         previousFailures: 3
       </code>
       
-       («отпустило»)
+       (recovery)
     </td>
   </tr>
   
@@ -494,7 +494,7 @@ The four `cancel-*` events are the async-cancel channel's observability contract
 (battle-stand debugging, 2026-08-21) — one line per cancel attempt, so the
 operator can tell **«signal never sent»** (`cancel-no-channel`) from
 **«sent and failed»** (`cancel-failed`) from **«acked»** (`cancel-ack`). The
-daemon writes them to stdout as `[cancel] POST <url> runId=<id>` / `[cancel] ack status=<n>` / `[cancel] failed: <причина>` / `[cancel] no cancelUrl — legacy stop-polling` — grep `[cancel]` in `docker logs` to follow a cancel attempt.
+daemon writes them to stdout as `[cancel] POST <url> runId=<id>` / `[cancel] ack status=<n>` / `[cancel] failed: <reason>` / `[cancel] no cancelUrl — legacy stop-polling` — grep `[cancel]` in `docker logs` to follow a cancel attempt.
 
 ```ts
 const engine = createEngine({

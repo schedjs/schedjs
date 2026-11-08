@@ -81,7 +81,7 @@ lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob
   keeps failing sends a single `run.failed` when the streak reaches
   `onStreak` consecutive failures (payload carries `consecutiveFailures`); the
   failures inside the streak stay silent, a success breaks the streak, and the
-  next incident alerts again. The recovery signal («отпустило») is a
+  next incident alerts again. The recovery signal ("it let go") is a
   `run.succeeded` payload carrying `previousFailures` — how many failures the
   success ended (send it by adding `'succeeded'` to `on`). Default
   `onStreak: 1` = every terminal failure alerts, i.e. exactly the behaviour
@@ -812,7 +812,7 @@ The root `alerts` block is the **channel + defaults** for the whole daemon. A ta
   task pages PagerDuty while the rest go to Slack). `alerts.onStreak: N` alerts once per
   N-failure streak instead of once per failure (default `1` = every terminal failure) —
   see [Self-hosting → Status alerts](https://schedjs.github.io/schedjs/self-hosting#status-alerts) for the recovery
-  («отпустило») signal.
+  ("it let go") signal.
 - A task without an `alerts` block uses the root defaults — no behavior change.
 - Malformed `alerts` (bad status, non-boolean `onMissed`/`onSyncFailed`, `onStreak`
   that is not an integer ≥ 1, webhook without a string `url`) fails at load, not on
@@ -1060,8 +1060,8 @@ Pause exists on **both** the task and the schedule. A schedule-fired run fires i
   schedule. `resumeSchedule` clears only its level.
 
 `resume(task)` does not unpause schedules and vice versa — the UI shows the
-**effective** status (🔴 task-paused / 🟡 schedule-paused) so «снял паузу, а оно
-молчит» never happens. A pending retry is a due run of the schedule — pausing
+**effective** status (🔴 task-paused / 🟡 schedule-paused), so "I resumed it and it
+is still silent" never happens. A pending retry is a due run of the schedule — pausing
 gates it too; unpausing re-arms it.
 
 ## Sync semantics
@@ -3169,7 +3169,7 @@ uses it to send **one** message per incident instead of one per run:
 | 2nd failure  | 1                  | silent                                                     |
 | 3rd failure  | 2                  | `run.failed` + `consecutiveFailures: 3`                    |
 | 4th failure  | 3                  | silent — one alert per streak, no reminders                |
-| success      | 3                  | `run.succeeded` + `previousFailures: 3` («отпустило»)      |
+| success      | 3                  | `run.succeeded` + `previousFailures: 3` (recovery)         |
 | next failure | 0                  | a fresh incident — silent until the streak reaches 3 again |
 
 The counter lives in the engine process, not in storage: the storage
@@ -3223,7 +3223,7 @@ The four `cancel-*&#x60; events are the async-cancel channel's observability con
 (battle-stand debugging, 2026-08-21) — one line per cancel attempt, so the
 operator can tell &#x2A;*«signal never sent»** (`cancel-no-channel&#x60;) from
 &#x2A;*«sent and failed»** (`cancel-failed&#x60;) from &#x2A;*«acked»** (`cancel-ack`). The
-daemon writes them to stdout as `[cancel] POST <url> runId=<id>` / `[cancel] ack status=<n>` / `[cancel] failed: <причина>` / `[cancel] no cancelUrl — legacy stop-polling` — grep `[cancel]` in `docker logs` to follow a cancel attempt.
+daemon writes them to stdout as `[cancel] POST <url> runId=<id>` / `[cancel] ack status=<n>` / `[cancel] failed: <reason>` / `[cancel] no cancelUrl — legacy stop-polling` — grep `[cancel]` in `docker logs` to follow a cancel attempt.
 
 ```ts
 const engine = createEngine({
@@ -3682,7 +3682,7 @@ when the rule returns) or `'operator'` (an explicit hand-stop — sync never cle
   its task is disabled — a parked rule is never reported as `active`),
   `'paused-task'` (the family stop holds), `'paused-schedule'` (only this instance), or
   `'active'`. The UI renders 🔴 for paused-task, 🟡 for paused-schedule and ⛔ for
-  disabled, so «снял паузу, а оно молчит» never happens.
+  disabled, so "I resumed it and it is still silent" never happens.
 
 ```json
 {
@@ -3808,8 +3808,8 @@ failure streak — that lives in the daemon process (see
 schedule row: `task`, rule, `tz&#x60;, &#x2A;*`data`** (the per-tenant parameters), next run,
 last run + status, and the **effective pause status**: 🔴 `paused (task)` when the
 family stop holds the schedule, 🟡 `paused (schedule)` when only this instance is
-paused, ▶ `active`. The two levels are shown separately so «снял паузу, а оно
-молчит» never happens — `resume` on a schedule held by the task still shows 🔴
+paused, ▶ `active`. The two levels are shown separately, so "I resumed it and it is
+still silent" never happens — `resume` on a schedule held by the task still shows 🔴
 until `resume` is called on the task.
 
 **Runtime rows** — a schedule whose task is runtime-only (`fileManaged=false`, e.g.
@@ -4532,7 +4532,7 @@ retry ladder is one incident; its depth shows up as `run.attempt`):
   advances the schedule, not the task. It is **not** the streak itself — the
   streak lives in the engine process, below). A success breaks the streak: the
   next incident alerts again.
-- **«Отпустило» (recovery)** — the success that broke a streak which had reached
+- **Recovery ("it let go")** — the success that broke a streak which had reached
   the threshold carries `previousFailures` (how many failures it ended). It is a
   `run.succeeded` alert like any other, so it is gated by `on`: with the default
   `on: ['failed']` no success notification is sent — add `'succeeded'` to receive

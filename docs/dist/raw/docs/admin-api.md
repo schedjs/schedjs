@@ -491,7 +491,7 @@ or its last run fell out of the recent window; listRuns is recent-first, capped 
 its task is disabled — a parked rule is never reported as `active`),
 `'paused-task'` (the family stop holds), `'paused-schedule'` (only this instance), or
 `'active'`. The UI renders 🔴 for paused-task, 🟡 for paused-schedule and ⛔ for
-disabled, so «снял паузу, а оно молчит» never happens.
+disabled, so "I resumed it and it is still silent" never happens.
 
 ```json
 {
