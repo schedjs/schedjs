@@ -1,33 +1,36 @@
 # Changelog
 
-All notable changes to sched. Format follows [Keep a Changelog](https://keepachangelog.com/);
-versioning is per-package (monorepo), so entries list the version matrix of the
-wave. Prior to the public release the project lived on a private registry —
-history is summarized below and fully preserved in the git log.
+All notable changes to sched. The format follows [Keep a Changelog](https://keepachangelog.com/);
+versioning is per-package (monorepo), so every release lists the versions it shipped.
 
-## [Unreleased]
+## [0.57.0] — 2026-11-08
+
+core 0.57.0 · storage-mongo 0.6.1 · storage-mysql 0.6.0 · storage-postgres 0.6.0 ·
+admin-api 0.5.0 · mcp 0.6.1 · ui 0.4.1 · daemon 0.13.4 · cli 0.3.1
 
 ### Added
 
-- `disabled_by` on tasks and schedules (`'sync' | 'operator'`, `null` on legacy
-  rows): the disable reason now lives next to the flag. Exposed as `disabledBy`
-  by the admin API, the MCP tools and the dashboard.
-- `effectiveStatus: 'disabled'` — a disabled schedule (or a schedule whose task
-  is disabled) is never reported as `active`. The dashboard renders ⛔ and
+- **`disabledBy` — the reason a task or schedule is disabled.** `'sync'` means
+  sync parked it because the rule left `tasks.json`; `'operator'` means someone
+  stopped it by hand; `null` on rows created before this release (read as
+  operator intent). Exposed by the admin API, the MCP schedule tools and the
+  dashboard.
+- **`effectiveStatus: 'disabled'`** — a disabled schedule, or a schedule whose
+  task is disabled, is never reported as `active`. The dashboard shows ⛔ and
   `sched schedules` prints `disabled` in the PAUSED column.
 
 ### Changed
 
-- **Sync un-parks its own rule when it returns to `tasks.json`.** A rule removed
-  from the file is disabled with `disabledBy: 'sync'`; when it comes back, sync
-  clears that mark and recomputes `nextRunAt` from now (no catch-up burst). An
-  operator stop (`disableTask` / `disabledBy: 'operator'`) is never cleared by
-  sync; a legacy row without a mark counts as operator intent. Before this, a
-  rule that briefly left the file stayed parked forever while the schedule list
-  and the boot log (`6 rule(s)`) looked healthy.
-- Additive migrations: SQLite adds the column on open, MySQL and PostgreSQL run
-  migration 9, MongoDB is schemaless. Rows parked by earlier releases carry no
-  mark and need one manual `enableTask`.
+- **A rule that returns to `tasks.json` schedules again.** Sync disables a rule
+  it finds missing from the file, and now clears that mark when the rule comes
+  back — recomputing `nextRunAt` from now, with no catch-up burst. An operator
+  stop is never cleared by sync. Previously a rule that briefly left the file
+  stayed parked forever while the schedule list and the boot log still looked
+  healthy.
+- **Additive migrations only:** SQLite adds the column on open, MySQL and
+  PostgreSQL run migration 9, MongoDB needs nothing. Rows parked by earlier
+  releases carry no mark, so they are treated as operator intent and need one
+  manual `enableTask`.
 
 ### Fixed
 
@@ -35,160 +38,104 @@ history is summarized below and fully preserved in the git log.
   the root `.bin` is not on `PATH`, so `yarn workspaces foreach … run build`
   failed with `command not found: tsc`.
 
-Wave: core **0.57.0** · storage-mongo **0.6.1** · storage-mysql **0.6.0** ·
-storage-postgres **0.6.0** · admin-api **0.5.0** · mcp **0.6.1** · ui **0.4.1** ·
-daemon **0.13.4** · cli **0.3.1**.
+## [0.56.0] — 2026-09-21
 
-- **R2+R3+R4 — пауза очереди, окно ранов, массовые операции** (волна core
-  **0.56.0** → storage-mongo **0.6.0** / storage-mysql **0.5.0** /
-  storage-postgres **0.5.0** → admin-api **0.4.0** → mcp **0.6.0** →
-  ui **0.4.0** → daemon **0.13.3** → cli **0.3.0**).
-  - **Очередь на паузе, демон на ходу.** `engine.pause()` / `resume()`
-    (`isPaused()` / `getPauseInfo()`) замораживают только клейм: синк
-    `tasks.json`, retention/prune, poll-loop и алерты по уже идущим ранам
-    продолжают работать. Старт замороженным — `createDaemon({ startPaused: true })`
-    или `SCHED_START_PAUSED=1` (флага CLI намеренно нет). Снятие — **skip, не
-    catch-up**: слот, наступивший внутри паузы, уезжает в следующий будущий без
-    `missed-slot`, а просроченные `once`/delayed-раны и pending-ретраи играют
-    ровно один раз. События `queue-paused` (`{ pausedAt, startPaused }`) и
-    `queue-resumed` (`{ pausedMs, skippedSchedules, deferredRuns }`).
-  - **Контур управления очередью.** `GET /queue` → `{ paused, pausedAt, startPaused }`,
-    `POST /queue/pause|resume` → `200` и идемпотентно (никогда не `409`);
-    `sched status` печатает строку `queue:` (`active` / `paused (since …, start-paused)`);
-    MCP — `pause_queue` / `resume_queue` (мутации, под `--readonly` выключены).
-    Состояние очереди намеренно не уехало в `GET /health`: liveness отвечает за liveness.
-  - **Окно ранов: `RunFilter += since / until / runner`.** `GET /runs?since=&until=&runner=`
-    (ISO-8601 на проводе; `sched runs --since 24h --until 2h --runner docker`
-    разворачивает относительную форму на клиенте), плюс fail-fast **400** на
-    неразбираемый timestamp и на неизвестный `status` (`?status=bogus` раньше
-    отдавал пустой список, что читается как «фейлов нет»). Окно — по `startedAt`,
-    обе границы включительные; цена прямо оговорена: долгий ран, стартовавший
-    ДО `since`, в список не попадёт, даже если упал внутри окна. Во всех
-    адаптерах — `idx_runs_started` (идемпотентный DDL на открытии в sqlite,
-    v8-миграция в mysql/postgres, в mongo переиспользован существующий
-    `{ startedAt: -1 }` — обходится в обратную сторону).
-  - **Массовые cancel/retry.** `POST /runs/bulk/cancel|retry` с `{ ids: [...] }`
-    отвечает **частичным** результатом `{ ok, failed: [{ id, reason }] }` —
-    никогда не атомарно, чтобы один гоняющийся cancel не блокировал остальные 99;
-    причины `not-found | already-terminal | not-cancellable`, `400` на пустое/чужое
-    тело и **422** сверх 100 id. CLI принимает ту же пачку: `sched cancel <id...>` /
-    `retry <id...>`, код выхода **1**, если хоть один id не прошёл. В MCP массовых
-    тулов намеренно нет — агент крутит `cancel_run` / `retry_run`.
-  - **Почему в волне даемон.** `@schedjs/mcp` — единственная не-`workspace`
-    зависимость в дереве (`apps/daemon`: `^0.5.1`), а caret на 0.x не покрывает
-    `0.6.0`, поэтому daemon **0.13.3** — патч без нового кода, только перепин
-    (`^0.6.0`). Ради адаптеров волна и идёт: у `storage-mongo 0.5.1` под
-    патчем лежала вложенная копия core 0.53.0 — после 0.6.0/0.5.0 дерево
-    потребителя резолвит один core.
-  - **Дашборд (`@schedjs/ui 0.4.0`).** Фильтры ранов в строке над списком
-    (`task` / `since` / `until` / `runner`, окно по `started_at`, включительные
-    границы): живут в состоянии компонента — **переживают пагинацию**, а `clear`
-    сбрасывает все четыре. Массовые **cancel/retry** по чекбоксам строк:
-    результат **частичный и честный** — ок-счётчик плюс каждый проваленный id с
-    причиной (`not-found` / `already-terminal` / `not-cancellable`, `no-answer`
-    достраивается на клиенте, поэтому id не пропадает молча); проваленные
-    остаются отмеченными — это ровно та работа, которая не сделалась. В шапке —
-    виджет очереди `queue: active` / `queue: paused (since …)` с одной кнопкой
-    pause/resume поверх идемпотентных роутов. Доки — `11.ui.md`.
-  - Доки: `00.whats-new.md`, `05.runs.md`, `10.admin-api.md`, `12.mcp.md`,
-    `13.cli.md`, `14.self-hosting.md`, `08.storage/*`.
+core 0.56.0 · storage-mongo 0.6.0 · storage-mysql 0.5.0 · storage-postgres 0.5.0 ·
+admin-api 0.4.0 · mcp 0.6.0 · ui 0.4.0 · daemon 0.13.3 · cli 0.3.0
 
-- **R1 — стрик-алерты: один сигнал на серию фейлов + «отпустило»** (волна
-  core **0.55.0** → admin-api **0.3.3** → mcp **0.5.2** → daemon **0.13.2** →
-  cli **0.2.0**). `AlertsConfig.onStreak`
-  (целое ≥ 1; дефолт 1 = прежнее поведение — алерт на каждый терминальный фейл)
-  шлёт `run.failed` **ровно один раз на серию**: на ран, где
-  `consecutiveFailures === onStreak`; внутри серии тишина, успех разрывает серию, и
-  следующий инцидент стреляет снова. Восстановление — `run.succeeded` с
-  `previousFailures` («отпустило»), гейтится существующим `on`: с дефолтным
-  `on: ['failed']` релиз-сигнала нет — добавьте `'succeeded'`, чтобы его получать;
-  `cancelled` не считается ни фейлом, ни восстановлением. Серия живёт в памяти
-  движка (`Storage`-контракт не менялся): рестарт демона забывает незакрытую серию,
-  поэтому следующий фейл алертит ещё раз — алерт не теряется, это принятая цена.
-  Валидация `tasks.json` теперь покрывает и корневой блок `alerts` (`onStreak` —
-  целое ≥ 1, `onSyncFailed` — boolean). CLI: колонка `FAILS` в `sched tasks`.
-  Доки — `09.logging.md`, `14.self-hosting.md`, `00.whats-new.md`.
+### Added
 
-  Почему в волне пять пакетов, а не три: `workspace:*` в манифестах
-  разворачивается при упаковке в точную версию, поэтому core 0.55.0
-  без перепина соседей давал в дереве потребителя ДВЕ копии core —
-  engine бросал `InputValidationError` из 0.55.0, а admin-api ловил класс
-  из 0.54.0 и `instanceof` не срабатывал (`POST /tasks/:name/run` с
-  невалидным `data` отвечал 500 вместо 400). admin-api **0.3.3** и mcp
-  **0.5.2** — патчи без нового кода: они пинят core 0.55.0 (у mcp заодно
-  уезжает фикс баннера версии — `VERSION` читается из `package.json`,
-  а не из хардкода). Адаптеры `storage-*` оставлены на 0.54.0: они
-  импортируют core только как типы (`import type`), рантайм-связи и
-  проверок идентичности там нет, а свои изменения они получат в волне 2
-  вместе с `RunFilter`.
+- **Pause the whole queue without stopping the daemon.** `engine.pause()` /
+  `resume()` (`isPaused()`, `getPauseInfo()`) freeze claiming only: `tasks.json`
+  sync, retention, the poll loop and alerts for runs already in flight keep
+  working. Boot frozen with `createDaemon({ startPaused: true })` or
+  `SCHED_START_PAUSED=1`. Resume is **skip, not catch-up** — a slot that came
+  due during the pause moves to its next future slot, while overdue `once` and
+  delayed runs play exactly once. Events `queue-paused` / `queue-resumed`
+  (the latter carries `{ pausedMs, skippedSchedules, deferredRuns }`).
+- **Queue control plane:** `GET /queue`, `POST /queue/pause|resume` (idempotent,
+  never `409`), a `queue:` line in `sched status`, and `pause_queue` /
+  `resume_queue` MCP tools.
+- **Run filters:** `GET /runs?since=&until=&runner=` (ISO-8601 on the wire,
+  relative forms such as `24h` in the CLI), `400` on an unparseable timestamp
+  or unknown `status`, backed by `idx_runs_started` in every adapter.
+- **Bulk operations:** `POST /runs/bulk/cancel|retry` return a partial result
+  (`{ ok, failed: [{ id, reason }] }`) — never atomic, so one racing run cannot
+  block the rest. `sched cancel <id...>` / `retry <id...>` exit `1` if any id
+  failed.
 
-- **Публичный npm-релиз (2026-09-19)** — core 0.54.0, ui 0.3.1, cli 0.1.2,
-  storage-mongo 0.5.1, daemon 0.13.1, mcp 0.5.1, admin-api 0.3.2,
-  storage-mysql 0.4.2, storage-postgres 0.4.2. Внимание: tarball'ы
-  `daemon@0.13.0` / `mcp@0.5.0` / `admin-api@0.3.1` / `storage-mysql@0.4.1` /
-  `storage-postgres@0.4.1` на npm нерабочие (в манифест утёк протокол
-  `workspace:*`) — свежий `npm i` на них падает; используйте версии выше.
-  Версии публичного npm для этих пяти пакетов на один патч выше версий
-  внутреннего реестра (волна 2026-08-30).
+### Changed
 
-- **Волна 0.54.0/0.13.0 опубликована на npm** (2026-08-30): core 0.54.0,
-  daemon 0.13.0, mcp 0.5.0, admin-api 0.3.1, ui 0.3.1, storage-mysql/pg 0.4.1;
-  publish:check npm-часть зелёная, install-smoke OK. Docker-образ — отдельный
-  VDS-шаг.
+- Dashboard: run filters (task / since / until / runner, kept across paging),
+  bulk cancel/retry with per-id reasons, and a queue widget in the header.
 
-- **@schedjs/mcp full control-plane (task:1364)** — tools grown from 9 to 18:
-  schedule CRUD (`get/create/update/pause/resume/delete_schedule`), run
-  lifecycle (`cancel_run`, `retry_run`), `delete_task`. `data`/inputSchema
-  validation flows through to the admin API.
+## [0.55.0] — 2026-09-20
 
-- **inputSchema in TaskDefinition (core)** — declare the shape of run `data`
-  (tenant parameters) as a JSON Schema subset (types, min/max, minLength/
-  maxLength, minItems/maxItems, enum, required, default, description). The
-  engine validates `data` at create_schedule / update_schedule / run_once
-  (400 with detailed issues), applies defaults, and the admin UI / MCP render
-  forms from the schema (trigger.dev model). `input_schema` persisted on the
-  task row (sqlite v0.9, mysql/pg v7).
+core 0.55.0 · admin-api 0.3.3 · mcp 0.5.2 · daemon 0.13.2 · cli 0.2.0
 
-- **daemon 0.12.1 published** (cancel-on-poll-timeout wave: core 0.53.0 →
-  daemon 0.12.1 → npm). Publish:check green for all 9 npm packages;
-  docker image pushed separately on the VDS release step.
+### Added
 
-- **Cancel-on-timeout (core 0.53.0)** — a poll/run timeout is no longer a
-  silent stop-polling: when the accepted envelope advertised a `cancelUrl`,
-  sched now POSTs `{ runId }` to the worker **before** failing the timed-out
-  run, so the worker halts at the next stage boundary instead of finishing
-  destructive work after the `failed` verdict was recorded. A failed cancel
-  signal is appended to the run error (`cancel signal failed: <reason>`).
-  Workers without a `cancelUrl` keep the legacy stop-polling semantics.
+- **Streak alerts (`AlertsConfig.onStreak`).** One `run.failed` per failure
+  streak instead of one per failed run; a success emits `run.succeeded` with
+  `previousFailures` (the "recovered" signal) and resets the streak. `onStreak:
+  1` (default) keeps the old per-run behaviour. The streak lives in engine
+  memory: a daemon restart forgets an open streak, so the next failure alerts
+  again — an alert is never lost.
+- `sched tasks` gained a FAILS column (per-task failure count, schedules
+  included).
 
-- **Sync-health alerts (`sync.failed`)** — the daemon now reports tasks.json
-  sync failures over the alerts webhook (`onSyncFailed`, default on): a dead
-  storage pool means nothing schedules, so `run.failed` alerts can never fire
-  — sync health is the scheduler's own heartbeat. Fires once per failure
-  streak (dedupe), resets on heal. Prod lesson 2026-08-24 (books: dead mongo
-  pool, tasks not scheduled, no alerts). core 0.52.0 / daemon 0.12.0.
-- **daemon 0.11.3 published** (release-hardening wave: core 0.51.0 → daemon
-  0.11.3 → `ghcr.io/schedjs/sched-daemon:0.11.3` + latest). Retention
-  regression suite (c3e60c7) + falsy-drop audit landed; publish:check green
-  (9 npm + 1 docker).
-- **Mongo reconnect ownership (storage-mongo 0.5.1)** — the adapter, not the
-  driver's SDAM, owns reconnection. Every storage op is wrapped: a
-  connection-class error (`MongoNetworkError` / `MongoNotConnectedError` /
-  server-selection / topology-closed) forces a fresh topology
-  (`client.close()` + `client.connect()`, which re-resolves DNS) and retries
-  (bounded, 2×). Prod lesson (books 2026-08-24): the driver kept `connection 6
-  … closed` for hours after the mongo container was recreated — tasks not
-  scheduled, no alerts. Non-connection errors propagate unchanged.
-- **Release hardening** (for the public release):
-  - `--retention-ttl 0` now truly means "retention off": a `0` value reaches
-    the engine as `retentionMs: 0` (nullish, not falsy-dropped) and old runs
-    are **not** pruned. Previously `0` was dropped and the default TTL applied —
-    old runs could be deleted even with retention disabled.
-  - `yarn publish:check` — post-publish self-check (`npm view` + `docker
-    manifest inspect`) so artifacts that fail to reach the registry are caught
-    automatically.
-- **Docs**: public-facing cleanup — private registry/host references replaced
-  with tokens, README quick start, LICENSE (MIT), CONTRIBUTING (CLA + trademark).
+### Fixed
+
+- `POST /tasks/:name/run` with invalid `data` answers `400` instead of `500`:
+  admin-api and mcp no longer carry a duplicate copy of `@schedjs/core`, so
+  `instanceof InputValidationError` works.
+
+## [0.54.0] — 2026-09-19
+
+core 0.54.0 · admin-api 0.3.2 · mcp 0.5.1 · storage-mongo 0.5.1 ·
+storage-mysql 0.4.2 · storage-postgres 0.4.2 · ui 0.3.1 · daemon 0.13.1 ·
+cli 0.1.2
+
+First release published to the public npm registry.
+
+- **MCP control plane:** the tool set grew from 9 to 18 — schedule CRUD
+  (`get/create/update/pause/resume/delete_schedule`), run lifecycle
+  (`cancel_run`, `retry_run`) and `delete_task`.
+- **`inputSchema` in `TaskDefinition`:** declare the shape of run `data` as a
+  JSON Schema subset (types, bounds, `enum`, `required`, `default`,
+  `description`). The engine validates `data` on schedule create/update and
+  `run_once` (400 with the offending paths), applies defaults, and the admin UI
+  and MCP render forms from the schema.
+
+> Earlier releases (`daemon@0.13.0`, `mcp@0.5.0`, `admin-api@0.3.1`,
+> `storage-mysql@0.4.1`, `storage-postgres@0.4.1`) are broken on npm — their
+> manifests leaked the `workspace:*` protocol and a fresh `npm i` fails on them.
+
+## Earlier releases
+
+- **Cancel-on-timeout (core 0.53.0).** A poll/run timeout no longer stops
+  polling silently: when the worker advertised a `cancelUrl`, sched POSTs
+  `{ runId }` to it before failing the timed-out run, so the worker halts at the
+  next stage boundary instead of finishing destructive work after the failure
+  was recorded. A failed cancel signal is appended to the run error. Workers
+  without a `cancelUrl` keep the legacy semantics.
+- **`sync.failed` alerts (core 0.52.0 / daemon 0.12.0).** tasks.json sync
+  failures are reported over the alerts webhook (`onSyncFailed`, on by default):
+  a dead storage pool means nothing schedules, so `run.failed` can never fire —
+  sync health is the scheduler's own heartbeat. Fires once per failure streak,
+  resets on heal.
+- **Mongo reconnect ownership (storage-mongo 0.5.1).** The adapter, not the
+  driver's SDAM, owns reconnection: every operation is wrapped, and a
+  connection-class error forces a fresh topology (re-resolving DNS) with a
+  bounded retry. Drivers can keep a closed connection for hours after the server
+  is recreated — long enough to stop scheduling without any alert. Non-connection
+  errors propagate unchanged.
+- **`--retention-ttl 0` truly means "retention off"** — `0` reaches the engine as
+  `retentionMs: 0` instead of being falsy-dropped and replaced by the default
+  TTL, so old runs are no longer deleted with retention disabled.
+- **`yarn publish:check`** — post-publish self-check (`npm view` plus
+  `docker manifest inspect`) so artifacts that fail to reach a registry are
+  caught automatically.
 
 ## 2026-08-23 — prod-cutover fixes (daemon 0.11.0 / core 0.50.x / storage-mongo 0.5.0)
 
@@ -199,7 +146,7 @@ First wave driven by production findings from a real deployment:
 - **Sort indexes** on `name` / `startedAt` for run listing.
 - **`timeoutMs: -1`** = no timeout (per-task run deadline contract).
 - **Log coercion** — run logs normalized to strings.
-- **`--retention-ttl 0`** = retention off (see Unreleased for the follow-up fix).
+- **`--retention-ttl 0`** = retention off (the falsy-drop was fixed later — see the retention entry above).
 
 ## 2026-08-22 — dispatch view + daemon image from npm (daemon 0.10.x / core 0.49.0 / storage-* 0.4.0)
 
@@ -242,7 +189,7 @@ First wave driven by production findings from a real deployment:
 - Node engine floor raised to `>= 24` in the daemon wave (`>= 22.5` in core for
   `node:sqlite`).
 
-## Earlier — foundations (private registry era)
+## Earlier — foundations
 
 - **Engine** (`@sched/core`): queue-based execution, retries with backoff,
   priority, run history, `onRunFinal` alerts, lock/heartbeat, live-sync
