@@ -1,10 +1,11 @@
-import type { RetryPolicy, ScheduleRecord, TaskRecord } from './types.js';
+import type { OverlapPolicy, RetryPolicy, ScheduleRecord, TaskRecord } from './types.js';
 
 /**
  * Effective schedule policy — `schedule.override ?? task.default`, resolved as a
  * WHOLE (never a partial merge): a schedule either carries its own full
  * `retry`/`priority` or inherits the task's, nothing in between (decision
- * 2026-08-18 — a half-merged policy blurs the audit).
+ * 2026-08-18 — a half-merged policy blurs the audit). `onOverlap` follows the
+ * same rule, with `skip` as the terminal default (task:4726).
  *
  * Declarative schedules (tasks.json) have the effective policy materialized
  * onto the row at sync (entry ?? task default, see toSchedules), so for them
@@ -15,9 +16,10 @@ import type { RetryPolicy, ScheduleRecord, TaskRecord } from './types.js';
 export function resolveSchedulePolicy(
   task: TaskRecord,
   schedule: ScheduleRecord,
-): { retry: RetryPolicy | null; priority: number } {
+): { retry: RetryPolicy | null; priority: number; onOverlap: OverlapPolicy } {
   return {
     retry: schedule.retry ?? task.retry,
     priority: schedule.priority ?? task.priority,
+    onOverlap: schedule.onOverlap ?? task.onOverlap ?? 'skip',
   };
 }

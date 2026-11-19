@@ -40,7 +40,7 @@ function makeRunner(
 async function seed(storage: Storage, task: TaskRecord, patch: Partial<ScheduleRecord> = {}): Promise<void> {
   await storage.upsertTask(task);
   if (task.schedule) {
-    await storage.createSchedule({
+    await storage.createSchedule(Object.assign({
       id: task.name,
       taskName: task.name,
       schedule: task.schedule,
@@ -54,13 +54,13 @@ async function seed(storage: Storage, task: TaskRecord, patch: Partial<ScheduleR
       failCount: task.failCount,
       priority: task.priority,
       retry: task.retry,
+      onOverlap: task.onOverlap ?? null,
       retryCount: task.retryCount,
       lastRunId: task.lastRunId,
       paused: task.paused,
       disabled: task.disabled,
       fileManaged: true,
-      ...patch,
-    });
+    }, patch));
   }
 }
 

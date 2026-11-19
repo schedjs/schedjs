@@ -314,6 +314,7 @@ createDaemon({
     },
   },
   missedSlotGraceMs: 120_000, // optional — how late a dispatch must be to count as missed (default 2 min)
+  startupGraceMs: 120_000,    // optional — defer catch-up dispatches this long after start (default 0 = off)
 });
 ```
 
@@ -506,6 +507,15 @@ and the check additionally requires run history (`lastRunAt`), so a
 history-less schedule that is ever dispatched late (e.g. a one-shot with `at`
 in the past) is not reported as a miss either. If the daemon itself is down, detection happens on
 restart — an external uptime monitor covers the gap.
+- **Boot catch-up is a false alarm by default.** A host reboot leaves every slot
+overdue; the daemon comes up before the apps its http tasks call, fires all of
+them at once and each one fails with a connection error — a reboot reads as
+«prod is broken». Set `startupGraceMs` (`--startup-grace SECONDS`, embedded:
+`createEngine({ startupGraceMs })`) to the time your apps need to boot: for that
+window due slots are held back and reported as `startup-deferred` (the slot
+stays due — nothing is skipped), then the catch-up plays once. Pair it with a
+task-level [`retry`](tasks#retry) policy for the case where the app is still
+slower than the grace.
 - **Embedded / any engine** — same hooks: `onRunFinal: createAlerts(config).handleFinal`
 plus `onEvent: createAlerts(config).handleEvent` (see
 [Logging → terminal events](logging#_2-terminal-events-onrunfinal)).

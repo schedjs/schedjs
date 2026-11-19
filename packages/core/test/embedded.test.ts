@@ -26,6 +26,7 @@ async function seedTask(storage: Storage, t: TaskRecord): Promise<void> {
     failCount: t.failCount,
     priority: t.priority,
     retry: t.retry,
+    onOverlap: t.onOverlap ?? null,
     retryCount: t.retryCount,
     lastRunId: t.lastRunId,
     paused: t.paused,

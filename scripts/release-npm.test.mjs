@@ -6,6 +6,7 @@ import {
   parseNpmVersions,
   planWave,
   readTarEntry,
+  waitForVersion,
 } from './release-npm-lib.mjs';
 
 const WS = [
@@ -206,5 +207,46 @@ describe('readTarEntry', () => {
 
   it('читает вторую запись архива (сдвиг по блокам считается верно)', () => {
     expect(readTarEntry(tgz, 'package/dist/index.js')).toBe('export const x = 1;');
+  });
+});
+
+describe('waitForVersion', () => {
+  /** Fake clock: `sleep` advances time, so the loop is deterministic and instant. */
+  function harness({ versions, appearAfter, timeoutMs = 60_000, intervalMs = 10_000 }) {
+    let t = 0;
+    let calls = 0;
+    return {
+      now: () => t,
+      sleep: async (ms) => {
+        t += ms;
+      },
+      fetchVersions: () => {
+        calls += 1;
+        return calls > appearAfter ? versions : [];
+      },
+      timeoutMs,
+      intervalMs,
+    };
+  }
+
+  it('returns at once when the version is already in the registry', async () => {
+    const h = harness({ versions: ['0.59.0'], appearAfter: 0 });
+    const res = await waitForVersion({ fetchVersions: h.fetchVersions, sleep: h.sleep, version: '0.59.0', now: h.now, timeoutMs: h.timeoutMs, intervalMs: h.intervalMs });
+    expect(res).toEqual({ ok: true, waitedMs: 0, polls: 1 });
+  });
+
+  it('keeps polling through the npm publish-scan window (404 window is not a failure)', async () => {
+    const h = harness({ versions: ['0.59.0'], appearAfter: 3 });
+    const res = await waitForVersion({ fetchVersions: h.fetchVersions, sleep: h.sleep, version: '0.59.0', now: h.now, timeoutMs: h.timeoutMs, intervalMs: h.intervalMs });
+    expect(res.ok).toBe(true);
+    expect(res.polls).toBe(4);
+    expect(res.waitedMs).toBe(30_000);
+  });
+
+  it('gives up after the timeout instead of hanging the release job', async () => {
+    const h = harness({ versions: [], appearAfter: Number.POSITIVE_INFINITY });
+    const res = await waitForVersion({ fetchVersions: h.fetchVersions, sleep: h.sleep, version: '0.59.0', now: h.now, timeoutMs: h.timeoutMs, intervalMs: h.intervalMs });
+    expect(res.ok).toBe(false);
+    expect(res.waitedMs).toBeGreaterThanOrEqual(60_000);
   });
 });

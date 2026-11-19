@@ -312,6 +312,24 @@ describe('toTasks', () => {
     expect(() => toTasks([{ ...base, retry: { maxAttempts: 2 } as never }], NOON)).toThrow(/backoffMs/);
   });
 
+  it('carries onOverlap: entry ?? task, default skip, validated fail-fast (task:4726)', () => {
+    const base = { name: 'a', schedules: [{ cron: '0 9 * * *' }], config: { url: 'http://x' } };
+    // default
+    expect(toTasks([base], NOON)[0]!.onOverlap).toBe('skip');
+    // task-level
+    expect(toTasks([{ ...base, onOverlap: 'queue' }], NOON)[0]!.onOverlap).toBe('queue');
+    // entry overrides the task (same whole-policy rule as retry/priority)
+    const [sched] = toSchedules([{ ...base, onOverlap: 'queue', schedules: [{ cron: '0 9 * * *', onOverlap: 'cancel' }] }], NOON);
+    expect(sched!.onOverlap).toBe('cancel');
+    // task-level policy is NOT baked onto the row — the row keeps «inherit»
+    expect(toSchedules([{ ...base, onOverlap: 'queue' }], NOON)[0]!.onOverlap).toBeNull();
+    // fail-fast on a value the engine cannot honour
+    expect(() => toTasks([{ ...base, onOverlap: 'restart' as never }], NOON)).toThrow(/onOverlap/);
+    expect(() =>
+      toTasks([{ ...base, schedules: [{ cron: '0 9 * * *', onOverlap: 'nope' as never }] }], NOON),
+    ).toThrow(/onOverlap/);
+  });
+
   it('validates priority fail-fast: non-negative integer', () => {
     const base = { name: 'a', schedules: [{ cron: '0 9 * * *' }], config: { url: 'http://x' } };
     expect(() => toTasks([{ ...base, priority: -1 }], NOON)).toThrow(/priority/);

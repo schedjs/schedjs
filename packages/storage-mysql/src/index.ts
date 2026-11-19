@@ -4,6 +4,7 @@ import type {
   ArtifactRef,
   CompleteResult,
   DisabledBy,
+  OverlapPolicy,
   RetryPolicy,
   RunFilter,
   RunFinish,
@@ -55,6 +56,7 @@ interface TaskRow {
   fail_count: number;
   priority: number;
   retry_json: string | null;
+  on_overlap: string | null;
   retry_count: number;
   last_run_id: string | null;
   timeout_ms: number | null;
@@ -80,6 +82,7 @@ interface ScheduleRow {
   fail_count: number;
   priority: number;
   retry_json: string | null;
+  on_overlap: string | null;
   retry_count: number;
   last_run_id: string | null;
   paused: number;
@@ -141,6 +144,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     failCount: row.fail_count,
     priority: row.priority,
     retry: row.retry_json === null ? null : (json(row.retry_json) as RetryPolicy),
+    onOverlap: (row.on_overlap as OverlapPolicy | null) ?? 'skip',
     retryCount: row.retry_count,
     lastRunId: row.last_run_id,
     timeoutMs: row.timeout_ms,
@@ -166,6 +170,7 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     failCount: row.fail_count,
     priority: row.priority,
     retry: row.retry_json === null ? null : (json(row.retry_json) as RetryPolicy),
+    onOverlap: (row.on_overlap as OverlapPolicy | null) ?? null,
     retryCount: row.retry_count,
     lastRunId: row.last_run_id,
     paused: row.paused === 1,
@@ -239,6 +244,7 @@ function scheduleValues(s: ScheduleRecord): Array<string | number | null> {
     s.failCount,
     s.priority,
     s.retry === null ? null : JSON.stringify(s.retry),
+    s.onOverlap ?? null,
     s.retryCount,
     s.lastRunId,
     s.paused ? 1 : 0,
@@ -288,6 +294,7 @@ const MIGRATIONS: Array<{ version: number; up: MigrationStep[] }> = [
         fail_count    INT          NOT NULL DEFAULT 0,
         priority      INT          NOT NULL DEFAULT 0,
         retry_json    TEXT,
+        on_overlap    VARCHAR(8),
         retry_count   INT          NOT NULL DEFAULT 0,
         timeout_ms    BIGINT,
         paused        TINYINT(1)   NOT NULL DEFAULT 0,
@@ -355,6 +362,7 @@ const MIGRATIONS: Array<{ version: number; up: MigrationStep[] }> = [
         fail_count    INT          NOT NULL DEFAULT 0,
         priority      INT          NOT NULL DEFAULT 0,
         retry_json    TEXT,
+        on_overlap    VARCHAR(8),
         retry_count   INT          NOT NULL DEFAULT 0,
         last_run_id   VARCHAR(64),
         paused        TINYINT(1)   NOT NULL DEFAULT 0,
@@ -454,6 +462,15 @@ const MIGRATIONS: Array<{ version: number; up: MigrationStep[] }> = [
       { sql: `ALTER TABLE schedules ADD COLUMN disabled_by VARCHAR(16)`, guard: { table: 'schedules', column: 'disabled_by' } },
     ],
   },
+  {
+    // v10 — overlap policy (task:4726): what to do when a slot comes due while a
+    // run of the same task is alive. NULL = inherit (task default: skip).
+    version: 10,
+    up: [
+      { sql: `ALTER TABLE scheduled_tasks ADD COLUMN on_overlap VARCHAR(8)`, guard: { table: 'scheduled_tasks', column: 'on_overlap' } },
+      { sql: `ALTER TABLE schedules ADD COLUMN on_overlap VARCHAR(8)`, guard: { table: 'schedules', column: 'on_overlap' } },
+    ],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -524,8 +541,8 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
   async function upsertScheduleRow(s: ScheduleRecord): Promise<void> {
     await pool.query(
       `INSERT INTO schedules
-        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, on_overlap, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         task_name     = VALUES(task_name),
         schedule_json = VALUES(schedule_json),
@@ -539,6 +556,7 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
         fail_count    = VALUES(fail_count),
         priority      = VALUES(priority),
         retry_json    = VALUES(retry_json),
+        on_overlap    = VALUES(on_overlap),
         retry_count   = VALUES(retry_count),
         last_run_id   = VALUES(last_run_id),
         paused        = VALUES(paused),
@@ -565,8 +583,8 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
     async upsertTask(task) {
       await pool.query(
         `INSERT INTO scheduled_tasks
-          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, on_overlap, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
           runner        = VALUES(runner),
           schedule_json = VALUES(schedule_json),
@@ -581,6 +599,7 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
           fail_count    = VALUES(fail_count),
           priority      = VALUES(priority),
           retry_json    = VALUES(retry_json),
+          on_overlap    = VALUES(on_overlap),
           retry_count   = VALUES(retry_count),
           last_run_id   = VALUES(last_run_id),
           timeout_ms    = VALUES(timeout_ms),
@@ -604,6 +623,7 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
           task.failCount,
           task.priority,
           task.retry === null ? null : JSON.stringify(task.retry),
+          task.onOverlap ?? 'skip',
           task.retryCount,
           task.lastRunId,
           task.timeoutMs ?? null,
@@ -730,11 +750,14 @@ export async function createMysqlStorage(pool: Pool): Promise<Storage> {
     },
 
     async refreshScheduleLock(id, at) {
-      await pool.query(
+      const [res] = await pool.query(
         `UPDATE schedules SET locked_at = ?, updated_at = ?
          WHERE id = ? AND locked_at IS NOT NULL`,
         [at.getTime(), now(), id],
       );
+      // affectedRows (not changedRows): a same-millisecond refresh is still a
+      // successful extension, and `changedRows` would call it a lost lock.
+      return (res as { affectedRows?: number }).affectedRows! > 0;
     },
 
     async clearScheduleLocks() {

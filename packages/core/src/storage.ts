@@ -153,10 +153,13 @@ export interface Storage {
   /** Unlock stale schedule locks (zombie sweep); increments their failCount. Returns count. */
   reapZombieScheduleLocks(olderThan: Date): Promise<number>;
   /**
-   * Extend a claimed schedule's lock (heartbeat) — no-op when not locked.
-   * The schedule twin of `refreshLock`.
+   * Extend a claimed schedule's lock (heartbeat). Returns **true** when the
+   * lock was held and is now extended, **false** when there was nothing to
+   * extend (never locked, already completed or reaped, unknown id) — the
+   * difference is what lets the engine report a run that lost its lock
+   * (task:4727). The schedule twin of `refreshLock`.
    */
-  refreshScheduleLock(id: string, now: Date): Promise<void>;
+  refreshScheduleLock(id: string, now: Date): Promise<boolean>;
   /** Release every schedule lock immediately (startup recovery). Returns count. */
   clearScheduleLocks(): Promise<number>;
 

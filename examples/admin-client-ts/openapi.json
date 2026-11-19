@@ -544,6 +544,11 @@
           "url": { "type": "string" }
         }
       },
+      "OverlapPolicy": {
+        "type": "string",
+        "enum": ["skip", "queue", "cancel"],
+        "description": "What a due slot does while a run of the same task is still alive: skip (default — drop the slot, one overlap-skipped event), queue (fire after the live run ends, no missed-slot), cancel (stop the live run first). Resolved schedule ?? task ?? skip."
+      },
       "RetryPolicy": {
         "type": "object",
         "required": ["maxAttempts", "backoffMs"],
@@ -577,6 +582,7 @@
           "externalId": { "type": "string" },
           "dedupKey": { "type": "string" },
           "retry": { "$ref": "#/components/schemas/RetryPolicy" },
+          "onOverlap": { "$ref": "#/components/schemas/OverlapPolicy" },
           "priority": { "type": "integer", "minimum": 0 }
         }
       },
@@ -605,6 +611,7 @@
           "failCount": { "type": "integer" },
           "priority": { "type": "integer" },
           "retry": { "oneOf": [{ "$ref": "#/components/schemas/RetryPolicy" }, { "type": "null" }] },
+          "onOverlap": { "oneOf": [{ "$ref": "#/components/schemas/OverlapPolicy" }, { "type": "null" }] },
           "retryCount": { "type": "integer" },
           "lastRunId": { "type": ["string", "null"] },
           "fileManaged": { "type": "boolean", "description": "true/absent = tasks.json-managed; false = runtime" },
@@ -627,6 +634,7 @@
           "label": { "type": "string" },
           "description": { "type": "string" },
           "retry": { "$ref": "#/components/schemas/RetryPolicy" },
+          "onOverlap": { "$ref": "#/components/schemas/OverlapPolicy" },
           "priority": { "type": "integer", "minimum": 0 },
           "data": {},
           "allowedTools": { "type": "array", "items": {} }
@@ -674,6 +682,7 @@
           "failCount": { "type": "integer" },
           "priority": { "type": "integer" },
           "retry": { "oneOf": [{ "$ref": "#/components/schemas/RetryPolicy" }, { "type": "null" }] },
+          "onOverlap": { "oneOf": [{ "$ref": "#/components/schemas/OverlapPolicy" }, { "type": "null" }] },
           "retryCount": { "type": "integer" },
           "lastRunId": { "type": ["string", "null"] },
           "paused": { "type": "boolean" },

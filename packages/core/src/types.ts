@@ -33,6 +33,21 @@ export interface RetryPolicy {
 }
 
 /**
+ * What the engine does when a slot comes due while a run of the same task is
+ * still alive (task:4726) — the case the schedule lock cannot cover, because
+ * manual runs (`triggerTask`, the admin API, a retry) never take one:
+ *
+ * - `skip` (default) — the slot is dropped and reported once per series with
+ *   `overlap-skipped`; `nextRunAt` moves to the next slot as if it had run.
+ * - `queue` — the slot stays due and fires as soon as the live run finishes;
+ *   the wait is intentional, so no `missed-slot` is reported for it.
+ * - `cancel` — the live run is cancelled (`cancelled`, reason names the
+ *   policy) and the slot starts a fresh run. The engine waits for the old run
+ *   to actually stop before dispatching.
+ */
+export type OverlapPolicy = 'skip' | 'queue' | 'cancel';
+
+/**
  * Reference to a run artifact — S3 object, email receipt, URL, local file.
  * Worker reports them back; the daemon stores them on the RunRecord.
  */
@@ -86,6 +101,8 @@ export interface ScheduleRecord {
   priority: number;
   /** Retry policy override; null = inherit the task's policy (slice 3 resolution). */
   retry: RetryPolicy | null;
+  /** Overlap policy override; `null`/absent = inherit the task's (default `skip`). */
+  onOverlap?: OverlapPolicy | null;
   /** Retries consumed so far (runtime state; 0 = none). */
   retryCount: number;
   /** Id of the last finished run from this schedule (runtime state). */
@@ -133,6 +150,8 @@ export interface TaskRecord {
   priority: number;
   /** Retry policy; null = no retries (a failure is final). */
   retry: RetryPolicy | null;
+  /** What happens when a slot arrives while a run of this task is alive. Default: `skip`. */
+  onOverlap?: OverlapPolicy;
   /** Retries consumed so far (runtime state; 0 = none). */
   retryCount: number;
   /**

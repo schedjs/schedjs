@@ -9,7 +9,16 @@ import type {
   Storage,
   TaskListFilter,
 } from './storage.js';
-import type { ArtifactRef, DisabledBy, RetryPolicy, RunRecord, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
+import type {
+  ArtifactRef,
+  DisabledBy,
+  OverlapPolicy,
+  RetryPolicy,
+  RunRecord,
+  RunStatus,
+  ScheduleRecord,
+  TaskRecord,
+} from './types.js';
 
 interface TaskRow {
   name: string;
@@ -26,6 +35,7 @@ interface TaskRow {
   fail_count: number;
   priority: number;
   retry_json: string | null;
+  on_overlap: string | null;
   retry_count: number;
   last_run_id: string | null;
   timeout_ms: number | null;
@@ -51,6 +61,7 @@ interface ScheduleRow {
   fail_count: number;
   priority: number;
   retry_json: string | null;
+  on_overlap: string | null;
   retry_count: number;
   last_run_id: string | null;
   paused: number;
@@ -112,6 +123,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     failCount: row.fail_count,
     priority: row.priority,
     retry: row.retry_json === null ? null : (json(row.retry_json) as RetryPolicy),
+    onOverlap: (row.on_overlap as OverlapPolicy | null) ?? 'skip',
     retryCount: row.retry_count,
     lastRunId: row.last_run_id,
     timeoutMs: row.timeout_ms,
@@ -161,6 +173,7 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     failCount: row.fail_count,
     priority: row.priority,
     retry: row.retry_json === null ? null : (json(row.retry_json) as RetryPolicy),
+    onOverlap: (row.on_overlap as OverlapPolicy | null),
     retryCount: row.retry_count,
     lastRunId: row.last_run_id,
     paused: row.paused === 1,
@@ -210,6 +223,7 @@ function scheduleValues(s: ScheduleRecord): Array<string | number | null> {
     s.failCount,
     s.priority,
     s.retry === null ? null : JSON.stringify(s.retry),
+    s.onOverlap ?? null,
     s.retryCount,
     s.lastRunId,
     s.paused ? 1 : 0,
@@ -253,6 +267,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       fail_count    INTEGER NOT NULL DEFAULT 0,
       priority      INTEGER NOT NULL DEFAULT 0,
       retry_json    TEXT,
+      on_overlap    TEXT,
       retry_count   INTEGER NOT NULL DEFAULT 0,
       last_run_id   TEXT,
       timeout_ms    INTEGER,
@@ -276,6 +291,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       fail_count    INTEGER NOT NULL DEFAULT 0,
       priority      INTEGER NOT NULL DEFAULT 0,
       retry_json    TEXT,
+      on_overlap    TEXT,
       retry_count   INTEGER NOT NULL DEFAULT 0,
       last_run_id   TEXT,
       paused        INTEGER NOT NULL DEFAULT 0,
@@ -370,6 +386,9 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
   if (!have.has('disabled_by')) db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN disabled_by TEXT`);
   const schedCols = db.prepare(`PRAGMA table_info(schedules)`).all() as Array<{ name: string }>;
   if (!schedCols.some((c) => c.name === 'disabled_by')) db.exec(`ALTER TABLE schedules ADD COLUMN disabled_by TEXT`);
+  // overlap policy (task:4726) — additive, NULL = inherit the task's (default skip)
+  if (!have.has('on_overlap')) db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN on_overlap TEXT`);
+  if (!schedCols.some((c) => c.name === 'on_overlap')) db.exec(`ALTER TABLE schedules ADD COLUMN on_overlap TEXT`);
 
   // v0.6 → v0.7 one-shot synthesis: legacy task rows with a schedule become
   // schedule rows — id = task name, dedupKey = task name (deterministic, so a
@@ -417,8 +436,8 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
 
   const upsertTask = db.prepare(`
     INSERT INTO scheduled_tasks
-      (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, on_overlap, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       runner        = excluded.runner,
       schedule_json = excluded.schedule_json,
@@ -433,6 +452,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       fail_count    = excluded.fail_count,
       priority      = excluded.priority,
       retry_json    = excluded.retry_json,
+      on_overlap    = excluded.on_overlap,
       retry_count   = excluded.retry_count,
       last_run_id   = excluded.last_run_id,
       timeout_ms    = excluded.timeout_ms,
@@ -445,8 +465,8 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
 
   const upsertSchedule = db.prepare(`
     INSERT INTO schedules
-      (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, on_overlap, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       task_name     = excluded.task_name,
       schedule_json = excluded.schedule_json,
@@ -460,6 +480,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
       fail_count    = excluded.fail_count,
       priority      = excluded.priority,
       retry_json    = excluded.retry_json,
+      on_overlap    = excluded.on_overlap,
       retry_count   = excluded.retry_count,
       last_run_id   = excluded.last_run_id,
       paused        = excluded.paused,
@@ -626,6 +647,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
         task.failCount,
         task.priority,
         task.retry === null ? null : JSON.stringify(task.retry),
+        task.onOverlap ?? 'skip',
         task.retryCount,
         task.lastRunId,
         task.timeoutMs ?? null,
@@ -709,7 +731,7 @@ export function createSqliteStorage(db: DatabaseSync): Storage {
     },
 
     async refreshScheduleLock(id, at) {
-      refreshSchedule.run(at.getTime(), now(), id);
+      return Number(refreshSchedule.run(at.getTime(), now(), id).changes) > 0;
     },
 
     async clearScheduleLocks() {

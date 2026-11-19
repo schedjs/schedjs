@@ -4,6 +4,27 @@ Version history for sched, newest first. Versioning is **per-package** (monorepo
 so each wave lists the version matrix it shipped. The full, commit-level history
 lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob/main/CHANGELOG.md){rel="&#x22;nofollow&#x22;"}.
 
+## 2026-11-19 — overlap policy, boot grace, lock truth (core 0.59.0 / storage-mongo 0.6.3 / storage-mysql 0.6.2 / storage-postgres 0.6.2 / admin-api 0.6.0 / mcp 0.6.3 / ui 0.4.2 / daemon 0.14.0 / cli 0.3.3)
+
+- **`onOverlap` — one task never runs twice.** Schedule-fired runs were already
+  serialized by the atomic schedule lock, but a *manual* run (API, dashboard, a
+  retry) takes no lock, so a due slot used to start a parallel copy. `onOverlap`
+  decides: `skip` (default — drop the slot, one `overlap-skipped` event per
+  series), `queue` (play it after the live run ends, no `missed-slot` alarm),
+  `cancel` (stop the live run first). Resolved like `retry`/`priority`.
+- **`startupGraceMs` / `--startup-grace SECONDS` — a reboot is not a failure
+  storm.** For the first N ms of ticking, overdue catch-up slots are held back
+  (`startup-deferred`) instead of fired at once: a host whose scheduler boots
+  before its apps no longer turns every overdue slot into `run.failed` +
+  `missed-slot`. Slots stay due — nothing is skipped. Default `0` = off.
+- **A long async run keeps its lock.** The poll loop now refreshes the schedule
+  lock every `lockHeartbeatMs`, the way the sync heartbeat does, so a run living
+  past `lockTtlMs` (with `timeoutMs: -1` disabling the poll ceiling) no longer
+  gets a parallel copy from the zombie watchdog.
+- **`Storage.refreshScheduleLock` returns `boolean`** — `true` = extended,
+  `false` = nothing to extend. The engine reports `lock-refresh-missed` once per
+  run when the lock is gone under a live run. Custom adapters should return it.
+
 ## 2026-10-31 — disable reason, sync un-parks a returned rule (core 0.57.0 / storage-mongo 0.6.1 / storage-mysql 0.6.0 / storage-postgres 0.6.0 / admin-api 0.5.0 / mcp 0.6.1 / ui 0.4.1 / daemon 0.13.4 / cli 0.3.1)
 
 - **`disabled` now says WHY.** New field `disabledBy: 'sync' | 'operator'`
@@ -946,21 +967,52 @@ failing the run.
 - A manual `triggerTask` never auto-retries — an explicit human trigger is a
   one-shot, its result alerts immediately.
 
+### `onOverlap`
+
+A slot can come due while a run of the same task is **still alive**. Schedule-fired
+runs cannot overlap (the schedule lock is atomic), but a manual run — `POST /tasks/:name/run`, the dashboard, a retry, a worker — takes no schedule lock, so
+without a rule the scheduler would start a second copy beside it:
+
+```json
+{
+  "name": "products-index-sync",
+  "schedules": [{ "cron": "*/30 * * * *" }],
+  "config": { "url": "..." },
+  "onOverlap": "skip"
+}
+```
+
+- `skip` (**default**) — the slot is dropped and `nextRunAt` moves to the next one,
+  as if the run had happened. One `overlap-skipped` event per skipped series
+  (not one per tick), so an hour-long run does not flood the log.
+- `queue` — the slot stays due and fires as soon as the live run finishes. The wait
+  is intentional, so its late dispatch is **not** reported as `missed-slot`.
+- `cancel` — the live run is cancelled (`cancelled`, the reason names the policy)
+  and the slot starts a fresh run. The engine waits for the old run to actually
+  stop before dispatching, so `cancel` trades latency for a clean handover. The
+  live run is never a *schedule-fired* run of the same schedule (a locked schedule
+  is not due), so the cancellation cannot swallow the slot being started.
+
+Resolved like `retry`/`priority`: the schedule entry wins, then the task, then
+`skip`. Manual runs are never deferred by this policy — it only governs whether a
+*scheduled slot* may start beside a live run.
+
 ## Fields
 
-| Field         | Type   | Default  | Description                                                                                                                                                                                                             |
-| ------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`        | string | —        | Unique task name. Runs are recorded against it                                                                                                                                                                          |
-| `runner`      | string | `"http"` | Which runner executes the task (http / docker / internal / custom)                                                                                                                                                      |
-| `schedules`   | array  | —        | Optional. One or more firing rules, each with its own `data`/policy. Omit → **trigger-only** task (never due, launched manually / from the API)                                                                         |
-| `tz`          | string | `"UTC"`  | IANA timezone for cron wall-clock semantics (applies to schedules that don't set their own)                                                                                                                             |
-| `config`      | object | —        | Runner-specific config, validated per runner at load (fail-fast)                                                                                                                                                        |
-| `priority`    | number | `0`      | Task-level scheduling priority — the default for schedules that don't override it (engine feature)                                                                                                                      |
-| `retry`       | object | —        | Task-level retry policy: `{ maxAttempts, backoffMs, multiplier? }` — the default for schedules that don't override it (engine feature)                                                                                  |
-| `timeoutMs`   | number | `-1`     | Run-deadline contract: `-1` (default) = never auto-terminate (manual cancel only), `> 0` = force-fail after N ms (see [Run deadline](https://schedjs.github.io/schedjs/#run-deadline-timeoutms))                        |
-| `inputSchema` | object | —        | JSON Schema for run `data` (types, bounds, defaults, descriptions). Data is validated at schedule create/update and run\_once; defaults are applied (see [inputSchema](https://schedjs.github.io/schedjs/#inputschema)) |
-| `label`       | string | —        | Human-readable label (admin UI); the engine ignores it                                                                                                                                                                  |
-| `description` | string | —        | Longer description (admin UI); the engine ignores it                                                                                                                                                                    |
+| Field         | Type   | Default  | Description                                                                                                                                                                                                                                                                      |
+| ------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`        | string | —        | Unique task name. Runs are recorded against it                                                                                                                                                                                                                                   |
+| `runner`      | string | `"http"` | Which runner executes the task (http / docker / internal / custom)                                                                                                                                                                                                               |
+| `schedules`   | array  | —        | Optional. One or more firing rules, each with its own `data`/policy. Omit → **trigger-only** task (never due, launched manually / from the API)                                                                                                                                  |
+| `tz`          | string | `"UTC"`  | IANA timezone for cron wall-clock semantics (applies to schedules that don't set their own)                                                                                                                                                                                      |
+| `config`      | object | —        | Runner-specific config, validated per runner at load (fail-fast)                                                                                                                                                                                                                 |
+| `priority`    | number | `0`      | Task-level scheduling priority — the default for schedules that don't override it (engine feature)                                                                                                                                                                               |
+| `retry`       | object | —        | Task-level retry policy: `{ maxAttempts, backoffMs, multiplier? }` — the default for schedules that don't override it (engine feature)                                                                                                                                           |
+| `onOverlap`   | string | `"skip"` | What a due slot does while a run of the same task is still alive: `skip` (drop it, one `overlap-skipped` event) / `queue` (fire after the live run ends, no `missed-slot`) / `cancel` (stop the live run first). See [`onOverlap`](https://schedjs.github.io/schedjs/#onoverlap) |
+| `timeoutMs`   | number | `-1`     | Run-deadline contract: `-1` (default) = never auto-terminate (manual cancel only), `> 0` = force-fail after N ms (see [Run deadline](https://schedjs.github.io/schedjs/#run-deadline-timeoutms))                                                                                 |
+| `inputSchema` | object | —        | JSON Schema for run `data` (types, bounds, defaults, descriptions). Data is validated at schedule create/update and run\_once; defaults are applied (see [inputSchema](https://schedjs.github.io/schedjs/#inputschema))                                                          |
+| `label`       | string | —        | Human-readable label (admin UI); the engine ignores it                                                                                                                                                                                                                           |
+| `description` | string | —        | Longer description (admin UI); the engine ignores it                                                                                                                                                                                                                             |
 
 ## `inputSchema`
 
@@ -1288,13 +1340,38 @@ heartbeat is liveness, not a timeout. The ceiling for a hung run stays at the
 sync timeout. If your sync workers have no runner timeout, a truly wedged worker
 blocks the task until the daemon restarts — set the runner timeouts.
 
-Async (`accepted`) runs are covered by a different invariant: `pollTimeoutMs`
-(default 25 min) is documented &#x2A;*must be < `lockTtlMs`**, so the poll fails a hung
-run before the watchdog could reap its lock. The heartbeat targets the sync path,
-which has no ceiling of its own.
+Async (`accepted`) runs get the same protection from the **poll loop**: while a run
+is in the poll queue, the loop refreshes its schedule lock every `lockHeartbeatMs`
+the same way the sync heartbeat does. The poll loop is the run's liveness signal,
+so a daemon that dies stops refreshing and the watchdog reaps the lock as before.
+
+On top of that, `pollTimeoutMs` (default 25 min) &#x2A;*must be < `lockTtlMs`** so a hung
+run is failed by the poll ceiling. A task with `timeoutMs: -1` deliberately opts out
+of every ceiling — its run may live for hours; the heartbeat is what keeps the
+watchdog from re-dispatching a parallel copy of the same slot in the meantime
+(prod defect, books 2026-11-19: 11 overlapping `running` runs). If a task must never
+run longer than X, set `timeoutMs` — `-1` means «no ceiling», not «no limit on
+parallelism».
 
 Configure via `--lock-heartbeat SECONDS` (daemon) or `lockHeartbeatMs`
 (embedded `createEngine` / `createDaemon`).
+
+## Overlap: a slot vs a live run
+
+Two runs of one task never run side by side **by design**, and the guard has two
+halves:
+
+- schedule-fired runs — the atomic schedule lock: the second claim simply loses;
+- a slot vs a run that took no lock (manual `triggerTask`, a retry, the API, a
+  worker) — the **overlap policy** (`onOverlap`, [Tasks → onOverlap](https://schedjs.github.io/schedjs/tasks#onoverlap)):
+  `skip` (default; drop the slot, one `overlap-skipped` event), `queue` (play it
+  after the live run ends — deliberately late, so no `missed-slot`), `cancel` (stop
+  the live run first).
+
+This matters for async tasks: the poll loop keeps the lock of an async *schedule*
+run fresh (see below), but a manual async run holds no lock at all — without the
+policy the next slot would start a parallel copy, which is exactly the incident
+class `overlap-skipped` now makes visible.
 
 ## Failures are recorded, not silent
 
@@ -1476,7 +1553,7 @@ Callbacks (worker → daemon push) are a future option — they'd need an inboun
   the operator can tell a lost poll connection apart from a worker-reported
   terminal failure.
 - Poll errors (non-2xx after retries, malformed envelope, unexpected status) → run `failed`.
-- `pollTimeoutMs` (default 25 min, must be < `lockTtlMs` — 5 min margin under the 30 min default so the poll fails a hung async run before the zombie watchdog can re-dispatch it) caps a hung async run. On firing, sched **signals the worker to stop** via the accepted envelope's `cancelUrl` (same `POST { runId }` as user cancel) before failing the run — the worker halts at the next stage boundary, so a `failed` verdict is not contradicted by a worker that keeps mutating. A worker without a `cancelUrl` keeps the legacy stop-polling semantics (it may finish on its own). Configure it via `createEngine({ pollTimeoutMs })` in embedded mode, or `--poll-timeout SECONDS` / `DaemonOptions.pollTimeoutMs` in the daemon.
+- `pollTimeoutMs` (default 25 min, must be < `lockTtlMs` — 5 min margin under the 30 min default so the poll fails a hung async run before the zombie watchdog can re-dispatch it) caps a hung async run (a task with `timeoutMs: -1` opts out of every ceiling; its lock is kept fresh by the poll loop instead, so a long run never gets a parallel copy). On firing, sched **signals the worker to stop** via the accepted envelope's `cancelUrl` (same `POST { runId }` as user cancel) before failing the run — the worker halts at the next stage boundary, so a `failed` verdict is not contradicted by a worker that keeps mutating. A worker without a `cancelUrl` keeps the legacy stop-polling semantics (it may finish on its own). Configure it via `createEngine({ pollTimeoutMs })` in embedded mode, or `--poll-timeout SECONDS` / `DaemonOptions.pollTimeoutMs` in the daemon.
 
 ## Worker examples by language
 
@@ -2683,7 +2760,8 @@ four groups:
   (clear lock, advance `nextRunAt`/`lastRunAt`/`lastRunId`, `failCount += failed`),
   `reapZombieScheduleLocks` (unlock stale schedule locks, bump `failCount`),
   `refreshScheduleLock` (the engine's heartbeat — extends a claimed schedule's
-  lock; no-op when not locked), `clearScheduleLocks` (startup recovery). The
+  lock, returns `true` when it was held and `false` when there was nothing to
+  extend, which the engine reports as `lock-refresh-missed`), `clearScheduleLocks` (startup recovery). The
   task-level twins (`listDueTasks`/`claimTask`/`completeTask`/`reapZombieLocks`/
   `refreshLock`/`clearLocks`) remain for manual-run reflection (`completeTask`
   writes `lastRunId`/`lastRunAt` on the task row).
@@ -2878,10 +2956,11 @@ export class MemoryStorage implements Storage {
     return count;
   }
 
-  async refreshScheduleLock(id: string, now: Date): Promise<void> {
+  async refreshScheduleLock(id: string, now: Date): Promise<boolean> {
     const s = this.schedules.get(id);
-    if (!s || s.lockedAt === null) return; // never re-locks a reaped/finished schedule
+    if (!s || s.lockedAt === null) return false; // never re-locks a reaped/finished schedule
     s.lockedAt = now;
+    return true;
   }
 
   async clearScheduleLocks(): Promise<number> {
@@ -3213,6 +3292,9 @@ The events (all carry `taskName` / `runId` / `attempt` where relevant):
 | `run-succeeded` / `run-failed` / `run-cancelled`                     | per-attempt terminal outcome                                                                                                                                | `error` (fail/cancel)                                |
 | `retry-scheduled`                                                    | a failure still has retries left                                                                                                                            | `nextRunAt`, `backoffMs`                             |
 | `missed-slot`                                                        | a schedule dispatched later than the grace window (downtime catch-up / wedged lock)                                                                         | `scheduledAt`, `delayMs`                             |
+| `startup-deferred`                                                   | a due slot was held back by the startup grace window (`startupGraceMs`) — the slot stays due, nothing is skipped                                            | `scheduleId`, `slotAt`                               |
+| `overlap-skipped`                                                    | a due slot found a run of the same task alive and the policy is `skip` — the slot was dropped (`nextRunAt` moved on), once per skipped series               | `scheduleId`, `liveRunId`, `slotAt`                  |
+| `lock-refresh-missed`                                                | an async run's lock refresh found no lock to extend — the run is alive but its schedule lock is gone, so a parallel copy may be dispatched (once per run)   | `runId`, `scheduleId`                                |
 | `poll`                                                               | an async run was polled                                                                                                                                     | `status`, `progress`                                 |
 | `cancel-sent` / `cancel-ack` / `cancel-failed` / `cancel-no-channel` | an async cancel signal was POSTed to the worker's `cancelUrl`, acked with a status, failed with a reason, or skipped (no `cancelUrl` — legacy stop-polling) | `cancelUrl` (sent), `status` (ack), `error` (failed) |
 | `zombie-reaped`                                                      | stale locks were released (only when > 0)                                                                                                                   | `count`                                              |
@@ -4038,24 +4120,25 @@ engine loops + optional admin server.
 ```bash
 schedd [--tasks tasks.json] [--db sched.db] [--lock-ttl SECONDS]
        [--lock-heartbeat SECONDS] [--retention-ttl SECONDS] [--temporary-retention-ttl SECONDS]
-       [--poll-timeout SECONDS] [--tick-interval MS] [--watchdog-interval MS]
+       [--poll-timeout SECONDS] [--startup-grace SECONDS] [--tick-interval MS] [--watchdog-interval MS]
        [--admin-port PORT] [--admin-host HOST] [--storage SPECIFIER]
 ```
 
-| Flag                        | Default        | Description                                                                                                                                                                                                          |
-| --------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--tasks`                   | `tasks.json`   | Path to the desired-state file                                                                                                                                                                                       |
-| `--db`                      | `sched.db`     | SQLite database path — &#x2A;*only valid with `--storage sqlite`** (XOR: a non-sqlite storage with an explicit `--db` fails fast)                                                                                    |
-| `--storage`                 | `sqlite`       | Exactly **one** storage (see below)                                                                                                                                                                                  |
-| `--lock-ttl`                | 1800 (30 min)  | Zombie-lock threshold in seconds                                                                                                                                                                                     |
-| `--lock-heartbeat`          | 600 (10 min)   | Lock refresh cadence for long sync runs, seconds — &#x2A;*must be `< lock-ttl` (enforced at parse; the engine throws too)** (default: `lock-ttl / 3`)                                                                |
-| `--retention-ttl`           | 2592000 (30 d) | Retention TTL for regular terminal runs, seconds from `finishedAt&#x60;. **`0` = retention off** — terminal runs are kept forever (archive semantics, see [Retention](https://schedjs.github.io/schedjs/#retention)) |
-| `--temporary-retention-ttl` | 86400 (24 h)   | Retention TTL for `temporary&#x60; runs. **`0` = retention off for the temporary class**                                                                                                                             |
-| `--poll-timeout`            | 1500 (25 min)  | Async (accepted) run ceiling in seconds — must be `< lock-ttl`                                                                                                                                                       |
-| `--tick-interval`           | 1000           | Tick cadence in ms (due-task scan)                                                                                                                                                                                   |
-| `--watchdog-interval`       | 60000          | Watchdog cadence in ms (zombie reaping)                                                                                                                                                                              |
-| `--admin-port`              | —              | Serve the admin API (`/api/*`) on this port                                                                                                                                                                          |
-| `--admin-host`              | `127.0.0.1`    | Bind host for the admin server                                                                                                                                                                                       |
+| Flag                        | Default        | Description                                                                                                                                                                                                                                                                                                                             |
+| --------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--tasks`                   | `tasks.json`   | Path to the desired-state file                                                                                                                                                                                                                                                                                                          |
+| `--db`                      | `sched.db`     | SQLite database path — &#x2A;*only valid with `--storage sqlite`** (XOR: a non-sqlite storage with an explicit `--db` fails fast)                                                                                                                                                                                                       |
+| `--storage`                 | `sqlite`       | Exactly **one** storage (see below)                                                                                                                                                                                                                                                                                                     |
+| `--lock-ttl`                | 1800 (30 min)  | Zombie-lock threshold in seconds                                                                                                                                                                                                                                                                                                        |
+| `--lock-heartbeat`          | 600 (10 min)   | Lock refresh cadence for long sync runs, seconds — &#x2A;*must be `< lock-ttl` (enforced at parse; the engine throws too)** (default: `lock-ttl / 3`)                                                                                                                                                                                   |
+| `--retention-ttl`           | 2592000 (30 d) | Retention TTL for regular terminal runs, seconds from `finishedAt&#x60;. **`0` = retention off** — terminal runs are kept forever (archive semantics, see [Retention](https://schedjs.github.io/schedjs/#retention))                                                                                                                    |
+| `--temporary-retention-ttl` | 86400 (24 h)   | Retention TTL for `temporary&#x60; runs. **`0` = retention off for the temporary class**                                                                                                                                                                                                                                                |
+| `--poll-timeout`            | 1500 (25 min)  | Async (accepted) run ceiling in seconds — must be `< lock-ttl`                                                                                                                                                                                                                                                                          |
+| `--startup-grace`           | 0 (off)        | Defer catch-up dispatches for N seconds after start: in that window every due slot is held back (`startup-deferred`) instead of fired. For hosts whose scheduler boots before the apps its http tasks call — without it a reboot fires all overdue slots at once and each fails with a connection error. `0` = off (historic behaviour) |
+| `--tick-interval`           | 1000           | Tick cadence in ms (due-task scan)                                                                                                                                                                                                                                                                                                      |
+| `--watchdog-interval`       | 60000          | Watchdog cadence in ms (zombie reaping)                                                                                                                                                                                                                                                                                                 |
+| `--admin-port`              | —              | Serve the admin API (`/api/*`) on this port                                                                                                                                                                                                                                                                                             |
+| `--admin-host`              | `127.0.0.1`    | Bind host for the admin server                                                                                                                                                                                                                                                                                                          |
 
 ## Environment
 
@@ -4500,6 +4583,7 @@ createDaemon({
     },
   },
   missedSlotGraceMs: 120_000, // optional — how late a dispatch must be to count as missed (default 2 min)
+  startupGraceMs: 120_000,    // optional — defer catch-up dispatches this long after start (default 0 = off)
 });
 ```
 
@@ -4692,6 +4776,15 @@ No `secret` → the POST is unsigned (plain webhook, e.g. into a chat gateway).
   history-less schedule that is ever dispatched late (e.g. a one-shot with `at`
   in the past) is not reported as a miss either. If the daemon itself is down, detection happens on
   restart — an external uptime monitor covers the gap.
+- **Boot catch-up is a false alarm by default.** A host reboot leaves every slot
+  overdue; the daemon comes up before the apps its http tasks call, fires all of
+  them at once and each one fails with a connection error — a reboot reads as
+  «prod is broken». Set `startupGraceMs` (`--startup-grace SECONDS`, embedded:
+  `createEngine({ startupGraceMs })`) to the time your apps need to boot: for that
+  window due slots are held back and reported as `startup-deferred` (the slot
+  stays due — nothing is skipped), then the catch-up plays once. Pair it with a
+  task-level [`retry`](https://schedjs.github.io/schedjs/tasks#retry) policy for the case where the app is still
+  slower than the grace.
 - **Embedded / any engine** — same hooks: `onRunFinal: createAlerts(config).handleFinal`
   plus `onEvent: createAlerts(config).handleEvent` (see
   [Logging → terminal events](https://schedjs.github.io/schedjs/logging#_2-terminal-events-onrunfinal)).

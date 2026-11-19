@@ -30,6 +30,14 @@ describe('createEventLogger', () => {
     logger({ type: 'cancel-ack', taskName: 'task-a', runId: RUN, status: 200 });
     logger({ type: 'cancel-failed', taskName: 'task-a', runId: RUN, error: 'ECONNREFUSED' });
     logger({ type: 'cancel-no-channel', taskName: 'task-a', runId: RUN });
+    logger({ type: 'lock-refresh-missed', taskName: 'task-a', runId: RUN, scheduleId: 'task-a' });
+    logger({
+      type: 'overlap-skipped',
+      taskName: 'task-a',
+      scheduleId: 'task-a',
+      liveRunId: RUN,
+      slotAt: new Date('2026-08-16T11:30:00Z'),
+    });
     logger({
       type: 'startup-deferred',
       taskName: 'task-a',
@@ -52,6 +60,8 @@ describe('createEventLogger', () => {
       '[sched] [cancel] ack runId=01234567 status=200',
       '[sched] [cancel] failed: ECONNREFUSED runId=01234567',
       '[sched] [cancel] no cancelUrl — legacy stop-polling runId=01234567',
+      '[sched] lock-refresh-missed task-a run=01234567 schedule=task-a',
+      '[sched] overlap-skipped task-a schedule=task-a live=01234567 slot=2026-08-16 11:30:00Z',
       '[sched] startup-deferred task-a schedule=task-a slot=2026-08-16 11:52:00Z',
     ]);
   });

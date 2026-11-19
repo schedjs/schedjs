@@ -4,6 +4,27 @@ Version history for sched, newest first. Versioning is **per-package** (monorepo
 so each wave lists the version matrix it shipped. The full, commit-level history
 lives in the repository [`CHANGELOG.md`](https://github.com/schedjs/schedjs/blob/main/CHANGELOG.md).
 
+## 2026-11-19 — overlap policy, boot grace, lock truth (core 0.59.0 / storage-mongo 0.6.3 / storage-mysql 0.6.2 / storage-postgres 0.6.2 / admin-api 0.6.0 / mcp 0.6.3 / ui 0.4.2 / daemon 0.14.0 / cli 0.3.3)
+
+- **onOverlap — one task never runs twice.** Schedule-fired runs were already
+serialized by the atomic schedule lock, but a *manual* run (API, dashboard, a
+retry) takes no lock, so a due slot used to start a parallel copy. `onOverlap`
+decides: `skip` (default — drop the slot, one `overlap-skipped` event per
+series), `queue` (play it after the live run ends, no `missed-slot` alarm),
+`cancel` (stop the live run first). Resolved like `retry`/`priority`.
+- **startupGraceMs / --startup-grace SECONDS — a reboot is not a failure
+storm.** For the first N ms of ticking, overdue catch-up slots are held back
+(`startup-deferred`) instead of fired at once: a host whose scheduler boots
+before its apps no longer turns every overdue slot into `run.failed` +
+`missed-slot`. Slots stay due — nothing is skipped. Default `0` = off.
+- **A long async run keeps its lock.** The poll loop now refreshes the schedule
+lock every `lockHeartbeatMs`, the way the sync heartbeat does, so a run living
+past `lockTtlMs` (with `timeoutMs: -1` disabling the poll ceiling) no longer
+gets a parallel copy from the zombie watchdog.
+- **Storage.refreshScheduleLock returns boolean** — `true` = extended,
+`false` = nothing to extend. The engine reports `lock-refresh-missed` once per
+run when the lock is gone under a live run. Custom adapters should return it.
+
 ## 2026-10-31 — disable reason, sync un-parks a returned rule (core 0.57.0 / storage-mongo 0.6.1 / storage-mysql 0.6.0 / storage-postgres 0.6.0 / admin-api 0.5.0 / mcp 0.6.1 / ui 0.4.1 / daemon 0.13.4 / cli 0.3.1)
 
 - **disabled now says WHY.** New field `disabledBy: 'sync' | 'operator'`

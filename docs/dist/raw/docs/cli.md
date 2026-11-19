@@ -82,7 +82,7 @@ engine loops + optional admin server.
 ```bash
 schedd [--tasks tasks.json] [--db sched.db] [--lock-ttl SECONDS]
        [--lock-heartbeat SECONDS] [--retention-ttl SECONDS] [--temporary-retention-ttl SECONDS]
-       [--poll-timeout SECONDS] [--tick-interval MS] [--watchdog-interval MS]
+       [--poll-timeout SECONDS] [--startup-grace SECONDS] [--tick-interval MS] [--watchdog-interval MS]
        [--admin-port PORT] [--admin-host HOST] [--storage SPECIFIER]
 ```
 
@@ -289,6 +289,30 @@ schedd [--tasks tasks.json] [--db sched.db] [--lock-ttl SECONDS]
       Async (accepted) run ceiling in seconds — must be <code>
         < lock-ttl
       </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        --startup-grace
+      </code>
+    </td>
+    
+    <td>
+      0 (off)
+    </td>
+    
+    <td>
+      Defer catch-up dispatches for N seconds after start: in that window every due slot is held back (<code>
+        startup-deferred
+      </code>
+      
+      ) instead of fired. For hosts whose scheduler boots before the apps its http tasks call — without it a reboot fires all overdue slots at once and each fails with a connection error. <code>
+        0
+      </code>
+      
+       = off (historic behaviour)
     </td>
   </tr>
   

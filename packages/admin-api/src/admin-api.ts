@@ -808,6 +808,7 @@ export function createAdminApi(options: AdminApiOptions): AdminApi {
               if ('dedupKey' in raw) patch.dedupKey = raw.dedupKey;
               if ('retry' in raw) patch.retry = raw.retry;
               if ('priority' in raw) patch.priority = raw.priority;
+              if ('onOverlap' in raw) patch.onOverlap = raw.onOverlap;
             } else if (tz !== undefined) {
               patch.tz = tz;
             }

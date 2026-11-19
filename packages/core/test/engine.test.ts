@@ -70,6 +70,7 @@ async function seedTask(storage: Storage, task: TaskRecord): Promise<void> {
       failCount: task.failCount,
       priority: task.priority,
       retry: task.retry,
+      onOverlap: task.onOverlap ?? null,
       retryCount: task.retryCount,
       lastRunId: task.lastRunId,
       paused: task.paused,
@@ -621,14 +622,30 @@ describe('engine — policy inheritance (slice 3)', () => {
       fileManaged: true,
     };
     // unset → inherits the whole task policy
-    expect(resolveSchedulePolicy(task, { ...base, retry: null })).toEqual({ retry: task.retry, priority: 0 });
+    expect(resolveSchedulePolicy(task, { ...base, retry: null })).toEqual({ retry: task.retry, priority: 0, onOverlap: 'skip' });
     // set → the schedule's FULL policy wins, no field-level merge
     const override = { maxAttempts: 5, backoffMs: 5000, multiplier: 2 };
-    expect(resolveSchedulePolicy(task, { ...base, retry: override })).toEqual({ retry: override, priority: 0 });
+    expect(resolveSchedulePolicy(task, { ...base, retry: override })).toEqual({
+      retry: override,
+      priority: 0,
+      onOverlap: 'skip',
+    });
+    // onOverlap follows the same rule: schedule wins, then the task, then skip
+    expect(resolveSchedulePolicy({ ...task, onOverlap: 'queue' }, base)).toEqual({
+      retry: task.retry,
+      priority: 0,
+      onOverlap: 'queue',
+    });
+    expect(resolveSchedulePolicy(task, { ...base, onOverlap: 'cancel' })).toEqual({
+      retry: task.retry,
+      priority: 0,
+      onOverlap: 'cancel',
+    });
     // priority independently
     expect(resolveSchedulePolicy({ ...task, priority: 7 }, { ...base, priority: 10 })).toEqual({
       retry: task.retry,
       priority: 10,
+      onOverlap: 'skip',
     });
   });
 
@@ -1603,6 +1620,47 @@ describe('engine — async accepted + poll loop', () => {
     expect((await storage.getSchedule('task-a'))!.lockedAt).toBeNull();
   });
 
+  it('reports lock-refresh-missed when the lock was already gone (task:4727)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ timeoutMs: -1, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const events: EngineEvent[] = [];
+    const { runner } = makeRunner(
+      async () => accepted,
+      async () => ({ status: 'running' }) as PollResult,
+    );
+    let now = NOON;
+    const engine = createEngine({
+      storage,
+      runner,
+      now: () => now,
+      lockTtlMs: 30 * 60 * 1000,
+      lockHeartbeatMs: 10 * 60 * 1000,
+      onEvent: (e) => events.push(e),
+    });
+    await engine.runOnce(); // accepted at 12:00:00
+
+    // Live lock: the refresh extends it and stays silent.
+    now = new Date(NOON.getTime() + 10 * 60 * 1000);
+    await engine.runPollOnce(now);
+    expect(events.filter((e) => e.type === 'lock-refresh-missed')).toHaveLength(0);
+
+    // Lock gone (reaped elsewhere / released): the run is no longer protected.
+    await storage.clearScheduleLocks();
+    now = new Date(now.getTime() + 10 * 60 * 1000);
+    await engine.runPollOnce(now);
+    const missed = events.filter((e) => e.type === 'lock-refresh-missed');
+    expect(missed).toHaveLength(1);
+    if (missed[0]!.type === 'lock-refresh-missed') {
+      expect(missed[0]!.taskName).toBe('task-a');
+      expect(missed[0]!.scheduleId).toBe('task-a');
+    }
+
+    // Still broken, but the report is one per run — not one per poll pass.
+    now = new Date(now.getTime() + 10 * 60 * 1000);
+    await engine.runPollOnce(now);
+    expect(events.filter((e) => e.type === 'lock-refresh-missed')).toHaveLength(1);
+  });
+
   it('sends POST /cancel to the worker on poll timeout when a cancelUrl was advertised (#1277)', async () => {
     const storage = new MemoryStorage();
     await seedTask(storage, makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z') }));
@@ -2529,6 +2587,111 @@ describe('engine — missed-slot detection', () => {
 
     const missed = events.filter((e) => e.type === 'missed-slot');
     expect(missed).toHaveLength(1);
+  });
+});
+
+describe('engine — overlap policy (task:4726)', () => {
+  const accepted = { status: 'accepted' as const, statusUrl: 'http://worker:3000/status/r1', pollIntervalMs: 1000 };
+
+  /** A live non-schedule run: `triggerTask` takes no schedule lock, so a slot can fire underneath it. */
+  async function seedWithLiveManualRun(onOverlap: 'skip' | 'queue' | 'cancel') {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ onOverlap, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner, calls } = makeRunner(
+      async () => accepted,
+      async () => ({ status: 'running' }) as PollResult,
+    );
+    const events: EngineEvent[] = [];
+    const engine = createEngine({ storage, runner, now: () => NOON, onEvent: (e) => events.push(e) });
+    await engine.triggerTask('task-a'); // manual async run, alive (poll never finishes it)
+    return { storage, engine, events, calls };
+  }
+
+  it('default (skip): a due slot does not start a second run and reports overlap-skipped once', async () => {
+    const { storage, engine, events, calls } = await seedWithLiveManualRun('skip');
+
+    await engine.runOnce();
+    await engine.runOnce(); // the next tick of the same series stays quiet
+
+    expect(calls).toHaveLength(1); // the manual run only
+    expect([...storage.runs.values()].filter((r) => r.status === 'running' || r.status === 'queued')).toHaveLength(1);
+    const skipped = events.filter((e) => e.type === 'overlap-skipped');
+    expect(skipped).toHaveLength(1);
+    expect(events.filter((e) => e.type === 'missed-slot')).toHaveLength(0); // the skip is not a miss
+    // the slot is consumed: nextRunAt moved forward
+    expect((await storage.getSchedule('task-a'))!.nextRunAt!.getTime()).toBeGreaterThan(NOON.getTime());
+  });
+
+  it('queue: the slot waits for the live run, then fires once — without a missed-slot alarm', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ onOverlap: 'queue', nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    let live = true;
+    const { runner, calls } = makeRunner(
+      async () => accepted,
+      async () => (live ? ({ status: 'running' } as PollResult) : ({ status: 'succeeded' } as PollResult)),
+    );
+    const events: EngineEvent[] = [];
+    let now = NOON;
+    const engine = createEngine({ storage, runner, now: () => now, onEvent: (e) => events.push(e) });
+    await engine.triggerTask('task-a');
+    await engine.runOnce(); // slot due, live run → queued
+    expect(calls).toHaveLength(1);
+
+    live = false;
+    now = new Date(NOON.getTime() + 30_000);
+    await engine.runPollOnce(now); // the manual run finishes
+    await engine.runOnce(now); // the queued slot plays
+    expect(calls).toHaveLength(2);
+    // the wait was intentional — not reported as a lost slot
+    expect(events.filter((e) => e.type === 'missed-slot')).toHaveLength(0);
+  });
+
+  it('queue: repeated ticks while the run is alive do not queue twice or fire a duplicate', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ onOverlap: 'queue', nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner, calls } = makeRunner(
+      async () => accepted,
+      async () => ({ status: 'running' }) as PollResult,
+    );
+    const engine = createEngine({ storage, runner, now: () => NOON });
+    await engine.triggerTask('task-a'); // the manual run (dispatches once)
+    expect(calls).toHaveLength(1);
+    await engine.runOnce();
+    await engine.runOnce();
+    await engine.runOnce();
+    expect(calls).toHaveLength(1); // still only the manual run — no second dispatch
+    expect([...storage.runs.values()]).toHaveLength(1); // only the manual run exists
+    expect((await storage.getSchedule('task-a'))!.nextRunAt).toEqual(new Date('2026-08-16T11:59:00Z'));
+  });
+
+  it('skip never drops a pending retry — the slot waits instead (retryCount > 0)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(
+      storage,
+      makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z'), retryCount: 1, lastRunAt: new Date('2026-08-16T11:00:00Z') }),
+    );
+    const retrySlot = (await storage.getSchedule('task-a'))!.nextRunAt;
+    const { runner, calls } = makeRunner(
+      async () => accepted,
+      async () => ({ status: 'running' }) as PollResult,
+    );
+    const engine = createEngine({ storage, runner, now: () => NOON });
+    await engine.triggerTask('task-a'); // live manual run (default policy: skip)
+    await engine.runOnce();
+
+    expect(calls).toHaveLength(1); // only the manual run — the retry slot was not dispatched
+    // the retry slot is still there — dropping it would lose operator-visible work
+    expect((await storage.getSchedule('task-a'))!.nextRunAt).toEqual(retrySlot);
+  });
+
+  it('cancel: the live run is cancelled and the slot starts a fresh one', async () => {
+    const { storage, engine, calls } = await seedWithLiveManualRun('cancel');
+
+    await engine.runOnce();
+
+    expect(calls).toHaveLength(2); // manual + the slot's run
+    const statuses = [...storage.runs.values()].map((r) => r.status).sort();
+    expect(statuses).toEqual(['cancelled', 'queued']);
   });
 });
 

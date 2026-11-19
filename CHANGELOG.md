@@ -11,6 +11,14 @@ admin-api 0.5.1 · mcp 0.6.2 · ui 0.4.1 · daemon 0.13.5 · cli 0.3.2
 
 ### Added
 
+- **Overlap policy `onOverlap`: `skip` | `queue` | `cancel`** (tasks.json, schedule
+  entries, the admin API and `sched schedules`). One task must never run twice:
+  schedule-fired runs are already serialized by the atomic schedule lock, but a
+  *manual* run (API, dashboard, retry) takes no lock, so a due slot used to start a
+  parallel copy. `skip` (default) drops the slot and reports one `overlap-skipped`
+  event per series; `queue` plays it after the live run ends without a
+  `missed-slot` alarm; `cancel` stops the live run first. Resolved like
+  `retry`/`priority` — schedule entry, then task, then `skip`.
 - **`startupGraceMs` / `--startup-grace SECONDS`** — a startup grace window: for
   the first N ms after the engine starts, due (catch-up) slots are held back
   instead of dispatched, and each one fires a `startup-deferred` engine event.
@@ -18,6 +26,15 @@ admin-api 0.5.1 · mcp 0.6.2 · ui 0.4.1 · daemon 0.13.5 · cli 0.3.2
   window closes. Directly for hosts whose scheduler boots before the apps its
   http tasks call: a reboot no longer turns every overdue slot into a
   `run.failed` + `missed-slot` storm. Default `0` = off (historic behaviour).
+
+### Changed
+
+- **`Storage.refreshScheduleLock` returns `boolean`** — `true` = the lock was
+  held and is extended, `false` = there was nothing to extend (never locked,
+  already completed or reaped, unknown id). A custom storage adapter must return
+  the boolean: the engine now reports `lock-refresh-missed` when an async run's
+  lock disappears under a live run (previously indistinguishable from a healthy
+  refresh). Returning nothing keeps working but never reports a lost lock.
 
 ### Fixed
 

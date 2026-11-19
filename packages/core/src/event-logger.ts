@@ -56,6 +56,10 @@ function format(event: EngineEvent, prefix: string): string {
       return `${prefix} retry ${event.taskName} run=${id(event.runId)} attempt=${event.attempt} backoff=${event.backoffMs}ms (next ${fmtTime(event.nextRunAt)})`;
     case 'startup-deferred':
       return `${prefix} startup-deferred ${event.taskName} schedule=${event.scheduleId} slot=${fmtTime(event.slotAt)}`;
+    case 'overlap-skipped':
+      return `${prefix} overlap-skipped ${event.taskName} schedule=${event.scheduleId} live=${id(event.liveRunId)} slot=${fmtTime(event.slotAt)}`;
+    case 'lock-refresh-missed':
+      return `${prefix} lock-refresh-missed ${event.taskName} run=${id(event.runId)} schedule=${event.scheduleId}`;
     case 'poll':
       return `${prefix} poll ${event.taskName} run=${id(event.runId)} status=${event.status}${event.progress !== null ? ` progress=${event.progress}` : ''}`;
     case 'cancel-sent':

@@ -182,13 +182,38 @@ heartbeat is liveness, not a timeout. The ceiling for a hung run stays at the
 sync timeout. If your sync workers have no runner timeout, a truly wedged worker
 blocks the task until the daemon restarts — set the runner timeouts.
 
-Async (`accepted`) runs are covered by a different invariant: `pollTimeoutMs`
-(default 25 min) is documented **must be < lockTtlMs**, so the poll fails a hung
-run before the watchdog could reap its lock. The heartbeat targets the sync path,
-which has no ceiling of its own.
+Async (`accepted`) runs get the same protection from the **poll loop**: while a run
+is in the poll queue, the loop refreshes its schedule lock every `lockHeartbeatMs`
+the same way the sync heartbeat does. The poll loop is the run's liveness signal,
+so a daemon that dies stops refreshing and the watchdog reaps the lock as before.
+
+On top of that, `pollTimeoutMs` (default 25 min) **must be < lockTtlMs** so a hung
+run is failed by the poll ceiling. A task with `timeoutMs: -1` deliberately opts out
+of every ceiling — its run may live for hours; the heartbeat is what keeps the
+watchdog from re-dispatching a parallel copy of the same slot in the meantime
+(prod defect, books 2026-11-19: 11 overlapping `running` runs). If a task must never
+run longer than X, set `timeoutMs` — `-1` means «no ceiling», not «no limit on
+parallelism».
 
 Configure via `--lock-heartbeat SECONDS` (daemon) or `lockHeartbeatMs`
 (embedded `createEngine` / `createDaemon`).
+
+## Overlap: a slot vs a live run
+
+Two runs of one task never run side by side **by design**, and the guard has two
+halves:
+
+- schedule-fired runs — the atomic schedule lock: the second claim simply loses;
+- a slot vs a run that took no lock (manual `triggerTask`, a retry, the API, a
+worker) — the **overlap policy** (`onOverlap`, [Tasks → onOverlap](tasks#onoverlap)):
+`skip` (default; drop the slot, one `overlap-skipped` event), `queue` (play it
+after the live run ends — deliberately late, so no `missed-slot`), `cancel` (stop
+the live run first).
+
+This matters for async tasks: the poll loop keeps the lock of an async *schedule*
+run fresh (see below), but a manual async run holds no lock at all — without the
+policy the next slot would start a parallel copy, which is exactly the incident
+class `overlap-skipped` now makes visible.
 
 ## Failures are recorded, not silent
 

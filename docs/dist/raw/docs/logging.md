@@ -363,6 +363,88 @@ The events (all carry `taskName` / `runId` / `attempt` where relevant):
   <tr>
     <td>
       <code>
+        startup-deferred
+      </code>
+    </td>
+    
+    <td>
+      a due slot was held back by the startup grace window (<code>
+        startupGraceMs
+      </code>
+      
+      ) — the slot stays due, nothing is skipped
+    </td>
+    
+    <td>
+      <code>
+        scheduleId
+      </code>
+      
+      , <code>
+        slotAt
+      </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        overlap-skipped
+      </code>
+    </td>
+    
+    <td>
+      a due slot found a run of the same task alive and the policy is <code>
+        skip
+      </code>
+      
+       — the slot was dropped (<code>
+        nextRunAt
+      </code>
+      
+       moved on), once per skipped series
+    </td>
+    
+    <td>
+      <code>
+        scheduleId
+      </code>
+      
+      , <code>
+        liveRunId
+      </code>
+      
+      , <code>
+        slotAt
+      </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        lock-refresh-missed
+      </code>
+    </td>
+    
+    <td>
+      an async run's lock refresh found no lock to extend — the run is alive but its schedule lock is gone, so a parallel copy may be dispatched (once per run)
+    </td>
+    
+    <td>
+      <code>
+        runId
+      </code>
+      
+      , <code>
+        scheduleId
+      </code>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
         poll
       </code>
     </td>

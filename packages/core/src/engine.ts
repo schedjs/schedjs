@@ -97,6 +97,19 @@ export type EngineEvent =
    * be yet. Emitted once per deferred schedule per window; the slot stays due.
    */
   | { type: 'startup-deferred'; taskName: string; scheduleId: string; slotAt: Date }
+  /**
+   * An async run's lock refresh found no lock to extend — the run is still
+   * alive but its schedule was released (reaped by the watchdog / cleared by a
+   * restart), so a later tick may dispatch a parallel copy. Fired once per run,
+   * not once per refresh attempt.
+   */
+  | { type: 'lock-refresh-missed'; taskName: string; runId: string; scheduleId: string }
+  /**
+   * A due slot found a run of the same task still alive and the schedule's
+   * overlap policy is `skip` (task:4726): the slot was dropped, `nextRunAt`
+   * moved to the next slot. Fired once per skipped series, not once per tick.
+   */
+  | { type: 'overlap-skipped'; taskName: string; scheduleId: string; liveRunId: string; slotAt: Date }
   | { type: 'poll'; taskName: string; runId: string; status: PollResult['status']; progress: number | null }
   | { type: 'zombie-reaped'; olderThan: Date; count: number }
   /**
@@ -551,6 +564,8 @@ export function createEngine(config: EngineConfig): Engine {
     acceptedAt: number;
     /** Last async lock refresh (task:4724) — see the poll loop's heartbeat. */
     lastLockRefreshAt: number;
+    /** True once `lock-refresh-missed` was fired for this run (one report per run). */
+    lockLostReported: boolean;
   }
   const asyncRuns = new Map<string, AsyncRun>();
 
@@ -560,7 +575,35 @@ export function createEngine(config: EngineConfig): Engine {
    * non-abortable runner that hangs keeps `done` pending (the run was going to
    * hang anyway — that is what cancel is for).
    */
-  const runningRuns = new Map<string, { controller: AbortController; done: Promise<void> }>();
+  const runningRuns = new Map<string, { controller: AbortController; done: Promise<void>; taskName: string }>();
+
+  /** Schedules already reported as `overlap-skipped` (one event per series). */
+  const overlapSkipped = new Set<string>();
+  /**
+   * Slots deferred by the `queue` policy: scheduleId → the slot key it is
+   * waiting on. Its late dispatch is not a miss; the entry is dropped as soon as
+   * that slot dispatches and pruned after a day so a paused/removed schedule
+   * cannot hold a stale excuse forever.
+   */
+  const queuedOverlapSlots = new Map<string, { key: string; queuedAt: number }>();
+  const queuedSlotKey = (schedule: ScheduleRecord): string =>
+    schedule.nextRunAt === null ? '' : schedule.nextRunAt.toISOString();
+  function pruneQueuedOverlapSlots(now: Date): void {
+    const cutoff = now.getTime() - 24 * 60 * 60 * 1000;
+    for (const [id, entry] of queuedOverlapSlots) if (entry.queuedAt < cutoff) queuedOverlapSlots.delete(id);
+  }
+
+  /**
+   * The live run of this task, or null — the overlap detector (task:4726). Both
+   * registries are engine-owned and cover every run this process started; runs
+   * left by a previous process were cancelled at startup (`recoverOrphanRuns`),
+   * so no storage scan is needed per dispatch.
+   */
+  function liveRunOf(taskName: string): string | null {
+    for (const [runId, ar] of asyncRuns) if (ar.task.name === taskName) return runId;
+    for (const [runId, r] of runningRuns) if (r.taskName === taskName) return runId;
+    return null;
+  }
 
   /** Map a throwing runner to an outcome: user-cancel → cancelled, everything else → failed. */
   function outcomeFromThrow(err: unknown): Extract<RunOutcome, { status: 'cancelled' } | { status: 'failed' }> {
@@ -862,6 +905,7 @@ export function createEngine(config: EngineConfig): Engine {
       nextPollAt: at + accepted.pollIntervalMs,
       acceptedAt: at,
       lastLockRefreshAt: at,
+      lockLostReported: false,
     });
     return true;
   }
@@ -899,15 +943,16 @@ export function createEngine(config: EngineConfig): Engine {
       // heartbeat, best-effort like it.
       if (ar.schedule !== null && at - ar.lastLockRefreshAt >= lockHeartbeatMs) {
         try {
-          await storage.refreshScheduleLock(ar.schedule.id, now);
-          ar.lastLockRefreshAt = at; // only on success — a failed refresh retries on the next pass
+          const refreshed = await storage.refreshScheduleLock(ar.schedule.id, now);
+          ar.lastLockRefreshAt = at;
+          if (!refreshed && !ar.lockLostReported) {
+            ar.lockLostReported = true;
+            fire({ type: 'lock-refresh-missed', taskName: ar.task.name, runId, scheduleId: ar.schedule.id });
+          }
         } catch {
           // best-effort, like the sync heartbeat: a storage hiccup must not fail
           // the run. A dead process stops refreshing entirely, so the watchdog
           // still reaps genuinely orphaned locks.
-          // shortcut: refreshScheduleLock returns void, so a resolved no-op (lock
-          // already reaped) is indistinguishable from a real refresh; upgrade if a
-          // duplicate dispatch is ever traced to exactly that gap.
         }
       }
       if (ar.nextPollAt > at) continue;
@@ -962,8 +1007,66 @@ export function createEngine(config: EngineConfig): Engine {
     // the family stop (repair window) — checked here at dispatch (and the
     // atomic claim stays race-free against it).
     if (task.paused || schedule.paused) return;
+
+    // Overlap policy (task:4726): a slot can come due while a run of this task
+    // is still alive — the schedule lock cannot stop that, because manual runs
+    // (triggerTask / admin API) never take one. Resolved before the claim: a
+    // deferred or skipped slot must not hold the lock.
+    const liveRunId = liveRunOf(task.name);
+    let skipDueToOverlap = false;
+    if (liveRunId !== null) {
+      const { onOverlap } = resolveSchedulePolicy(task, schedule);
+      // A pending retry is operator-visible work, not a disposable catch-up slot:
+      // never drop it, wait instead (`skip` and `queue` behave alike here, the
+      // same reason `skipPausedSlots` defers retries and one-shots).
+      const mustWait = onOverlap === 'queue' || schedule.retryCount > 0 || schedule.schedule.kind === 'once';
+      if (mustWait) {
+        // Stay due; the next tick after the live run ends plays this slot. The
+        // wait is intentional, so its late dispatch must not be a missed-slot.
+        queuedOverlapSlots.set(schedule.id, { key: queuedSlotKey(schedule), queuedAt: now.getTime() });
+        pruneQueuedOverlapSlots(now);
+        return;
+      }
+      if (onOverlap === 'cancel') {
+        // Stop the live run first: the slot replaces it, never runs beside it.
+        // The live run cannot be a schedule-fired run of THIS schedule (a locked
+        // schedule is never due), so its cancellation never consumes the slot
+        // being started — it either holds no lock (manual) or another row's.
+        await cancelRunInner(liveRunId);
+      } else {
+        skipDueToOverlap = true; // claimed + consumed below (one atomic write)
+      }
+    }
+
     const claimed = await storage.claimSchedule(schedule.id, now);
     if (!claimed) return; // lost the race (locked / paused / disabled / sibling of same task in flight)
+
+    if (skipDueToOverlap) {
+      // skip (default): consume the slot as if it had run — through the same
+      // atomic complete as a real finish, so two concurrent ticks cannot advance
+      // past two slots (a bare updateSchedule outside the claim could).
+      const slotAt = schedule.nextRunAt;
+      await storage.completeSchedule(schedule.id, {
+        nextRunAt: computeNext(schedule, now),
+        // the slot is consumed, not run. `lastRunAt` stays the last REAL run
+        // (a never-run schedule keeps `now` because the storage contract's
+        // completeSchedule always writes one).
+        lastRunAt: schedule.lastRunAt ?? now,
+        failed: false,
+      });
+      if (slotAt !== null && !overlapSkipped.has(schedule.id)) {
+        overlapSkipped.add(schedule.id);
+        fire({
+          type: 'overlap-skipped',
+          taskName: task.name,
+          scheduleId: schedule.id,
+          liveRunId: liveRunId!,
+          slotAt,
+        });
+      }
+      return;
+    }
+    overlapSkipped.delete(schedule.id); // a run is starting — the series is over
 
     // missed-slot: a schedule with history dispatching way past its slot means
     // the slot was lost (engine down / wedged lock) — the catch-up run is not
@@ -976,7 +1079,12 @@ export function createEngine(config: EngineConfig): Engine {
       lastPauseWindow !== null &&
       schedule.nextRunAt.getTime() >= lastPauseWindow.from.getTime() &&
       schedule.nextRunAt.getTime() <= lastPauseWindow.to.getTime();
+    // A slot deferred by the `queue` overlap policy waited on purpose.
+    const queued = queuedOverlapSlots.get(schedule.id);
+    const queuedOverlapSlot = queued !== undefined && queued.key === queuedSlotKey(schedule);
+    if (queuedOverlapSlot) queuedOverlapSlots.delete(schedule.id);
     if (
+      !queuedOverlapSlot &&
       !slotInPauseWindow &&
       schedule.lastRunAt !== null &&
       schedule.nextRunAt !== null &&
@@ -1003,7 +1111,7 @@ export function createEngine(config: EngineConfig): Engine {
     const controller = new AbortController();
     let runFinished!: () => void;
     const runDone = new Promise<void>((r) => (runFinished = r));
-    runningRuns.set(runId, { controller, done: runDone });
+    runningRuns.set(runId, { controller, done: runDone, taskName: task.name });
     const deadline = armRunDeadline(task, controller);
     try {
       fire({ type: 'claim', taskName: task.name, runId, attempt: schedule.retryCount + 1 });
@@ -1213,6 +1321,55 @@ export function createEngine(config: EngineConfig): Engine {
     return { skippedSchedules, deferredRuns };
   }
 
+  /**
+   * Internal cancel path — the public `cancelRun` and the `cancel` overlap
+   * policy (task:4726) both go through it. Never throws for an unknown run.
+   */
+  async function cancelRunInner(runId: string): Promise<RunRecord | null> {
+    const run = await storage.getRun(runId);
+    if (!run) return null;
+
+    // Async pull run (queued or running-async, still being polled): drop it
+    // from the poll queue and finish cancelled — schedule advanced, lock
+    // released (same terminal path as a normal poll finish).
+    const ar = asyncRuns.get(runId);
+    if (ar) {
+      asyncRuns.delete(runId);
+      ar.finishing = true; // claimed: a stale poll-tick snapshot must not double-finish
+      const finishedAt = clock();
+      // Tell the worker to stop BEFORE finishing cancelled — the accepted
+      // envelope's cancelUrl is the worker's cancel channel (the http runner
+      // POSTs {runId}; the worker stops at the next stage boundary). A
+      // worker without a cancelUrl, or a failed signal, is left to finish on
+      // its own — the run's error records that honestly instead of silently
+      // orphaning the worker (battle-stand report 2026-08-21: cancel did not
+      // reach the worker, which kept publishing after cancel). Each step
+      // fires a cancel-* event so stdout shows where a signal gets lost.
+      const cancelError = await signalCancel(runId, ar);
+      const cancelled: SyncOutcome = { status: 'cancelled', error: `cancelled by user${cancelError}` };
+      if (ar.schedule !== null) {
+        await completeScheduleRun(ar.schedule, ar.task, runId, cancelled, finishedAt);
+      } else {
+        await recordFinish(ar.task.name, runId, cancelled, ar.task.retryCount + 1, true);
+      }
+      return storage.getRun(runId);
+    }
+
+    // Sync run in flight: abort the runner via hooks.signal and AWAIT the
+    // actual stop — the run comes back cancelled (built-in runners react to
+    // abort; a non-abortable custom runner keeps the run hanging, which is
+    // what cancel is for).
+    const entry = runningRuns.get(runId);
+    if (entry) {
+      entry.controller.abort();
+      await entry.done;
+      return storage.getRun(runId);
+    }
+
+    // Terminal (or present-but-not-in-flight) run — nothing to cancel.
+    return storage.getRun(runId);
+  }
+
   return {
     async runOnce(now) {
       await tick(now ?? clock());
@@ -1299,7 +1456,7 @@ export function createEngine(config: EngineConfig): Engine {
       const controller = new AbortController();
       let runFinished!: () => void;
       const runDone = new Promise<void>((r) => (runFinished = r));
-      runningRuns.set(runId, { controller, done: runDone });
+      runningRuns.set(runId, { controller, done: runDone, taskName: name });
       const deadline = armRunDeadline(task, controller);
       try {
         try {
@@ -1385,7 +1542,7 @@ export function createEngine(config: EngineConfig): Engine {
       const controller = new AbortController();
       let runFinished!: () => void;
       const runDone = new Promise<void>((r) => (runFinished = r));
-      runningRuns.set(newRunId, { controller, done: runDone });
+      runningRuns.set(newRunId, { controller, done: runDone, taskName: task.name });
       const deadline = armRunDeadline(task, controller);
       try {
         try {

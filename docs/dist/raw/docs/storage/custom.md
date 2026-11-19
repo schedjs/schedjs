@@ -60,7 +60,8 @@ per-task ceiling enforced in the same conditional UPDATE), `completeSchedule`
 (clear lock, advance `nextRunAt`/`lastRunAt`/`lastRunId`, `failCount += failed`),
 `reapZombieScheduleLocks` (unlock stale schedule locks, bump `failCount`),
 `refreshScheduleLock` (the engine's heartbeat — extends a claimed schedule's
-lock; no-op when not locked), `clearScheduleLocks` (startup recovery). The
+lock, returns `true` when it was held and `false` when there was nothing to
+extend, which the engine reports as `lock-refresh-missed`), `clearScheduleLocks` (startup recovery). The
 task-level twins (`listDueTasks`/`claimTask`/`completeTask`/`reapZombieLocks`/
 `refreshLock`/`clearLocks`) remain for manual-run reflection (`completeTask`
 writes `lastRunId`/`lastRunAt` on the task row).

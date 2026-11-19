@@ -211,6 +211,36 @@ N failed attempts.
 - A manual `triggerTask` never auto-retries — an explicit human trigger is a
 one-shot, its result alerts immediately.
 
+### `onOverlap`
+
+A slot can come due while a run of the same task is **still alive**. Schedule-fired
+runs cannot overlap (the schedule lock is atomic), but a manual run — `POST /tasks/:name/run`, the dashboard, a retry, a worker — takes no schedule lock, so
+without a rule the scheduler would start a second copy beside it:
+
+```json
+{
+  "name": "products-index-sync",
+  "schedules": [{ "cron": "*/30 * * * *" }],
+  "config": { "url": "..." },
+  "onOverlap": "skip"
+}
+```
+
+- `skip` (**default**) — the slot is dropped and `nextRunAt` moves to the next one,
+as if the run had happened. One `overlap-skipped` event per skipped series
+(not one per tick), so an hour-long run does not flood the log.
+- `queue` — the slot stays due and fires as soon as the live run finishes. The wait
+is intentional, so its late dispatch is **not** reported as `missed-slot`.
+- `cancel` — the live run is cancelled (`cancelled`, the reason names the policy)
+and the slot starts a fresh run. The engine waits for the old run to actually
+stop before dispatching, so `cancel` trades latency for a clean handover. The
+live run is never a *schedule-fired* run of the same schedule (a locked schedule
+is not due), so the cancellation cannot swallow the slot being started.
+
+Resolved like `retry`/`priority`: the schedule entry wins, then the task, then
+`skip`. Manual runs are never deferred by this policy — it only governs whether a
+*scheduled slot* may start beside a live run.
+
 ## Fields
 
 <table>
@@ -390,6 +420,52 @@ one-shot, its result alerts immediately.
       </code>
       
        — the default for schedules that don't override it (engine feature)
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <code>
+        onOverlap
+      </code>
+    </td>
+    
+    <td>
+      string
+    </td>
+    
+    <td>
+      <code>
+        "skip"
+      </code>
+    </td>
+    
+    <td>
+      What a due slot does while a run of the same task is still alive: <code>
+        skip
+      </code>
+      
+       (drop it, one <code>
+        overlap-skipped
+      </code>
+      
+       event) / <code>
+        queue
+      </code>
+      
+       (fire after the live run ends, no <code>
+        missed-slot
+      </code>
+      
+      ) / <code>
+        cancel
+      </code>
+      
+       (stop the live run first). See <a href="#onoverlap">
+        <code>
+          onOverlap
+        </code>
+      </a>
     </td>
   </tr>
   

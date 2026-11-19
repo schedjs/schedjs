@@ -21,7 +21,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PUBLISH_ORDER, assertPackedManifest, checkInstalled, parseNpmVersions, planWave, readTarEntry } from './release-npm-lib.mjs';
+import { PUBLISH_ORDER, assertPackedManifest, checkInstalled, parseNpmVersions, planWave, readTarEntry, waitForVersion } from './release-npm-lib.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const IS_WIN = process.platform === 'win32';
@@ -76,7 +76,7 @@ function publishedVersions(name) {
 
 const slug = (name) => name.replace('@', '').replace('/', '-');
 
-function main() {
+async function main() {
   const npmVersion = run(NPM, ['-v']).trim();
   log(`npm ${npmVersion} · node ${process.version} · registry ${REGISTRY} · режим ${PUBLISH ? 'ПУБЛИКАЦИЯ' : REHEARSE ? 'репетиция (без публикации)' : 'dry-run'}`);
   const [maj, min] = npmVersion.split('.').map(Number);
@@ -140,9 +140,20 @@ function main() {
       for (const t of tarballs) {
         log(`\n== publish ${t.pkg.name}@${t.pkg.version} (OIDC)`);
         run(NPM, ['publish', t.tgz, '--access', 'public', `--registry=${REGISTRY}`]);
-        const got = publishedVersions(t.pkg.name);
-        if (!got.includes(t.pkg.version)) throw new Error(`${t.pkg.name}@${t.pkg.version}: после publish версии нет в реестре (не судить по packument'у — читать version-документ/список версий; gotcha 20)`);
-        log(`  verified: ${t.pkg.name}@${t.pkg.version} виден в реестре`);
+        // `npm publish` (OIDC) отвечает успехом раньше, чем версия видна: npm
+        // сканирует пакет, version-документ 404 первые ~4–5 минут (gotcha 20,
+        // ранбук «Порядок наблюдения»). Ждём, а не объявляем волну сломанной.
+        const waited = await waitForVersion({
+          fetchVersions: () => publishedVersions(t.pkg.name),
+          sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+          version: t.pkg.version,
+        });
+        if (!waited.ok) {
+          throw new Error(
+            `${t.pkg.name}@${t.pkg.version}: за ${Math.round(waited.waitedMs / 1000)}s и ${waited.polls} проверок версия не появилась в реестре (не судить по packument'у — читать version-документ; gotcha 20)`,
+          );
+        }
+        log(`  verified: ${t.pkg.name}@${t.pkg.version} виден в реестре (${Math.round(waited.waitedMs / 1000)}s, ${waited.polls} проверок)`);
       }
     } else {
       log('\n== publish пропущен (dry-run)');
@@ -185,4 +196,4 @@ function main() {
 }
 
 export { PUBLISH_ORDER };
-main();
+await main();

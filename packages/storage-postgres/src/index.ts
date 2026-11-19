@@ -4,6 +4,7 @@ import type {
   ArtifactRef,
   CompleteResult,
   DisabledBy,
+  OverlapPolicy,
   RetryPolicy,
   RunFilter,
   RunFinish,
@@ -55,6 +56,7 @@ interface TaskRow {
   fail_count: number;
   priority: number;
   retry_json: string | null;
+  on_overlap: string | null;
   retry_count: number;
   last_run_id: string | null;
   timeout_ms: number | null;
@@ -80,6 +82,7 @@ interface ScheduleRow {
   fail_count: number;
   priority: number;
   retry_json: string | null;
+  on_overlap: string | null;
   retry_count: number;
   last_run_id: string | null;
   paused: boolean;
@@ -146,6 +149,7 @@ function rowToTask(row: TaskRow): TaskRecord {
     failCount: row.fail_count,
     priority: row.priority,
     retry: row.retry_json === null ? null : (json(row.retry_json) as RetryPolicy),
+    onOverlap: (row.on_overlap as OverlapPolicy | null) ?? 'skip',
     retryCount: row.retry_count,
     lastRunId: row.last_run_id,
     timeoutMs: row.timeout_ms,
@@ -171,6 +175,7 @@ function rowToSchedule(row: ScheduleRow): ScheduleRecord {
     failCount: row.fail_count,
     priority: row.priority,
     retry: row.retry_json === null ? null : (json(row.retry_json) as RetryPolicy),
+    onOverlap: (row.on_overlap as OverlapPolicy | null) ?? null,
     retryCount: row.retry_count,
     lastRunId: row.last_run_id,
     paused: row.paused,
@@ -244,6 +249,7 @@ function scheduleValues(s: ScheduleRecord): Array<string | number | null | boole
     s.failCount,
     s.priority,
     s.retry === null ? null : JSON.stringify(s.retry),
+    s.onOverlap ?? null,
     s.retryCount,
     s.lastRunId,
     s.paused,
@@ -283,6 +289,7 @@ const MIGRATIONS: Array<{ version: number; up: Array<string | ((pool: Pool) => P
         fail_count    INT          NOT NULL DEFAULT 0,
         priority      INT          NOT NULL DEFAULT 0,
         retry_json    TEXT,
+        on_overlap    VARCHAR(8),
         retry_count   INT          NOT NULL DEFAULT 0,
         timeout_ms    BIGINT,
         paused        BOOLEAN      NOT NULL DEFAULT false,
@@ -351,6 +358,7 @@ const MIGRATIONS: Array<{ version: number; up: Array<string | ((pool: Pool) => P
         fail_count    INT          NOT NULL DEFAULT 0,
         priority      INT          NOT NULL DEFAULT 0,
         retry_json    TEXT,
+        on_overlap    VARCHAR(8),
         retry_count   INT          NOT NULL DEFAULT 0,
         last_run_id   VARCHAR(64),
         paused        BOOLEAN      NOT NULL DEFAULT false,
@@ -439,6 +447,15 @@ const MIGRATIONS: Array<{ version: number; up: Array<string | ((pool: Pool) => P
       `ALTER TABLE schedules ADD COLUMN IF NOT EXISTS disabled_by VARCHAR(16)`,
     ],
   },
+  {
+    // v10 — overlap policy (task:4726): what to do when a slot comes due while a
+    // run of the same task is alive. NULL = inherit (task default: skip).
+    version: 10,
+    up: [
+      `ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS on_overlap VARCHAR(8)`,
+      `ALTER TABLE schedules ADD COLUMN IF NOT EXISTS on_overlap VARCHAR(8)`,
+    ],
+  },
 ];
 
 async function migrate(pool: Pool): Promise<void> {
@@ -497,8 +514,8 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
   async function upsertScheduleRow(s: ScheduleRecord): Promise<void> {
     await pool.query(
       `INSERT INTO schedules
-        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        (id, task_name, schedule_json, tz, data, external_id, dedup_key, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, on_overlap, retry_count, last_run_id, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
       ON CONFLICT (id) DO UPDATE SET
         task_name     = EXCLUDED.task_name,
         schedule_json = EXCLUDED.schedule_json,
@@ -512,6 +529,7 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
         fail_count    = EXCLUDED.fail_count,
         priority      = EXCLUDED.priority,
         retry_json    = EXCLUDED.retry_json,
+        on_overlap    = EXCLUDED.on_overlap,
         retry_count   = EXCLUDED.retry_count,
         last_run_id   = EXCLUDED.last_run_id,
         paused        = EXCLUDED.paused,
@@ -538,8 +556,8 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
     async upsertTask(task) {
       await pool.query(
         `INSERT INTO scheduled_tasks
-          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+          (name, runner, schedule_json, tz, config_json, input_schema, label, description, next_run_at, last_run_at, locked_at, fail_count, priority, retry_json, on_overlap, retry_count, last_run_id, timeout_ms, paused, disabled, disabled_by, file_managed, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
         ON CONFLICT (name) DO UPDATE SET
           runner        = EXCLUDED.runner,
           schedule_json = EXCLUDED.schedule_json,
@@ -554,6 +572,7 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
           fail_count    = EXCLUDED.fail_count,
           priority      = EXCLUDED.priority,
           retry_json    = EXCLUDED.retry_json,
+          on_overlap    = EXCLUDED.on_overlap,
           retry_count   = EXCLUDED.retry_count,
           last_run_id   = EXCLUDED.last_run_id,
           timeout_ms    = EXCLUDED.timeout_ms,
@@ -577,6 +596,7 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
           task.failCount,
           task.priority,
           task.retry === null ? null : JSON.stringify(task.retry),
+          task.onOverlap ?? 'skip',
           task.retryCount,
           task.lastRunId,
           task.timeoutMs ?? null,
@@ -704,11 +724,12 @@ export async function createPostgresStorage(pool: Pool): Promise<Storage> {
     },
 
     async refreshScheduleLock(id, at) {
-      await pool.query(
+      const res = await pool.query(
         `UPDATE schedules SET locked_at = $1, updated_at = $2
          WHERE id = $3 AND locked_at IS NOT NULL`,
         [at.getTime(), now(), id],
       );
+      return (res.rowCount ?? 0) > 0;
     },
 
     async clearScheduleLocks() {

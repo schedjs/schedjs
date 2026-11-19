@@ -6,7 +6,7 @@ import { parseSchedule } from './human.js';
 import type { Schedule } from './human.js';
 import { assertValidInputSchema, validateInput } from './input-schema.js';
 import type { Storage } from './storage.js';
-import type { DisabledBy, RetryPolicy, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
+import type { DisabledBy, OverlapPolicy, RetryPolicy, RunStatus, ScheduleRecord, TaskRecord } from './types.js';
 
 /**
  * One entry of a tasks.json file — the desired-state contract.
@@ -67,6 +67,12 @@ export interface TaskDefinition {
    */
   retry?: RetryPolicy;
   /**
+   * What happens when a slot comes due while a run of this task is still alive
+   * (entry ?? task, terminal default `skip`). Manual runs take no schedule
+   * lock, so this is the only guard against running beside them.
+   */
+  onOverlap?: OverlapPolicy;
+  /**
    * Run-deadline contract: force-termination timeout in ms from run start.
    * `-1` = never auto-terminate (only manual cancel); `> 0` = force-fail the
    * run after this many ms. Absent = `-1` — the safe default (never
@@ -103,6 +109,8 @@ export interface ScheduleEntryBase {
   retry?: RetryPolicy;
   /** Schedule-level priority override (slice 3 resolves schedule ?? task). Default: 0. */
   priority?: number;
+  /** Schedule-level overlap-policy override (resolves schedule ?? task ?? `skip`). */
+  onOverlap?: OverlapPolicy;
 }
 
 export type ScheduleEntry = ScheduleEntryBase &
@@ -202,6 +210,7 @@ function resolveEntry(taskName: string, tz: string | undefined, raw: unknown, no
     fail(taskName, 'schedules.priority must be a non-negative integer');
   }
   validateRetry(taskName, 'schedules.retry', sched.retry);
+  validateOverlap(taskName, 'schedules.onOverlap', sched.onOverlap);
   const externalId = sched.externalId;
   if (externalId !== undefined && !isNonEmptyString(externalId)) {
     fail(taskName, 'schedules.externalId must be a non-empty string');
@@ -218,6 +227,7 @@ function resolveEntry(taskName: string, tz: string | undefined, raw: unknown, no
     externalId: externalId ?? null,
     dedupKey: dedupKey ?? null,
     retry: (sched.retry as RetryPolicy | undefined) ?? null,
+    onOverlap: (sched.onOverlap as OverlapPolicy | undefined) ?? null,
     // keep "unset" distinguishable from an explicit 0 — toSchedules / the API
     // materialize entry ?? task default, and 0 ?? task.priority would swallow
     // the inheritance (F1).
@@ -284,12 +294,21 @@ function validateRetry(taskName: string, field: string, retry: unknown): void {
   }
 }
 
-/** Fail-fast validation of the task-level engine policy fields (priority / retry). */
+/** Fail-fast validation of an overlap policy at any level (task or schedule entry). */
+function validateOverlap(taskName: string, field: string, value: unknown): void {
+  if (value === undefined) return;
+  if (value !== 'skip' && value !== 'queue' && value !== 'cancel') {
+    fail(taskName, `${field} must be one of "skip" | "queue" | "cancel"`);
+  }
+}
+
+/** Fail-fast validation of the task-level engine policy fields (priority / retry / onOverlap). */
 function validateEnginePolicy(def: TaskDefinition): void {
   if (def.priority !== undefined && (!isPositiveInt(def.priority) && def.priority !== 0)) {
     fail(def.name, 'priority must be a non-negative integer');
   }
   validateRetry(def.name, 'retry', def.retry);
+  validateOverlap(def.name, 'onOverlap', def.onOverlap);
   const timeoutMs = def.timeoutMs;
   if (timeoutMs !== undefined && (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || (timeoutMs !== -1 && timeoutMs <= 0))) {
     fail(def.name, 'timeoutMs must be -1 (never auto-terminate) or a positive number of milliseconds');
@@ -315,6 +334,8 @@ export interface ParsedEntry {
   externalId: string | null;
   dedupKey: string | null;
   retry: RetryPolicy | null;
+  /** Entry-level overlap override; null = inherit the task's. */
+  onOverlap: OverlapPolicy | null;
   /** Effective priority: undefined = the entry does not override — inherits the task default at materialization (toSchedules / API). */
   priority: number | undefined;
 }
@@ -328,6 +349,7 @@ interface ParsedTask {
   inputSchema: unknown | null;
   priority: number;
   retry: RetryPolicy | null;
+  onOverlap: OverlapPolicy;
   timeoutMs: number | null;
   label: string | null;
   description: string | null;
@@ -380,6 +402,7 @@ function parseTask(def: TaskDefinition, now: Date): ParsedTask {
     inputSchema,
     priority: def.priority ?? 0,
     retry: def.retry ?? null,
+    onOverlap: def.onOverlap ?? 'skip',
     timeoutMs: def.timeoutMs ?? -1,
     label: def.label ?? null,
     description: def.description ?? null,
@@ -425,6 +448,7 @@ export function toTasks(defs: TaskDefinition[], now: Date): TaskRecord[] {
       failCount: 0,
       priority: p.priority,
       retry: p.retry,
+      onOverlap: p.onOverlap,
       retryCount: 0,
       lastRunId: null,
       timeoutMs: p.timeoutMs,
@@ -471,6 +495,9 @@ export function toSchedules(defs: TaskDefinition[], now: Date): ScheduleRecord[]
         // v1 ordering is preserved for migrated DBs (which copied task policy).
         priority: e.priority ?? p.priority,
         retry: e.retry ?? p.retry,
+        // only the ENTRY override is materialized — a null row means «inherit the
+        // task», so editing the task-level policy later still reaches the row
+        onOverlap: e.onOverlap ?? null,
         retryCount: 0,
         lastRunId: null,
         paused: false,
@@ -689,6 +716,7 @@ async function applyTask(storage: Storage, task: TaskRecord): Promise<TaskRecord
     inputSchema: task.inputSchema,
     priority: task.priority,
     retry: task.retry,
+    onOverlap: task.onOverlap ?? 'skip',
     timeoutMs: task.timeoutMs ?? null,
     label: task.label,
     description: task.description,
@@ -725,6 +753,7 @@ async function applySchedule(storage: Storage, schedule: ScheduleRecord): Promis
     dedupKey: schedule.dedupKey,
     priority: schedule.priority,
     retry: schedule.retry,
+    onOverlap: schedule.onOverlap ?? 'skip',
     ...disabled,
     nextRunAt: revived || scheduleChanged ? schedule.nextRunAt : existing.nextRunAt,
   });

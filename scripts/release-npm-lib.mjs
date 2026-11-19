@@ -9,6 +9,37 @@
 import { gunzipSync } from 'node:zlib';
 
 /**
+ * Дождаться появления версии в реестре после `npm publish`.
+ * Зачем: публикация по OIDC отвечает успехом, но version-документ и tarball
+ * отдают 404 первые ~4–5 минут (publish-time скан npm; ранбук, «Порядок
+ * наблюдения за публикацией», gotcha 20). Мгновенная проверка в этом окне
+ * объявляет здоровую волную сломанной — ровно это случилось на волне 0.59.0.
+ * Чистая логика: списки версий и пауза инжектируются.
+ *
+ * @param {{fetchVersions: () => string[], sleep: (ms: number) => Promise<void>, version: string,
+ *          timeoutMs?: number, intervalMs?: number, now?: () => number}} deps
+ * @returns {Promise<{ok: boolean, waitedMs: number, polls: number}>}
+ */
+export async function waitForVersion({
+  fetchVersions,
+  sleep,
+  version,
+  timeoutMs = 10 * 60 * 1000,
+  intervalMs = 10_000,
+  now = () => Date.now(),
+}) {
+  const startedAt = now();
+  let polls = 0;
+  for (;;) {
+    polls += 1;
+    const seen = fetchVersions();
+    if (seen.includes(version)) return { ok: true, waitedMs: now() - startedAt, polls };
+    if (now() - startedAt >= timeoutMs) return { ok: false, waitedMs: now() - startedAt, polls };
+    await sleep(intervalMs);
+  }
+}
+
+/**
  * Достать файл из .tgz чистыми средствами Node (tar-парсер на 40 строк).
  * Зачем не `tar`: на Windows в PATH первым может оказаться GNU tar из Git Bash,
  * который трактует `C:\...` как удалённый хост (`Cannot connect to C:`) — а

@@ -146,6 +146,7 @@ export async function createMongoStorage(db: Db, options: MongoStorageOptions = 
           failCount: task.failCount,
           priority: task.priority,
           retry: task.retry,
+          onOverlap: task.onOverlap ?? null,
           retryCount: task.retryCount,
           lastRunId: task.lastRunId,
           paused: task.paused,
@@ -283,7 +284,10 @@ export async function createMongoStorage(db: Db, options: MongoStorageOptions = 
     },
 
     async refreshScheduleLock(id, now) {
-      await schedules.updateOne({ id, lockedAt: { $ne: null } }, { $set: { lockedAt: now } });
+      // matchedCount, not modifiedCount: a refresh landing in the same
+      // millisecond writes an identical value and must still count as refreshed.
+      const res = await schedules.updateOne({ id, lockedAt: { $ne: null } }, { $set: { lockedAt: now } });
+      return res.matchedCount > 0;
     },
 
     async clearScheduleLocks() {

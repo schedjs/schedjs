@@ -32,6 +32,7 @@ export function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
     failCount: 0,
     priority: 0,
     retry: null,
+    onOverlap: 'skip',
     retryCount: 0,
     lastRunId: null,
     timeoutMs: null,
@@ -63,6 +64,7 @@ export function makeSchedule(overrides: Partial<ScheduleRecord> = {}): ScheduleR
     failCount: 0,
     priority: 0,
     retry: null,
+    onOverlap: null,
     retryCount: 0,
     lastRunId: null,
     paused: false,
@@ -427,14 +429,24 @@ export function storageContractTests(api: ContractTestApi, name: string, make: (
         expect((await s.getSchedule('fresh'))!.lockedAt).not.toBeNull();
       });
 
-      it('refreshScheduleLock extends a claimed lock; no-op when unlocked or unknown', async () => {
+      it('refreshScheduleLock extends a claimed lock; reports false when unlocked or unknown', async () => {
         await s.createSchedule(makeSchedule({ lockedAt: new Date('2026-08-16T09:00:00Z') }));
-        await s.refreshScheduleLock('sched-1', new Date('2026-08-16T10:30:00Z'));
+        // true = the lock WAS held and is now extended (task:4727 — the engine
+        // reports a lost lock, so the no-op must be distinguishable)
+        await expect(s.refreshScheduleLock('sched-1', new Date('2026-08-16T10:30:00Z'))).resolves.toBe(true);
         expect((await s.getSchedule('sched-1'))!.lockedAt).toEqual(new Date('2026-08-16T10:30:00Z'));
         await s.createSchedule(makeSchedule({ id: 'free' }));
-        await s.refreshScheduleLock('free', new Date('2026-08-16T10:30:00Z'));
+        await expect(s.refreshScheduleLock('free', new Date('2026-08-16T10:30:00Z'))).resolves.toBe(false);
         expect((await s.getSchedule('free'))!.lockedAt).toBeNull();
-        await expect(s.refreshScheduleLock('nope', new Date('2026-08-16T10:30:00Z'))).resolves.toBeUndefined();
+        await expect(s.refreshScheduleLock('nope', new Date('2026-08-16T10:30:00Z'))).resolves.toBe(false);
+      });
+
+      it('round-trips the overlap policy on a schedule (task:4726)', async () => {
+        await s.createSchedule(makeSchedule({ id: 'ov', onOverlap: 'cancel' }));
+        expect((await s.getSchedule('ov'))!.onOverlap).toBe('cancel');
+        // absent = inherit (task default skip) — never silently turned into 'skip' on the row
+        await s.createSchedule(makeSchedule({ id: 'inherit', onOverlap: null }));
+        expect((await s.getSchedule('inherit'))!.onOverlap).toBeNull();
       });
 
       it('clearScheduleLocks releases every schedule lock without touching other state', async () => {
