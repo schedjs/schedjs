@@ -1552,6 +1552,57 @@ describe('engine — async accepted + poll loop', () => {
     expect((await storage.getSchedule('task-a'))!.lockedAt).not.toBeNull();
   });
 
+  it('holds the schedule lock across an async run longer than lockTtl — no duplicate dispatch (task:4724)', async () => {
+    // Prod defect (books, 2026-11-19): timeoutMs: -1 disables the poll ceiling,
+    // so nothing refreshed the lock and the zombie watchdog re-dispatched a
+    // live async run every 30 min (11 parallel `running` runs, missed-slot spam).
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ timeoutMs: -1, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner, calls, pollCalls } = makeRunner(
+      async () => accepted,
+      async () => ({ status: 'running', progress: 1 }) as PollResult,
+    );
+    const refreshes: string[] = [];
+    const originalRefresh = storage.refreshScheduleLock.bind(storage);
+    storage.refreshScheduleLock = async (id, at) => {
+      refreshes.push(id);
+      return originalRefresh(id, at);
+    };
+    let now = NOON;
+    const engine = createEngine({
+      storage,
+      runner,
+      now: () => now,
+      lockTtlMs: 30 * 60 * 1000,
+      lockHeartbeatMs: 10 * 60 * 1000,
+    });
+    await engine.runOnce(); // accepted at 12:00:00
+
+    // Two hours of poll + watchdog + tick passes (every 10 min = heartbeat cadence).
+    for (let step = 1; step <= 12; step += 1) {
+      now = new Date(NOON.getTime() + step * 10 * 60 * 1000);
+      await engine.runPollOnce(now);
+      await engine.runWatchdogOnce(now);
+      await engine.runOnce(now);
+      // the lock is refreshed to «now», so the watchdog never sees it stale
+      expect((await storage.getSchedule('task-a'))!.lockedAt).toEqual(now);
+    }
+
+    expect(calls).toHaveLength(1); // one dispatch, no overlap
+    expect(pollCalls.length).toBeGreaterThan(1); // the run stayed polled, not abandoned
+    expect(refreshes.length).toBeGreaterThan(1); // the heartbeat actually ran
+    expect([...storage.runs.values()].filter((r) => r.status === 'running')).toHaveLength(1);
+
+    // Finished/cancelled runs stop refreshing — the lock must age out again.
+    const runId = [...storage.runs.keys()][0]!;
+    await engine.cancelRun(runId);
+    const refreshesAtCancel = refreshes.length;
+    now = new Date(now.getTime() + 60 * 60 * 1000);
+    await engine.runPollOnce(now);
+    expect(refreshes).toHaveLength(refreshesAtCancel);
+    expect((await storage.getSchedule('task-a'))!.lockedAt).toBeNull();
+  });
+
   it('sends POST /cancel to the worker on poll timeout when a cancelUrl was advertised (#1277)', async () => {
     const storage = new MemoryStorage();
     await seedTask(storage, makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z') }));
@@ -2478,6 +2529,82 @@ describe('engine — missed-slot detection', () => {
 
     const missed = events.filter((e) => e.type === 'missed-slot');
     expect(missed).toHaveLength(1);
+  });
+});
+
+describe('engine — startup grace (task:3765)', () => {
+  it('defers catch-up dispatch for startupGraceMs, then fires it once', async () => {
+    // Prod defect (books VDS reboot 2026-10-08): the daemon came up before its
+    // http apps and every overdue slot fired at once → `fetch failed` storm.
+    const storage = new MemoryStorage();
+    await seedTask(
+      storage,
+      makeTask({
+        nextRunAt: new Date('2026-08-16T11:52:00Z'),
+        lastRunAt: new Date('2026-08-16T10:52:00Z'),
+      }),
+    );
+    const events: EngineEvent[] = [];
+    const { runner, calls } = makeRunner();
+    const engine = createEngine({
+      storage,
+      runner,
+      now: () => NOON,
+      startupGraceMs: 60_000,
+      onEvent: (e) => events.push(e),
+    });
+
+    // 5 s after engine start: apps still booting — nothing dispatched, no miss.
+    await engine.runOnce(new Date(NOON.getTime() + 5_000));
+    expect(calls).toHaveLength(0);
+    expect(events.filter((e) => e.type === 'missed-slot')).toHaveLength(0);
+    expect(events.filter((e) => e.type === 'startup-deferred')).toHaveLength(1);
+
+    // Repeated ticks inside the grace stay quiet: one event per schedule, not per tick.
+    await engine.runOnce(new Date(NOON.getTime() + 6_000));
+    expect(events.filter((e) => e.type === 'startup-deferred')).toHaveLength(1);
+
+    // Grace over (measured from the FIRST TICK at +5s): the same slot fires exactly once.
+    await engine.runOnce(new Date(NOON.getTime() + 66_000));
+    expect(calls).toHaveLength(1);
+  });
+
+  it('measures the window from the first tick, not from engine construction', async () => {
+    // The daemon builds the engine, then wires storage/admin and starts ticking
+    // later — time spent wiring must not eat the operator's grace window.
+    const storage = new MemoryStorage();
+    await seedTask(
+      storage,
+      makeTask({
+        nextRunAt: new Date('2026-08-16T11:52:00Z'),
+        lastRunAt: new Date('2026-08-16T10:52:00Z'),
+      }),
+    );
+    const { runner, calls } = makeRunner();
+    const engine = createEngine({ storage, runner, now: () => NOON, startupGraceMs: 60_000 });
+
+    await engine.runOnce(new Date(NOON.getTime() + 10 * 60 * 1000)); // first tick, 10 min after creation
+    expect(calls).toHaveLength(0);
+
+    await engine.runOnce(new Date(NOON.getTime() + 11 * 60 * 1000));
+    expect(calls).toHaveLength(1);
+  });
+
+  it('default (startupGraceMs absent) dispatches catch-up immediately — unchanged behaviour', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(
+      storage,
+      makeTask({
+        nextRunAt: new Date('2026-08-16T11:52:00Z'),
+        lastRunAt: new Date('2026-08-16T10:52:00Z'),
+      }),
+    );
+    const { runner, calls } = makeRunner();
+    const engine = createEngine({ storage, runner, now: () => NOON });
+
+    await engine.runOnce(new Date(NOON.getTime() + 5_000));
+
+    expect(calls).toHaveLength(1);
   });
 });
 

@@ -83,7 +83,10 @@ describe('createDaemon', () => {
     expect(() => daemon.stop()).not.toThrow();
   });
 
-  it('recovers orphaned in-flight runs on start (restart): run cancelled, lock released immediately', async () => {
+  // Real sqlite file + fresh daemon start: ~7 commits, each one an fsync (default
+  // journal + synchronous=FULL), which costs 200-400ms per commit on Windows —
+  // ~4s total against the 5s default. Explicit budget so machine load cannot flake it.
+  it('recovers orphaned in-flight runs on start (restart): run cancelled, lock released immediately', { timeout: 30_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'sched-recovery-'));
     const dbPath = join(dir, 'sched.db');
     const seedDb = new DatabaseSync(dbPath);

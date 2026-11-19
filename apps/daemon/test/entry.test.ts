@@ -17,6 +17,7 @@ describe('parseCliArgs', () => {
       retentionMs: 30 * 24 * 60 * 60 * 1000,
       temporaryRetentionMs: 24 * 60 * 60 * 1000,
       pollTimeoutMs: 25 * 60 * 1000,
+      startupGraceMs: 0,
       tickIntervalMs: 1_000,
       watchdogIntervalMs: 60_000,
       adminPort: null,
@@ -40,6 +41,8 @@ describe('parseCliArgs', () => {
       '60',
       '--poll-timeout',
       '300',
+      '--startup-grace',
+      '120',
       '--tick-interval',
       '500',
       '--watchdog-interval',
@@ -56,10 +59,16 @@ describe('parseCliArgs', () => {
     expect(opts.retentionMs).toBe(120_000);
     expect(opts.temporaryRetentionMs).toBe(60_000);
     expect(opts.pollTimeoutMs).toBe(300_000);
+    expect(opts.startupGraceMs).toBe(120_000);
     expect(opts.tickIntervalMs).toBe(500);
     expect(opts.watchdogIntervalMs).toBe(30_000);
     expect(opts.adminPort).toBe(8080);
     expect(opts.adminHost).toBe('0.0.0.0');
+  });
+
+  it('accepts --startup-grace 0 (off — the default) and rejects a bad value', () => {
+    expect(parseCliArgs(['--startup-grace', '0']).startupGraceMs).toBe(0);
+    expect(() => parseCliArgs(['--startup-grace', '-5'])).toThrow(/startup-grace/);
   });
 
   it('rejects --lock-heartbeat >= --lock-ttl and --poll-timeout >= --lock-ttl (r7 F2)', () => {

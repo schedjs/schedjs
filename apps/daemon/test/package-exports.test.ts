@@ -19,6 +19,8 @@ describe('@schedjs/daemon package exports', () => {
     expect(PKG.exports?.['.']?.types).toBe('./dist/daemon.d.ts');
   });
 
+  // Cold `node` spawn + package import ≈ 5 s under load → плюс-минус по дефолтному
+  // таймауту vitest (флак в гейте синка 2026-11-19). Свой потолок, класс как ac508a7.
   it('node resolves `@schedjs/daemon` (self-reference) to a working createDaemon', () => {
     const fixture = fileURLToPath(new URL('./fixtures/exports-smoke.mjs', import.meta.url));
     const out = execSync(`node "${fixture}"`, {
@@ -26,5 +28,5 @@ describe('@schedjs/daemon package exports', () => {
       encoding: 'utf8',
     });
     expect(out.trim()).toBe('function');
-  });
+  }, 30_000);
 });

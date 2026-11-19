@@ -65,6 +65,12 @@ export interface DaemonOptions {
    */
   missedSlotGraceMs?: number;
   /**
+   * Startup grace (engine `startupGraceMs`): for the first N ms of ticking,
+   * overdue catch-up slots are deferred instead of dispatched — for hosts whose
+   * scheduler boots before the apps its http tasks call. 0 / omitted = off.
+   */
+  startupGraceMs?: number;
+  /**
    * Object-storage (Minio/S3) credentials for the artifact proxy
    * (`GET /api/runs/:id/artifacts/:idx`). Omit → direct-link mode (UI builds
    * URLs from refs itself).
@@ -234,6 +240,7 @@ export function createDaemon(options: DaemonOptions): Daemon {
       if (alerts) alerts.handleEvent(event);
     },
     ...(options.missedSlotGraceMs !== undefined ? { missedSlotGraceMs: options.missedSlotGraceMs } : {}),
+    ...(options.startupGraceMs !== undefined ? { startupGraceMs: options.startupGraceMs } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.lockTtlMs ? { lockTtlMs: options.lockTtlMs } : {}),
     ...(options.lockHeartbeatMs ? { lockHeartbeatMs: options.lockHeartbeatMs } : {}),

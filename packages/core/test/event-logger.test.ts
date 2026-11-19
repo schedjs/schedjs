@@ -30,6 +30,12 @@ describe('createEventLogger', () => {
     logger({ type: 'cancel-ack', taskName: 'task-a', runId: RUN, status: 200 });
     logger({ type: 'cancel-failed', taskName: 'task-a', runId: RUN, error: 'ECONNREFUSED' });
     logger({ type: 'cancel-no-channel', taskName: 'task-a', runId: RUN });
+    logger({
+      type: 'startup-deferred',
+      taskName: 'task-a',
+      scheduleId: 'task-a',
+      slotAt: new Date('2026-08-16T11:52:00Z'),
+    });
 
     expect(lines).toEqual([
       '[sched] tick: 3 due',
@@ -46,6 +52,7 @@ describe('createEventLogger', () => {
       '[sched] [cancel] ack runId=01234567 status=200',
       '[sched] [cancel] failed: ECONNREFUSED runId=01234567',
       '[sched] [cancel] no cancelUrl — legacy stop-polling runId=01234567',
+      '[sched] startup-deferred task-a schedule=task-a slot=2026-08-16 11:52:00Z',
     ]);
   });
 

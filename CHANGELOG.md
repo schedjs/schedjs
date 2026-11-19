@@ -3,6 +3,32 @@
 All notable changes to sched. The format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is per-package (monorepo), so every release lists the versions it shipped.
 
+## [0.58.0] — 2026-11-19
+
+core 0.58.0 · storage-mongo 0.6.2 · storage-mysql 0.6.1 · storage-postgres 0.6.1 ·
+admin-api 0.5.1 · mcp 0.6.2 · ui 0.4.1 · daemon 0.13.5 · cli 0.3.2
+
+
+### Added
+
+- **`startupGraceMs` / `--startup-grace SECONDS`** — a startup grace window: for
+  the first N ms after the engine starts, due (catch-up) slots are held back
+  instead of dispatched, and each one fires a `startup-deferred` engine event.
+  The slot stays due — nothing is skipped — so the catch-up plays once when the
+  window closes. Directly for hosts whose scheduler boots before the apps its
+  http tasks call: a reboot no longer turns every overdue slot into a
+  `run.failed` + `missed-slot` storm. Default `0` = off (historic behaviour).
+
+### Fixed
+
+- **A long async run no longer gets a parallel copy.** `timeoutMs: -1` disables
+  the `pollTimeoutMs` ceiling, and nothing refreshed the schedule lock while a
+  run sat in the poll queue — so the zombie watchdog reaped the lock every
+  `lockTtlMs` and the next tick dispatched the same slot again (books
+  2026-11-19: 11 overlapping `running` runs, `missed-slot` spam). The poll loop
+  now refreshes the lock every `lockHeartbeatMs`, exactly like the sync
+  heartbeat, so the watchdog only reaps genuinely dead processes.
+
 ## [0.57.0] — 2026-11-08
 
 core 0.57.0 · storage-mongo 0.6.1 · storage-mysql 0.6.0 · storage-postgres 0.6.0 ·

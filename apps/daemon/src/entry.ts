@@ -22,6 +22,8 @@ export interface CliOptions {
   retentionMs: number;
   temporaryRetentionMs: number;
   pollTimeoutMs: number;
+  /** Startup grace for catch-up dispatches (engine `startupGraceMs`); 0 = off. */
+  startupGraceMs: number;
   tickIntervalMs: number;
   watchdogIntervalMs: number;
   /** Admin control plane port; null → disabled. */
@@ -38,6 +40,7 @@ const DEFAULTS: CliOptions = {
   retentionMs: 30 * 24 * 60 * 60 * 1000,
   temporaryRetentionMs: 24 * 60 * 60 * 1000,
   pollTimeoutMs: 25 * 60 * 1000,
+  startupGraceMs: 0,
   tickIntervalMs: 1_000,
   watchdogIntervalMs: 60_000,
   adminPort: null,
@@ -85,6 +88,7 @@ export function helpText(): string {
     '  --retention-ttl             retention TTL for regular terminal runs, seconds; 0 = retention off (default: 2592000 = 30 d)',
     '  --temporary-retention-ttl   retention TTL for temporary runs, seconds; 0 = retention off (default: 86400 = 24 h)',
     '  --poll-timeout              async (accepted) run ceiling, seconds; must be < lock-ttl (default: 1500 = 25 min)',
+    '  --startup-grace             defer catch-up dispatches for N seconds of ticking after start (default: 0 = off)',
     '  --tick-interval             tick cadence, ms (default: 1000)',
     '  --watchdog-interval         watchdog cadence, ms (default: 60000)',
     '  --admin-port PORT           serve the admin api (/api/*) on PORT (SCHED_ADMIN_KEY for auth)',
@@ -106,6 +110,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
       'retention-ttl': { type: 'string' },
       'temporary-retention-ttl': { type: 'string' },
       'poll-timeout': { type: 'string' },
+      'startup-grace': { type: 'string' },
       'tick-interval': { type: 'string' },
       'watchdog-interval': { type: 'string' },
       'admin-port': { type: 'string' },
@@ -138,6 +143,10 @@ export function parseCliArgs(argv: string[]): CliOptions {
   const pollTimeoutMs = str(values['poll-timeout'])
     ? positiveNumber(str(values['poll-timeout'])!, 'poll-timeout', 1000)
     : DEFAULTS.pollTimeoutMs;
+  // 0 = off is a valid value here (the historic boot-catch-up behaviour).
+  const startupGraceMs = str(values['startup-grace'])
+    ? retentionSeconds(str(values['startup-grace'])!, 'startup-grace', 1000)
+    : DEFAULTS.startupGraceMs;
   // r7 F2: the documented invariant is now enforced at parse time — but only
   // for flags the operator actually passed (the poll-timeout default of 25 min
   // is legal against a 30 min ttl; a tiny explicit ttl without an explicit
@@ -155,6 +164,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
     lockTtlMs,
     lockHeartbeatMs,
     pollTimeoutMs,
+    startupGraceMs,
     retentionMs: str(values['retention-ttl'])
       ? retentionSeconds(str(values['retention-ttl'])!, 'retention-ttl', 1000)
       : DEFAULTS.retentionMs,
@@ -310,6 +320,7 @@ async function main(): Promise<void> {
     retentionMs: opts.retentionMs,
     temporaryRetentionMs: opts.temporaryRetentionMs,
     pollTimeoutMs: opts.pollTimeoutMs,
+    ...(opts.startupGraceMs > 0 ? { startupGraceMs: opts.startupGraceMs } : {}),
     tickIntervalMs: opts.tickIntervalMs,
     watchdogIntervalMs: opts.watchdogIntervalMs,
     ...(opts.adminPort !== null

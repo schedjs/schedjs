@@ -91,6 +91,12 @@ export type EngineEvent =
       delayMs: number;
     }
   | { type: 'retry-scheduled'; taskName: string; runId: string; attempt: number; nextRunAt: Date; backoffMs: number }
+  /**
+   * A due slot was deferred by the startup grace window
+   * ({@link EngineConfig.startupGraceMs}): the daemon is up, its apps may not
+   * be yet. Emitted once per deferred schedule per window; the slot stays due.
+   */
+  | { type: 'startup-deferred'; taskName: string; scheduleId: string; slotAt: Date }
   | { type: 'poll'; taskName: string; runId: string; status: PollResult['status']; progress: number | null }
   | { type: 'zombie-reaped'; olderThan: Date; count: number }
   /**
@@ -262,6 +268,19 @@ export interface EngineConfig {
    * Default: 120_000 (2 min).
    */
   missedSlotGraceMs?: number;
+  /**
+   * Startup grace window: for the first N ms of ticking, due (catch-up) slots —
+   * overdue recurring slots, overdue one-shots and pending retries alike — are
+   * NOT dispatched — a `startup-deferred` event is fired instead and
+   * the slot stays due, playing once the window closes. Nothing is skipped.
+   *
+   * For hosts where the scheduler comes up before the services its http tasks
+   * call: without the grace every overdue slot fires at once on boot and each
+   * fails with a connection error, turning a host reboot into a false alert
+   * storm (task:3765, books VDS 2026-10-08).
+   * Default: 0 (off — catch-up fires immediately, the historic behaviour).
+   */
+  startupGraceMs?: number;
   /**
    * Engine-lifecycle observer: claim / dispatch / run outcome / retry schedule /
    * poll / zombie reap — the native "engine events" level (docs/12.logging.md).
@@ -442,6 +461,13 @@ export function createEngine(config: EngineConfig): Engine {
   const watchdogIntervalMs = config.watchdogIntervalMs ?? 60_000;
   const pollIntervalMs = config.pollIntervalMs ?? 1_000;
   const missedSlotGraceMs = config.missedSlotGraceMs ?? 2 * 60 * 1000;
+  const startupGraceMs = config.startupGraceMs ?? 0;
+  // Startup grace is measured from the FIRST TICK, not from engine creation: a
+  // daemon builds the engine while wiring storage/admin and only starts ticking
+  // later, and time spent wiring must not eat the window the operator asked for.
+  let graceAnchorMs: number | null = null;
+  /** Schedules already reported as startup-deferred (one event per window). */
+  const startupDeferred = new Set<string>();
   const retentionIntervalMs = config.retentionIntervalMs ?? 60 * 60 * 1000; // 1 hour
   // 25 min < lockTtl 30 min: the poll must fail a hung async run before the
   // zombie watchdog could unlock its task and re-dispatch a live run.
@@ -523,6 +549,8 @@ export function createEngine(config: EngineConfig): Engine {
     pollIntervalMs: number;
     nextPollAt: number;
     acceptedAt: number;
+    /** Last async lock refresh (task:4724) — see the poll loop's heartbeat. */
+    lastLockRefreshAt: number;
   }
   const asyncRuns = new Map<string, AsyncRun>();
 
@@ -833,6 +861,7 @@ export function createEngine(config: EngineConfig): Engine {
       pollIntervalMs: accepted.pollIntervalMs,
       nextPollAt: at + accepted.pollIntervalMs,
       acceptedAt: at,
+      lastLockRefreshAt: at,
     });
     return true;
   }
@@ -861,6 +890,26 @@ export function createEngine(config: EngineConfig): Engine {
   async function pollOnceInner(now: Date): Promise<void> {
     const at = now.getTime();
     for (const [runId, ar] of [...asyncRuns]) {
+      // Async lock heartbeat (task:4724): a live async run must keep its
+      // schedule claim fresh. Nothing else refreshes it (`runSchedule` stops
+      // its heartbeat on `accepted`), so without this the zombie watchdog reaps
+      // the lock after lockTtlMs and the next tick dispatches a second copy of
+      // the same slot — forever, when `timeoutMs: -1` disables the poll ceiling.
+      // The poll loop is the run's liveness signal: same cadence as the sync
+      // heartbeat, best-effort like it.
+      if (ar.schedule !== null && at - ar.lastLockRefreshAt >= lockHeartbeatMs) {
+        try {
+          await storage.refreshScheduleLock(ar.schedule.id, now);
+          ar.lastLockRefreshAt = at; // only on success — a failed refresh retries on the next pass
+        } catch {
+          // best-effort, like the sync heartbeat: a storage hiccup must not fail
+          // the run. A dead process stops refreshing entirely, so the watchdog
+          // still reaps genuinely orphaned locks.
+          // shortcut: refreshScheduleLock returns void, so a resolved no-op (lock
+          // already reaped) is indistinguishable from a real refresh; upgrade if a
+          // duplicate dispatch is ever traced to exactly that gap.
+        }
+      }
       if (ar.nextPollAt > at) continue;
       // Per-task run-deadline (task.timeoutMs): >0 = force-fail at the task's
       // own ceiling (overrides the global); -1 = never auto-terminate (only
@@ -1024,6 +1073,28 @@ export function createEngine(config: EngineConfig): Engine {
       // claim keeps running (async polls, watchdog, retention, alerts) — those
       // live on their own loops, not here.
       if (paused) return;
+      // Startup grace (task:3765): a daemon that comes up before its http apps
+      // would otherwise fire every overdue slot at once, each one failing on a
+      // connection error — a reboot reads as "prod is broken". Defer the
+      // dispatches until the window closes; the slots stay due (nothing is
+      // skipped) and play once when the apps are up.
+      graceAnchorMs ??= now.getTime();
+      if (startupGraceMs > 0 && now.getTime() < graceAnchorMs + startupGraceMs) {
+        for (const schedule of await storage.listDueSchedules(now)) {
+          // One event per schedule per window — the tick would otherwise repeat
+          // it every second and turn the grace into its own noise source.
+          if (schedule.nextRunAt === null || startupDeferred.has(schedule.id)) continue;
+          startupDeferred.add(schedule.id);
+          fire({
+            type: 'startup-deferred',
+            taskName: schedule.taskName,
+            scheduleId: schedule.id,
+            slotAt: schedule.nextRunAt,
+          });
+        }
+        return;
+      }
+      startupDeferred.clear(); // window closed — a later window starts clean
       const generation = pauseGeneration;
       const due = await storage.listDueSchedules(now);
       if (due.length > 0) fire({ type: 'tick', at: now, dueCount: due.length });

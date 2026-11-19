@@ -54,6 +54,8 @@ function format(event: EngineEvent, prefix: string): string {
       return `${prefix} missed-slot ${event.taskName} sched=${event.scheduleId} scheduled ${fmtTime(event.scheduledAt)} (${event.delayMs}ms late)`;
     case 'retry-scheduled':
       return `${prefix} retry ${event.taskName} run=${id(event.runId)} attempt=${event.attempt} backoff=${event.backoffMs}ms (next ${fmtTime(event.nextRunAt)})`;
+    case 'startup-deferred':
+      return `${prefix} startup-deferred ${event.taskName} schedule=${event.scheduleId} slot=${fmtTime(event.slotAt)}`;
     case 'poll':
       return `${prefix} poll ${event.taskName} run=${id(event.runId)} status=${event.status}${event.progress !== null ? ` progress=${event.progress}` : ''}`;
     case 'cancel-sent':
