@@ -562,6 +562,8 @@ export function createEngine(config: EngineConfig): Engine {
     pollIntervalMs: number;
     nextPollAt: number;
     acceptedAt: number;
+    /** The run's own deadline timer (task:4754) — see {@link asyncCeilingMs}. */
+    deadlineTimer: NodeJS.Timeout | null;
     /** Last async lock refresh (task:4724) — see the poll loop's heartbeat. */
     lastLockRefreshAt: number;
     /** True once `lock-refresh-missed` was fired for this run (one report per run). */
@@ -846,22 +848,77 @@ export function createEngine(config: EngineConfig): Engine {
     return '';
   }
 
+  /** Disarm the run's own deadline timer (task:4754) — always before the entry leaves the poll queue. */
+  function disarmAsyncDeadline(ar: AsyncRun): void {
+    if (ar.deadlineTimer !== null) clearTimeout(ar.deadlineTimer);
+    ar.deadlineTimer = null;
+  }
+
+  /**
+   * The run's ceiling and the label its failure carries: `task.timeoutMs` > 0
+   * wins, `-1` removes every ceiling (only manual cancel stops the run), a null
+   * (legacy DB row not yet re-synced) falls back to the engine's `pollTimeoutMs`.
+   * `0` is not a legal task value (tasks.json rejects it) — it falls back to the
+   * global ceiling, i.e. the run still has a guard.
+   */
+  function asyncCeilingMs(task: TaskRecord): { ms: number; label: string } | null {
+    const t = task.timeoutMs ?? null;
+    if (t === -1) return null;
+    if (t !== null && t > 0) return { ms: t, label: 'run timeout' };
+    return pollTimeoutMs > 0 ? { ms: pollTimeoutMs, label: 'poll timeout' } : null;
+  }
+
+  /** Cap on the deadline-retry delay: a failed terminal write is retried soon, not a whole ceiling later. */
+  const deadlineRetryCapMs = 30_000;
+
+  function armAsyncDeadline(runId: string, ar: AsyncRun, ceiling: { ms: number; label: string }, delayMs: number): void {
+    disarmAsyncDeadline(ar);
+    ar.deadlineTimer = setTimeout(() => {
+      void expireAsyncRun(runId, ceiling).catch((err) =>
+        fire({ type: 'error', message: err instanceof Error ? err.message : String(err) }),
+      );
+    }, delayMs);
+    ar.deadlineTimer.unref(); // a pending deadline must not hold the process open
+  }
+
+  /**
+   * Re-arm the deadline after a terminal write threw. Without this the guard
+   * dies on the very storage blip it is meant to outlive — and the poll loop it
+   * was moved out of may be wedged too (task:4754).
+   */
+  function rearmAfterFailedFinish(runId: string, ar: AsyncRun): void {
+    const ceiling = asyncCeilingMs(ar.task);
+    if (ceiling === null || asyncRuns.get(runId) !== ar) return; // no ceiling, or the entry is gone
+    armAsyncDeadline(runId, ar, ceiling, Math.min(ceiling.ms, deadlineRetryCapMs));
+  }
+
   async function finishAsyncRun(runId: string, ar: AsyncRun, poll: TerminalPollResult): Promise<void> {
     if (ar.finishing) return; // cancelRun claimed the run while this tick's snapshot was in flight — it finishes it
+    if (asyncRuns.get(runId) !== ar) return; // a stale snapshot / a fired timer whose entry was already finished
     ar.finishing = true;
-    const finishedAt = clock();
-    if (ar.schedule !== null) {
-      await completeScheduleRun(ar.schedule, ar.task, runId, poll, finishedAt);
-    } else {
-      await recordFinish(ar.task.name, runId, poll, ar.task.retryCount + 1, true); // manual trigger — schedule untouched
-      // r6 F5: reflect the manual run on the task (lastRunId/lastRunAt) without moving the schedule
-      await storage.completeTask(ar.task.name, {
-        nextRunAt: ar.task.nextRunAt,
-        lastRunAt: finishedAt,
-        failed: poll.status === 'failed',
-        lastRunId: runId,
-      });
+    try {
+      const finishedAt = clock();
+      if (ar.schedule !== null) {
+        await completeScheduleRun(ar.schedule, ar.task, runId, poll, finishedAt);
+      } else {
+        await recordFinish(ar.task.name, runId, poll, ar.task.retryCount + 1, true); // manual trigger — schedule untouched
+        // r6 F5: reflect the manual run on the task (lastRunId/lastRunAt) without moving the schedule
+        await storage.completeTask(ar.task.name, {
+          nextRunAt: ar.task.nextRunAt,
+          lastRunAt: finishedAt,
+          failed: poll.status === 'failed',
+          lastRunId: runId,
+        });
+      }
+    } catch (err) {
+      // A failed terminal write (storage blip / reconnect window) must not wedge
+      // the run: the claim goes back and the deadline re-arms, so the next pass
+      // retries the finish instead of short-circuiting on `finishing` forever.
+      ar.finishing = false;
+      rearmAfterFailedFinish(runId, ar);
+      throw err;
     }
+    disarmAsyncDeadline(ar);
     asyncRuns.delete(runId);
   }
 
@@ -894,7 +951,7 @@ export function createEngine(config: EngineConfig): Engine {
     }
     await storage.updateRun(runId, { status: 'queued', workerRef: accepted.statusUrl });
     const at = clock().getTime();
-    asyncRuns.set(runId, {
+    const ar: AsyncRun = {
       task,
       schedule,
       statusUrl: accepted.statusUrl,
@@ -904,10 +961,37 @@ export function createEngine(config: EngineConfig): Engine {
       pollIntervalMs: accepted.pollIntervalMs,
       nextPollAt: at + accepted.pollIntervalMs,
       acceptedAt: at,
+      deadlineTimer: null,
       lastLockRefreshAt: at,
       lockLostReported: false,
-    });
+    };
+    asyncRuns.set(runId, ar);
+    // The run's own deadline (task:4754). Prod 2026-11-21: a worker recreated
+    // mid-run left the run `running` for 110 min although its `task.timeoutMs`
+    // was 25 min — the ceiling used to be a check INSIDE the poll loop, so it
+    // died with the poll loop (wedged poll request, hung storage await) as
+    // surely as it died with the worker. A timer does not depend on either.
+    const ceiling = asyncCeilingMs(task);
+    if (ceiling !== null) armAsyncDeadline(runId, ar, ceiling, ceiling.ms);
     return true;
+  }
+
+  /** Deadline-timer path of the async ceiling (task:4754) — the poll loop is not involved. */
+  async function expireAsyncRun(runId: string, ceiling: { ms: number; label: string }): Promise<void> {
+    const ar = asyncRuns.get(runId);
+    if (!ar || ar.finishing) return; // already finishing/finished — the other path wins
+    try {
+      const cancelError = await signalCancel(runId, ar);
+      await finishAsyncRun(runId, ar, {
+        status: 'failed',
+        error: `${ceiling.label} after ${ceiling.ms}ms${cancelError}`,
+      });
+    } catch (err) {
+      // Same boundary as pollOnce: a storage failure here must not crash the
+      // daemon. Only finishAsyncRun can throw here (signalCancel swallows its
+      // own worker errors) and it re-arms the deadline before rethrowing.
+      fire({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   let polling = false;
@@ -955,26 +1039,20 @@ export function createEngine(config: EngineConfig): Engine {
           // still reaps genuinely orphaned locks.
         }
       }
-      if (ar.nextPollAt > at) continue;
-      // Per-task run-deadline (task.timeoutMs): >0 = force-fail at the task's
-      // own ceiling (overrides the global); -1 = never auto-terminate (only
-      // manual cancel) — tasks.json absent now defaults to -1 at parse; null
-      // = a legacy DB row not yet re-synced → the engine's global
-      // pollTimeoutMs. Measured from acceptance (≈ run start for async).
-      const taskTimeout = ar.task.timeoutMs ?? null;
-      if (taskTimeout === -1) {
-        // never auto-terminate — skip the global ceiling too
-      } else if (taskTimeout !== null) {
-        if (at - ar.acceptedAt >= taskTimeout) {
-          const cancelError = await signalCancel(runId, ar);
-          await finishAsyncRun(runId, ar, { status: 'failed', error: `run timeout after ${taskTimeout}ms${cancelError}` });
-          continue;
-        }
-      } else if (pollTimeoutMs > 0 && at - ar.acceptedAt >= pollTimeoutMs) {
+      // Run-deadline (task.timeoutMs / pollTimeoutMs), measured from acceptance
+      // (≈ run start for async). Checked BEFORE the poll-interval gate — the
+      // ceiling is not a property of the worker's advertised poll cadence
+      // (task:4754: a long pollIntervalMs must not postpone the verdict).
+      const ceiling = asyncCeilingMs(ar.task);
+      if (ceiling !== null && at - ar.acceptedAt >= ceiling.ms) {
         const cancelError = await signalCancel(runId, ar);
-        await finishAsyncRun(runId, ar, { status: 'failed', error: `poll timeout after ${pollTimeoutMs}ms${cancelError}` });
+        await finishAsyncRun(runId, ar, {
+          status: 'failed',
+          error: `${ceiling.label} after ${ceiling.ms}ms${cancelError}`,
+        });
         continue;
       }
+      if (ar.nextPollAt > at) continue;
       let poll: PollResult;
       try {
         poll = await runner.poll!(runId, ar.statusUrl, ar.task);
@@ -1334,8 +1412,8 @@ export function createEngine(config: EngineConfig): Engine {
     // released (same terminal path as a normal poll finish).
     const ar = asyncRuns.get(runId);
     if (ar) {
-      asyncRuns.delete(runId);
       ar.finishing = true; // claimed: a stale poll-tick snapshot must not double-finish
+      disarmAsyncDeadline(ar);
       const finishedAt = clock();
       // Tell the worker to stop BEFORE finishing cancelled — the accepted
       // envelope's cancelUrl is the worker's cancel channel (the http runner
@@ -1345,13 +1423,22 @@ export function createEngine(config: EngineConfig): Engine {
       // orphaning the worker (battle-stand report 2026-08-21: cancel did not
       // reach the worker, which kept publishing after cancel). Each step
       // fires a cancel-* event so stdout shows where a signal gets lost.
-      const cancelError = await signalCancel(runId, ar);
-      const cancelled: SyncOutcome = { status: 'cancelled', error: `cancelled by user${cancelError}` };
-      if (ar.schedule !== null) {
-        await completeScheduleRun(ar.schedule, ar.task, runId, cancelled, finishedAt);
-      } else {
-        await recordFinish(ar.task.name, runId, cancelled, ar.task.retryCount + 1, true);
+      try {
+        const cancelError = await signalCancel(runId, ar);
+        const cancelled: SyncOutcome = { status: 'cancelled', error: `cancelled by user${cancelError}` };
+        if (ar.schedule !== null) {
+          await completeScheduleRun(ar.schedule, ar.task, runId, cancelled, finishedAt);
+        } else {
+          await recordFinish(ar.task.name, runId, cancelled, ar.task.retryCount + 1, true);
+        }
+      } catch (err) {
+        // The entry stays in the poll queue (claim released, deadline re-armed)
+        // so the run is not orphaned `running`/`queued` with nobody to finish it.
+        ar.finishing = false;
+        rearmAfterFailedFinish(runId, ar);
+        throw err;
       }
+      asyncRuns.delete(runId);
       return storage.getRun(runId);
     }
 
@@ -1577,48 +1664,10 @@ export function createEngine(config: EngineConfig): Engine {
     },
 
     async cancelRun(runId) {
-      const run = await storage.getRun(runId);
-      if (!run) return null;
-
-      // Async pull run (queued or running-async, still being polled): drop it
-      // from the poll queue and finish cancelled — schedule advanced, lock
-      // released (same terminal path as a normal poll finish).
-      const ar = asyncRuns.get(runId);
-      if (ar) {
-        asyncRuns.delete(runId);
-        ar.finishing = true; // claimed: a stale poll-tick snapshot must not double-finish
-        const finishedAt = clock();
-        // Tell the worker to stop BEFORE finishing cancelled — the accepted
-        // envelope's cancelUrl is the worker's cancel channel (the http runner
-        // POSTs {runId}; the worker stops at the next stage boundary). A
-        // worker without a cancelUrl, or a failed signal, is left to finish on
-        // its own — the run's error records that honestly instead of silently
-        // orphaning the worker (battle-stand report 2026-08-21: cancel did not
-        // reach the worker, which kept publishing after cancel). Each step
-        // fires a cancel-* event so stdout shows where a signal gets lost.
-        const cancelError = await signalCancel(runId, ar);
-        const cancelled: SyncOutcome = { status: 'cancelled', error: `cancelled by user${cancelError}` };
-        if (ar.schedule !== null) {
-          await completeScheduleRun(ar.schedule, ar.task, runId, cancelled, finishedAt);
-        } else {
-          await recordFinish(ar.task.name, runId, cancelled, ar.task.retryCount + 1, true);
-        }
-        return storage.getRun(runId);
-      }
-
-      // Sync run in flight: abort the runner via hooks.signal and AWAIT the
-      // actual stop — the run comes back cancelled (built-in runners react to
-      // abort; a non-abortable custom runner keeps the run hanging, which is
-      // what cancel is for).
-      const entry = runningRuns.get(runId);
-      if (entry) {
-        entry.controller.abort();
-        await entry.done;
-        return storage.getRun(runId);
-      }
-
-      // Terminal (or present-but-not-in-flight) run — nothing to cancel.
-      return storage.getRun(runId);
+      // One implementation with the internal path (the `cancel` overlap policy
+      // uses it too) — the async branch has to stay in one place to keep the
+      // deadline timer and the poll-queue entry consistent (task:4754).
+      return cancelRunInner(runId);
     },
 
     async runWatchdogOnce(now) {

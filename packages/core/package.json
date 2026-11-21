@@ -1,6 +1,6 @@
 {
   "name": "@schedjs/core",
-  "version": "0.59.0",
+  "version": "0.59.1",
   "description": "Cron done right — queue-based scheduler engine for Node.js: cron-parser, retries with backoff, idempotent runId, cancellation, pluggable storage",
   "type": "module",
   "main": "./dist/index.js",

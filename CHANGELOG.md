@@ -3,6 +3,29 @@
 All notable changes to sched. The format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is per-package (monorepo), so every release lists the versions it shipped.
 
+## [0.59.1] — 2026-11-21
+
+core 0.59.1 · storage-mongo 0.6.4 · storage-mysql 0.6.3 · storage-postgres 0.6.3 ·
+admin-api 0.6.1 · mcp 0.6.4 · ui 0.4.2 · daemon 0.14.1 · cli 0.3.4
+
+### Fixed
+
+- **An async run's deadline no longer dies with its worker — or with the poll
+  loop.** A run accepted by an http worker stayed `running` for 110 minutes when
+  the worker container was recreated mid-run (a deploy): the new worker answered
+  `404` on `statusUrl` and the task's `timeoutMs` (25 min) never fired. The
+  ceiling used to be a check *inside* the async poll loop, so it died with
+  whatever wedged that loop (a stuck poll request, a hung storage await) as
+  surely as it died with the worker; only a manual cancel closed the run. The
+  run now owns a deadline timer armed at acceptance, independent of the worker
+  and of the poll loop; `timeoutMs: -1` still means «no ceiling». Three
+  supporting fixes: the deadline check in the poll loop moved before the
+  poll-interval gate (a worker-advertised `pollIntervalMs` can no longer
+  postpone the verdict), a terminal write that throws releases the
+  first-finisher claim and re-arms the deadline instead of wedging the run on
+  `finishing` forever, and `cancelRun` shares one async-cancel path with the
+  `cancel` overlap policy.
+
 ## [0.58.0] — 2026-11-19
 
 core 0.58.0 · storage-mongo 0.6.2 · storage-mysql 0.6.1 · storage-postgres 0.6.1 ·

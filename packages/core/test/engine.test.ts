@@ -4,11 +4,12 @@ import { createEngine } from '../src/engine.js';
 import { createTaskOps } from '../src/task-ops.js';
 import { resolveSchedulePolicy } from '../src/policy.js';
 import type { EngineEvent, PollResult, RunOutcome, Runner, RunnerRunHooks } from '../src/engine.js';
+import { createHttpRunner } from '../src/runners/http.js';
 import { createSqliteStorage } from '../src/sqlite.js';
 import type { TaskRecord } from '../src/types.js';
 import type { Storage } from '../src/storage.js';
 import { MemoryStorage } from './helpers/memory-storage.js';
-import { makeTask } from '../src/storage-contract.js';
+import { makeSchedule, makeTask } from '../src/storage-contract.js';
 
 function makeRunner(
   impl?: (
@@ -647,6 +648,19 @@ describe('engine — policy inheritance (slice 3)', () => {
       priority: 10,
       onOverlap: 'skip',
     });
+  });
+
+  it('resolves onOverlap to skip for rows that predate the field — no throw (task:4726, mongo prod)', () => {
+    // Prod schedules live in mongo and are written through the API/MCP: an old
+    // document has no `onOverlap` key at all, so the row arrives with the field
+    // absent (not a value, not an explicit null). Resolution must be a default.
+    const task: Record<string, unknown> = { ...makeTask() };
+    const schedule: Record<string, unknown> = { ...makeSchedule() };
+    delete task.onOverlap;
+    delete schedule.onOverlap;
+
+    const resolved = resolveSchedulePolicy(task as never, schedule as never);
+    expect(resolved.onOverlap).toBe('skip');
   });
 
   it('pause AND: task.paused stops every schedule (family stop); resumeTask restores', async () => {
@@ -1872,6 +1886,187 @@ describe('engine — async accepted + poll loop', () => {
     expect(t!.nextRunAt).toEqual(task.nextRunAt); // schedule untouched
     expect(t!.lockedAt).toBeNull();
     expect(t!.failCount).toBe(0);
+  });
+});
+
+/**
+ * task:4754 — prod 2026-11-21: a `wb-pipeline` run sat `running` for 110 min
+ * after its worker container was recreated mid-run (deploy at minute 11). The
+ * worker that held the run was gone (404 on statusUrl), the run's own
+ * `task.timeoutMs` (25 min) never fired, and only a manual cancel closed it.
+ * The deadline must not depend on the worker — nor on the poll loop being alive.
+ */
+describe('engine — async run outlives its worker (task:4754)', () => {
+  const accepted = { status: 'accepted' as const, statusUrl: 'http://worker:3000/status/r1', pollIntervalMs: 1000 };
+
+  it('closes the run by task.timeoutMs with no poll pass at all (poll loop wedged/dead)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ timeoutMs: 40, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner, pollCalls } = makeRunner(async () => accepted, async () => ({ status: 'running' }));
+    const engine = createEngine({ storage, runner, now: () => NOON });
+    await engine.runOnce(); // accepted → queued
+
+    // No engine.runPollOnce() — the poll loop never runs again. Only the run's
+    // own deadline timer stands between it and an eternal `running`.
+    await vi.waitFor(async () => {
+      expect([...storage.runs.values()][0]!.status).toBe('failed');
+    }, { timeout: 2000, interval: 10 });
+
+    const [run] = [...storage.runs.values()];
+    expect(pollCalls).toHaveLength(0);
+    expect(run!.error).toContain('run timeout after 40ms');
+    expect(run!.finishedAt).not.toBeNull();
+    expect((await storage.getSchedule('task-a'))!.lockedAt).toBeNull();
+  });
+
+  it('retries the deadline when the timer-path terminal write throws (no poll loop to save it)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ timeoutMs: 40, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner } = makeRunner(async () => accepted, async () => ({ status: 'running' }));
+    const engine = createEngine({ storage, runner, now: () => NOON });
+    await engine.runOnce();
+
+    // One-shot storage failure exactly when the deadline fires.
+    let blip = true;
+    const originalFinish = storage.finishRun.bind(storage);
+    storage.finishRun = async (...args: Parameters<typeof originalFinish>) => {
+      if (blip) {
+        blip = false;
+        throw new Error('mongo blip');
+      }
+      return originalFinish(...args);
+    };
+
+    // Never call runPollOnce: the re-armed timer (≤30s, capped at the ceiling →
+    // 40ms here) must retry the finish on its own.
+    await vi.waitFor(async () => {
+      expect([...storage.runs.values()][0]!.status).toBe('failed');
+    }, { timeout: 3000, interval: 20 });
+
+    const [run] = [...storage.runs.values()];
+    expect(run!.error).toContain('run timeout after 40ms');
+    expect((await storage.getSchedule('task-a'))!.lockedAt).toBeNull();
+  });
+
+  it('never lets the deadline fire overwrite a run already finished by cancel', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ timeoutMs: 50, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner } = makeRunner(async () => accepted, async () => ({ status: 'running' }));
+    const engine = createEngine({ storage, runner, now: () => NOON });
+    await engine.runOnce();
+    const runId = [...storage.runs.keys()][0]!;
+
+    await engine.cancelRun(runId);
+    // the deadline timer is disarmed by the finish — wait past it and confirm
+    // nothing re-finishes the run as a timeout failure
+    await new Promise((r) => setTimeout(r, 150));
+
+    const run = await storage.getRun(runId);
+    expect(run!.status).toBe('cancelled');
+    const t = await storage.getSchedule('task-a');
+    expect(t!.failCount).toBe(0);
+    expect(t!.lockedAt).toBeNull();
+  });
+
+  it('closes the run by the deadline even when the worker cancel channel refuses', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ timeoutMs: 40, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    let cancelThrows = true;
+    const { runner } = makeRunner(
+      async () => ({ ...accepted, cancelUrl: 'http://worker:3000/cancel' }),
+      async () => ({ status: 'running' }),
+      async () => {
+        if (cancelThrows) {
+          cancelThrows = false;
+          throw new Error('ECONNREFUSED');
+        }
+      },
+    );
+    const events: EngineEvent[] = [];
+    const engine = createEngine({ storage, runner, now: () => NOON, onEvent: (e) => events.push(e) });
+    await engine.runOnce();
+
+    // The worker is gone: POST /cancel refuses. A failed cancel signal must not
+    // hold the deadline back — signalCancel records it on the run, the run still
+    // has to go terminal.
+    await vi.waitFor(async () => {
+      expect([...storage.runs.values()][0]!.status).toBe('failed');
+    }, { timeout: 3000, interval: 20 });
+
+    expect(events.some((e) => e.type === 'cancel-failed')).toBe(true);
+    expect([...storage.runs.values()][0]!.error).toContain('run timeout after 40ms');
+  });
+
+  it('applies the deadline even when the worker advertised a long poll interval', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ timeoutMs: 5000, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner, pollCalls } = makeRunner(
+      async () => ({ ...accepted, pollIntervalMs: 60 * 60 * 1000 }), // 1h between polls
+      async () => ({ status: 'running' }),
+    );
+    const engine = createEngine({ storage, runner, now: () => NOON });
+    await engine.runOnce();
+
+    // 10s > 5s deadline, but < the 1h poll interval — the deadline is not a
+    // property of the poll cadence.
+    await engine.runPollOnce(new Date('2026-08-16T12:00:10Z'));
+
+    expect(pollCalls).toHaveLength(0);
+    const [run] = [...storage.runs.values()];
+    expect(run!.status).toBe('failed');
+    expect(run!.error).toContain('run timeout after 5000ms');
+  });
+
+  it('retries the terminal write when finishing throws — a storage blip never wedges the run', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const { runner } = makeRunner(async () => accepted, async () => ({ status: 'succeeded', result: { ok: true } }));
+    const engine = createEngine({ storage, runner, now: () => NOON });
+    await engine.runOnce();
+
+    // One-shot storage failure in the terminal write (mongo reconnect window).
+    let blip = true;
+    const originalFinish = storage.finishRun.bind(storage);
+    storage.finishRun = async (...args: Parameters<typeof originalFinish>) => {
+      if (blip) {
+        blip = false;
+        throw new Error('mongo blip');
+      }
+      return originalFinish(...args);
+    };
+
+    await engine.runPollOnce(new Date('2026-08-16T12:00:01Z')); // finish throws, swallowed as an error event
+    expect([...storage.runs.values()][0]!.status).not.toBe('succeeded');
+
+    // The next pass must finish it, not short-circuit on a stuck `finishing` claim.
+    await engine.runPollOnce(new Date('2026-08-16T12:00:02Z'));
+    const [run] = [...storage.runs.values()];
+    expect(run!.status).toBe('succeeded');
+    expect(run!.result).toEqual({ ok: true });
+  });
+
+  it('closes the run when the worker vanished and statusUrl answers 404 (real http runner)', async () => {
+    const storage = new MemoryStorage();
+    await seedTask(storage, makeTask({ config: { url: 'http://worker:3000/run', envelope: true }, nextRunAt: new Date('2026-08-16T11:59:00Z') }));
+    const seen: string[] = [];
+    const fakeFetch = (async (url: string) => {
+      seen.push(String(url));
+      if (String(url).endsWith('/run')) {
+        return new Response(JSON.stringify({ status: 'accepted', statusUrl: '/status/r1' }), { status: 202 });
+      }
+      // the worker was recreated — the new process does not know this run
+      return new Response('run not found', { status: 404 });
+    }) as unknown as typeof fetch;
+    const engine = createEngine({ storage, runner: createHttpRunner({ fetch: fakeFetch }), now: () => NOON });
+    await engine.runOnce(); // accepted → queued
+
+    await engine.runPollOnce(new Date('2026-08-16T12:00:01Z'));
+
+    const [run] = [...storage.runs.values()];
+    expect(seen.some((u) => u.includes('/status/r1'))).toBe(true);
+    expect(run!.status).toBe('failed');
+    expect(run!.error).toContain('poll HTTP 404');
+    expect((await storage.getSchedule('task-a'))!.lockedAt).toBeNull();
   });
 });
 
